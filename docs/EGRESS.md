@@ -9,7 +9,8 @@
 > becomes the box-pidns zombie that used to deadlock teardown); an allowlisted NAME that resolves to a
 > loopback / link-local / `169.254.169.254` / RFC-1918 IP is refused (resolved-IP SSRF guard); and only
 > ports 80/443 are tunnelled. The one hole that remains is inherent to any name-based HTTP-proxy
-> allowlist and is stated plainly below: domain fronting on a **shared CDN** (SNI != CONNECT host).
+> allowlist and is stated plainly below: an allowed domain on a **shared CDN** reaches every other
+> tenant of that CDN.
 
 ## What it is
 
@@ -71,13 +72,34 @@ The proxy is not a suggestion; it is the only door.
 
 ## What it does NOT stop (state it plainly)
 
-- **Domain fronting / shared-CDN egress.** The client asks to `CONNECT allowed.com:443`, the proxy dials
-  `allowed.com`, and then the client speaks TLS with `SNI=evil.com` inside that tunnel. If `evil.com` and
-  `allowed.com` are served by the *same* front (a shared CDN / IP), data can reach `evil.com`. The proxy
-  today does NOT parse the TLS ClientHello, so it does not check that the SNI equals the `CONNECT` host:
-  domain fronting on a shared endpoint is NOT defended against (a ClientHello-SNI-equals-CONNECT check is
-  a planned hardening). **If your allowlist includes a big CDN domain, treat egress as open to everything
-  on that CDN.**
+- **Shared-CDN egress, over HTTPS only.** The client asks to `CONNECT allowed.com:443`, the proxy dials
+  `allowed.com`, and then the HTTP request *inside* the TLS session carries `Host: other.com`. If both
+  names are served by the same front (a shared CDN / IP), the CDN routes on that inner `Host` and the
+  data reaches `other.com`. The proxy cannot see it: the header is inside TLS, and reading it would mean
+  intercepting the session.
+  **Over plain HTTP the same trick is REFUSED**, because there the header is in plaintext and this proxy
+  reads it: a head whose `Host:` names a different host than the vetted request-target gets 403, and so
+  does a head carrying more than one `Host:` line (RFC 9112 makes that message invalid, and the reason is
+  this exact disagreement - we vet one field and an upstream may honour another). Measured from outside
+  against the previous release, where `GET http://pypi.org/` with `Host: www.python.org` was served as
+  `www.python.org`.
+  **This is NOT the SNI-mismatch case, and checking the SNI would not close it.** Measured on 0.31.0 with
+  an allowlist of `pypi.org`: `CONNECT pypi.org` carrying SNI *and* `Host: www.python.org` is served, and
+  so is `CONNECT pypi.org` with **SNI `pypi.org`** - a certificate that matches the name the proxy
+  allowed - and only the inner `Host` pointing elsewhere. A ClientHello check would pass that second case
+  unchanged, which is why this document no longer names one as a planned hardening.
+  **If your allowlist includes a domain on a big CDN, treat egress as open to every tenant of that CDN,
+  including one an attacker registers there.** Allow only origins you know are not shared, or use the VM
+  tier.
+  🚨 **And the example this page uses is one of them.** Measured: `pypi.org` resolves into Fastly's
+  range (`151.101.0.223`) and answers with Fastly cache headers (`x-served-by: cache-iad-...`), and
+  `files.pythonhosted.org`, which is where `pip` actually downloads from, is a CNAME to
+  `dualstack.python.map.fastly.net`. So an allowlist written to let `pip install` work has allowed
+  Fastly, which is the most common reason anyone turns this flag on. The advice above is honest but it
+  is not free: applied strictly it excludes PyPI.
+  For installing packages there is a better-shaped answer already in the product, and it is the default:
+  **the network stays off, and a one-time `setup=` runs in a network-on box that dies afterwards**, so
+  the allowlist is never the thing standing between a long-lived box and the internet.
 - **DNS exfiltration** is not a channel here (the box has no DNS; the proxy resolves), but a covert
   channel *inside* an allowed TLS session (timing, payload to an allowed host that then forwards) is not
   something a network allowlist can see. This is an allowlist, not a DLP.
@@ -96,7 +118,8 @@ The proxy is not a suggestion; it is the only door.
 | IP-literal target refused | **Hard** (never matches a domain entry) |
 | Connecting an allowlisted NAME that resolves to a private/loopback/metadata IP | **Hard** (resolved-IP guard: the proxy refuses the WHOLE name if ANY resolved record is non-public: loopback / link-local / `169.254.169.254` / RFC-1918 / ULA / multicast, incl. IPv4-mapped IPv6 like `::ffff:127.0.0.1`. It does not "pick the public one" from a mixed record set, so a clever-DNS operator can't order/flip records to reach a host-local service.) |
 | Restricting the PORT on an allowlisted host | **Hard** (only 80 and 443 are tunnelled; `:22`, `:6379`, … are refused) |
-| SNI ≠ CONNECT host on a shared CDN (domain fronting) | **Not addressed** (no ClientHello parsing today) |
+| An allowed domain on a SHARED CDN reaching every other tenant of it, over **HTTPS** | **Not addressed, and not addressable by this design**: the CDN routes on the HTTP `Host` INSIDE TLS, so a matching SNI does not help and only an intercepting proxy could see it |
+| The same, over **plain HTTP** | **Hard**: the `Host:` header is in plaintext, so a head that names a host other than the vetted request-target is refused, as is a head with more than one `Host:` line |
 | Covert channel inside an allowed session | **Not addressed** (this is an allowlist, not DLP) |
 
 The rule of thumb kern states everywhere applies here too: this is a strong control for first-party and

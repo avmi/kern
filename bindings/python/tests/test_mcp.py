@@ -1374,6 +1374,27 @@ def test_env_int_rejects_values_that_would_poison_every_later_call(raw, expected
     assert M._env_int("KERN_MCP_MEMORY_MB", 1024) == expected
 
 
+@pytest.mark.parametrize("raw,expected_mb", [
+    (None, 0), ("0", 0), ("-1", 0), ("junk", 0), ("", 0), ("1.5", 0), ("512", 512), ("1", 1),
+])
+def test_the_workspace_cap_knob_is_off_unless_a_POSITIVE_size_is_given(raw, expected_mb, monkeypatch):
+    """`KERN_MCP_WORKSPACE_MAX_MB` needs NO sentinel, and that is the whole test.
+
+    The memory, tmpfs and prewarm knobs need `0` to mean "off" because their default is a VALUE. This
+    one's default is off, so `0` is simply what unset means and `_env_int` with a zero default spells
+    every case. The first version used `_env_cap`, which returns 0 - not None - for an unset variable,
+    and a zero there is a cap of ZERO BYTES that refuses every call in the session. Six MCP tests
+    caught it at once, which is the only reason this is a parametrised test and not a comment."""
+    if raw is None:
+        monkeypatch.delenv("KERN_MCP_WORKSPACE_MAX_MB", raising=False)
+    else:
+        monkeypatch.setenv("KERN_MCP_WORKSPACE_MAX_MB", raw)
+    mb = M._env_int("KERN_MCP_WORKSPACE_MAX_MB", 0)
+    assert mb == expected_mb
+    # And the conversion the server does with it: a positive is bytes, everything else is no cap.
+    assert (mb * 1024 * 1024 if mb > 0 else None) == (expected_mb * 1024 * 1024 if expected_mb else None)
+
+
 def test_env_int_uses_the_default_when_unset(monkeypatch):
     monkeypatch.delenv("KERN_MCP_MEMORY_MB", raising=False)
     assert M._env_int("KERN_MCP_MEMORY_MB", 77) == 77

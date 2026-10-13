@@ -28,7 +28,9 @@ unsetting it still sends the 1024 default and shadows the profile), ``KERN_MCP_T
 in-memory state persists across calls and each call is sub-ms instead of a ~10 ms interpreter boot; still
 NEVER-NET; a runaway cell that times out respawns the kernel, it never dooms the session),
 ``KERN_MCP_QUIET`` (default on: suppress kern's non-fatal notes so a tools/call returns only the cell's
-own output; set to ``0`` to restore them), ``KERN_MCP_TMPFS_MB`` (default 64: scratch at ``/tmp``,
+own output; set to ``0`` to restore them), ``KERN_MCP_WORKSPACE_MAX_MB`` (default 0, meaning no cap: a
+size in MiB for the workspace, measured WHILE a call runs, so one runaway cell is stopped and not merely
+refused at the next call), ``KERN_MCP_TMPFS_MB`` (default 64: scratch at ``/tmp``,
 charged to the box's own memory cap; ``0`` removes it and puts /tmp back inside the read-only root),
 ``KERN_MCP_USER`` (the image account the code runs as, ``<user>[:<group>]``, e.g. ``node`` or ``1000``;
 default the image's own ``USER``; see ``Sandbox.user`` for what a non-root one costs the workspace),
@@ -456,7 +458,22 @@ class _Server:
             # reason, and it is the THIRD one - the table in docs/MCP.md says so.
             prewarm_cap = _env_cap("KERN_MCP_PREWARM", 1)
             prewarm = 0 if prewarm_cap is None else prewarm_cap
+            # THE WORKSPACE CAP, OFF BY DEFAULT AND NOW WORTH HAVING. It was not exposed here while the
+            # cap could only be checked BETWEEN calls, because that bounds nothing a runaway cell does in
+            # ONE call - measured: 8,115 MB on disk in ten seconds. The SDK now measures it WHILE the
+            # call runs and stops the box, so this knob bounds a single cell and the fault names the cap.
+            # ⛔ Still not a kernel boundary: the box writes to a host directory, so the overshoot is
+            # whatever it wrote between two measurements.
+            #
+            # NO SENTINEL HERE, unlike the memory, tmpfs and prewarm knobs, and the difference is that
+            # their default is a VALUE while this one's default is OFF: `0` is simply what unset means,
+            # so `_env_int` with a zero default already spells every case - unset, `0`, a negative and
+            # garbage all mean no cap, and only a positive is one. The first version of this line used
+            # `_env_cap` and `_env_cap(name, 0)` returns 0 rather than None when the variable is unset,
+            # which set a cap of ZERO BYTES and refused every call: caught by six MCP tests at once.
+            ws_cap_mb = _env_int("KERN_MCP_WORKSPACE_MAX_MB", 0)
             sbx = Sandbox(
+                workspace_max_bytes=ws_cap_mb * 1024 * 1024 if ws_cap_mb > 0 else None,
                 image=image, setup=setup, workspace=workspace, memory_mb=memory_mb,
                 timeout_s=timeout_s, env=env, profiles=profiles, tmpfs=tmpfs,
                 # Validated by the SDK like `user=`, so a value that is not an account name is refused

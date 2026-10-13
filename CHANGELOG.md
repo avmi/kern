@@ -19,6 +19,56 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
+## Unreleased
+
+**Two things a caller can notice, so they lead.** A `kern-sandbox` call that wrote past
+`workspace_max_bytes` *during* the call used to return normally, with the bytes on disk and the refusal
+arriving only at the next call; it now comes back with a new fault, `workspace_full`, and the box is
+stopped mid-call. And `--egress-allow` now refuses a plain-HTTP request whose `Host:` header names a
+different host than the request-target it vetted, or that carries more than one `Host:` line: those used
+to be forwarded.
+
+**kern-sandbox (Python and Node)**
+
+- `workspace_max_bytes` is enforced WHILE a call runs, not only between calls. Measured before: one call
+  wrote 8,115 MB in ten seconds against a 50 MiB cap and was admitted. The measurement is self-limiting
+  (the next one is scheduled at ten times the last one's duration, floor one second), it costs nothing
+  when no cap is set, and it never stops a box on a measurement it could not take. The overshoot is
+  whatever the box wrote between two measurements, and the cap is still not a kernel boundary.
+- New `fault.type` value `workspace_full`, additive. `KERN_MCP_WORKSPACE_MAX_MB` exposes the cap on the
+  MCP server, where it was deliberately absent while the cap could only be checked between calls.
+- One `chmod 0` from inside the box no longer ends the session. Code in a box could close a directory of
+  its own workspace, and the host-side walk then raised a bare `PermissionError`/`EACCES` out of the
+  reporting path: it destroyed the result of the call that had already run, and every later call failed
+  the same way. The owner bits are now put back on directories the host owns (read and search, never
+  write) and the walk retries once; a directory that is not ours is still read by the helper box, and a
+  refusal that remains names the directory instead of printing an errno. Reported from outside.
+- Refusals name the mechanism where they used to print the kernel's errno: a symlinked directory in a
+  READ or a listing (it said `[Errno 20] Not a directory`, while the write path already named it), a
+  path component that is not a directory, and a directory that is readable but not writable.
+- `snapshot()` and the workspace size measurement no longer raise a bare permission error when the
+  repair cannot be made; both name what they could not read. The Node binding no longer counts a
+  directory closed to it as zero bytes, which is how a cooperative cap is defeated for good.
+
+**Runtime**
+
+- `--egress-allow` refuses a plain-HTTP head that does not name one host (see above). Over HTTPS the
+  same trick is still possible on a shared CDN, because there the `Host` header is inside TLS and only
+  an intercepting proxy could read it; `docs/EGRESS.md` says so and no longer names an SNI check as a
+  planned hardening, which was measured not to close it.
+
+**Documentation**
+
+- `docs/EGRESS.md`, `docs/THREAT_MODEL.md` and the `--egress-allow` notice describe the shared-CDN hole
+  as what it is: the site is chosen by the HTTP `Host` header inside TLS, so a matching SNI does not
+  help. The page also records that its own example is on a shared CDN: `pypi.org` resolves into Fastly
+  and `files.pythonhosted.org` is a CNAME to it, so an allowlist written for `pip install` has allowed
+  that CDN.
+- `docs/MCP.md` documents that the workspace has no size bound by default, with the measured rate, the
+  new cap, and a recipe a non-root user can apply (`$XDG_RUNTIME_DIR` is already a sized tmpfs; making a
+  new sized mount needs root).
+- `docs/SANDBOX.md` documents the one thing the host changes in a workspace, and what it does not buy.
+
 ## v0.31.0 - 2026-10-10
 
 **`kern run --memory` REFUSES where it used to warn and run, and this one leads because it can stop

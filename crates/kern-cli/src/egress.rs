@@ -26,11 +26,27 @@ use std::os::unix::process::CommandExt; // for Command::pre_exec
 /// security decision, so it is deliberately strict:
 ///  * `pypi.org` matches `pypi.org` and `files.pypi.org`, NOT `evilpypi.org` or `pypi.org.evil.com`.
 ///  * an IP literal never matches a domain entry (no entry contains a bare IP unless you list it).
+/// "The same host", spelled ONCE. The root label's trailing dot is not part of the name and the
+/// comparison is case-insensitive, so `PyPI.ORG.` and `pypi.org` are one host - and every decision in
+/// this file that asks "is this that host?" has to agree about it. `None` for a name that normalises
+/// to nothing.
+///
+/// WHY IT IS A FUNCTION. It was written out three times: here, in `host_of_authority`'s tail, and in
+/// the `Host:`-agreement check. A cleanup review pointed out the direction the drift would fail in,
+/// which is the reason this is worth a function: the allowlist decides "may the box reach this", and
+/// the agreement check decides "is the head's `Host:` the same host we vetted". If the second learns a
+/// folding rule the first does not (IDNA, a leading dot, odd whitespace), a `Host:` the allowlist
+/// would call DIFFERENT compares EQUAL here and the head is forwarded. Permissive is the wrong
+/// direction for a control, so the two cannot be allowed to drift apart by construction.
+fn normalized_host(host: &str) -> Option<String> {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if h.is_empty() { None } else { Some(h) }
+}
+
 pub fn host_allowed(host: &str, allow: &[String]) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    if h.is_empty() {
+    let Some(h) = normalized_host(host) else {
         return false;
-    }
+    };
     allow.iter().any(|entry| {
         let e = entry
             .trim()
@@ -115,16 +131,54 @@ pub fn parse_http_host(request_line: &str, headers: &str) -> Option<String> {
             }
         }
     }
-    // fall back to the Host header
-    for h in headers.lines() {
-        if let Some(v) = h
-            .split_once(':')
-            .filter(|(k, _)| k.trim().eq_ignore_ascii_case("Host"))
-        {
-            return host_of_authority(v.1.trim());
-        }
+    // fall back to the Host header, through the one function that recognises it
+    host_header_values(headers).next().and_then(host_of_authority)
+}
+
+/// Every `Host:` field value in a head, in order, borrowed from it.
+///
+/// ONE PLACE RECOGNISES THE HEADER. `parse_http_host`'s fallback below and the agreement check both
+/// have to find the same field, and they used to look for it with two copies of the same
+/// `split_once(':')` + `eq_ignore_ascii_case("Host")` test. Any later change to what counts as the
+/// header (an obs-fold continuation, whitespace before the colon, a `Host` in a trailer) then lands in
+/// one of them, and the check silently stops guarding the value that is actually dialled.
+///
+/// An iterator rather than a count plus a value: the only question anyone asks is "none, one, or more
+/// than one", which `next()` twice answers without a tally that could be read apart from the value.
+fn host_header_values(headers: &str) -> impl Iterator<Item = &str> {
+    headers
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("Host"))
+        .map(|(_, v)| v.trim())
+}
+
+/// Whether a plain-HTTP head is self-consistent about WHICH host it is for: at most one `Host:` line,
+/// and if there is one it names the same host the request-target does. `target` is the already-parsed
+/// and allowlist-vetted host (`parse_http_host`).
+///
+/// Both halves answer the same question - "could the upstream pick a different site than the one we
+/// vetted?" - and the answer must be no before the head is forwarded. A head with NO `Host:` at all is
+/// consistent by construction (HTTP/1.0 without it is legal and there is nothing to disagree with);
+/// the target was vetted, so that is the site that gets served.
+pub fn http_head_names_one_host(target: &str, headers: &str) -> bool {
+    let mut values = host_header_values(headers);
+    match (values.next(), values.next()) {
+        // NO `Host:` AT ALL is consistent by construction: HTTP/1.0 without one is legal, the target
+        // was vetted, and there is nothing that could disagree with it.
+        (None, _) => true,
+        // TWO OR MORE, whatever they say. RFC 9112 §3.2 makes such a message invalid, and the reason is
+        // this exact disagreement class: we would vet the first and an upstream may honour the last.
+        (Some(_), Some(_)) => false,
+        // ONE, so it has to be the host we vetted - normalised through `normalized_host`, which is also
+        // what the allowlist decided with, so the guard and the decision it guards cannot disagree.
+        // PRESENT-BUT-UNPARSABLE IS NOT ABSENT: `Host:   ` names no host, and forwarding a malformed
+        // field an upstream may read differently than we did is the same class as carrying two.
+        (Some(v), None) => match (host_of_authority(v), normalized_host(target)) {
+            (Some(h), Some(t)) => h == t,
+            _ => false,
+        },
     }
-    None
 }
 
 /// The bare host of an `authority` (`host`, `host:port`, `[v6]:port`), lowercased, brackets/port
@@ -143,12 +197,7 @@ fn host_of_authority(authority: &str) -> Option<String> {
         // host:port → host (rsplit so a bare host with no colon works too)
         a.rsplit_once(':').map(|(h, _)| h).unwrap_or(a)
     };
-    let host = host.trim();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_ascii_lowercase())
-    }
+    normalized_host(host)
 }
 
 /// Ports the proxy will tunnel to. A domain allowlist is about reaching a web host, not arbitrary
@@ -655,6 +704,16 @@ fn handle_client(mut client: UnixStream, allow: &[String]) {
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             return;
         }
+        // THE HEAD HAS TO NAME ONE HOST, and it is checked AFTER the allowlist so a refusal cannot be
+        // used to probe what is on the list. Without this the proxy dialled the vetted request-target
+        // and forwarded a `Host:` naming somewhere else, which on a shared front is served as that
+        // somewhere else: domain fronting over port 80, measured from outside. Silent like its sibling
+        // refusals above: the response says 403 and nothing is logged, because a box that can drive a
+        // log line has a channel.
+        if !http_head_names_one_host(&host, headers) {
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+            return;
+        }
         let mut upstream = match connect_vetted(&host, port) {
             Ok(u) => u,
             Err(e) => {
@@ -940,6 +999,65 @@ mod tests {
 
     fn allow(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every shape a head can take about WHICH host it is for, enumerated rather than walked: the
+    /// control is one comparison, and a comparison is exactly what a later edit flips.
+    #[test]
+    fn a_plain_http_head_must_name_exactly_one_host() {
+        // THE DEFECT, measured from outside against 0.31.0: the request-target is on the allowlist, the
+        // `Host:` names somewhere else, and a shared front serves that somewhere else.
+        assert!(!http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost: www.python.org\r\nAccept: */*\r\n\r\n"
+        ));
+        // Agreement, in every spelling of the same host.
+        assert!(http_head_names_one_host("pypi.org", "\r\nHost: pypi.org\r\n\r\n"));
+        assert!(http_head_names_one_host("pypi.org", "\r\nHost: PyPI.ORG\r\n\r\n")); // case
+        assert!(http_head_names_one_host("pypi.org", "\r\nHost: pypi.org.\r\n\r\n")); // trailing dot
+        assert!(http_head_names_one_host("pypi.org", "\r\nHost: pypi.org:80\r\n\r\n")); // port
+        assert!(http_head_names_one_host("pypi.org", "\r\nhost: pypi.org\r\n\r\n")); // header case
+        assert!(http_head_names_one_host("pypi.org", "\r\nHost:   pypi.org  \r\n\r\n")); // padding
+        // NO `Host:` AT ALL is consistent: HTTP/1.0 without one is legal, the target was vetted, and
+        // there is nothing that could disagree with it.
+        assert!(http_head_names_one_host("pypi.org", "\r\nAccept: */*\r\n\r\n"));
+        assert!(http_head_names_one_host("pypi.org", ""));
+        // TWO `Host:` LINES are refused whatever they say, including when they agree: RFC 9112 makes
+        // such a message invalid, and the reason is that we vet one and an upstream may honour another.
+        assert!(!http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost: pypi.org\r\nHost: pypi.org\r\n\r\n"
+        ));
+        assert!(!http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost: pypi.org\r\nHost: evil.com\r\n\r\n"
+        ));
+        assert!(!http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost: evil.com\r\nHost: pypi.org\r\n\r\n"
+        ));
+        // The userinfo trick `host_of_authority` already strips, asked HERE too, because this is the
+        // comparison that decides and it must see the same host the RFC does.
+        assert!(!http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost: pypi.org@evil.com\r\n\r\n"
+        ));
+        // A `Host:` that does not parse to a host at all (empty authority) is not agreement.
+        assert!(!http_head_names_one_host("pypi.org", "\r\nHost:   \r\n\r\n"));
+    }
+
+    /// WHAT IS NOT THE `Host:` HEADER, asserted through the function that decides rather than through
+    /// the scan it uses: a name that merely CONTAINS "host" and a line with no colon are not fields, so
+    /// a head carrying only those has nothing that could disagree with the vetted target.
+    #[test]
+    fn a_header_that_is_not_the_host_field_does_not_count_as_one() {
+        assert!(http_head_names_one_host("pypi.org", "\r\nX-Forwarded-Host: evil.com\r\n\r\n"));
+        assert!(http_head_names_one_host("pypi.org", "\r\nHost\r\n\r\n"));
+        // And the one that IS the header still decides, next to them.
+        assert!(!http_head_names_one_host(
+            "pypi.org",
+            "\r\nX-Forwarded-Host: pypi.org\r\nHost: evil.com\r\n\r\n"
+        ));
     }
 
     #[test]

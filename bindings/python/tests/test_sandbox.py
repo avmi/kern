@@ -5898,7 +5898,20 @@ def test_the_fault_vocabulary_is_one_set_in_both_bindings_and_in_every_fault_the
     import re
     import typing
 
-    frozen = {"timeout", "oom", "escape_blocked", "killed", "startup_failed", "exec_failed"}
+    frozen = {
+        "timeout",
+        "oom",
+        "escape_blocked",
+        "killed",
+        "startup_failed",
+        "exec_failed",
+        # ADDED, and additive: no existing value changed meaning, which is the only kind of change the
+        # stability note at the top of CHANGELOG.md allows without leading a release entry. A box the
+        # binding stopped because the workspace crossed `workspace_max_bytes` DURING the call used to
+        # come back as `timeout` (the teardown is the deadline's), which was true of how it died and
+        # wrong about why.
+        "workspace_full",
+    }
     hints = typing.get_type_hints(kern.SandboxFault)
     declared_py = set(typing.get_args(hints["type"]))
     assert declared_py == frozen, f"the Python Literal moved: {declared_py ^ frozen}"

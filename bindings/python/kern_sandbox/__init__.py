@@ -97,7 +97,9 @@ _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside ev
 _RESIDENT_GONE = "no running box named"
 
 
-def _workspace_usage(root: str, blind: "list[str] | None" = None) -> int:
+def _workspace_usage(
+    root: str, blind: "list[str] | None" = None, regranted: "list[str] | None" = None
+) -> int:
     """Bytes the workspace occupies ON DISK, or 0 when it cannot be read.
 
     `st_blocks * 512` and NOT `st_size`, because the question is "how much of the disk is gone" and
@@ -134,11 +136,31 @@ def _workspace_usage(root: str, blind: "list[str] | None" = None) -> int:
     try:
         base_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError as e:
-        if blind is None and e.errno in (errno.EACCES, errno.EPERM):
-            raise
-        if e.errno in (errno.EACCES, errno.EPERM):
+        if e.errno not in _DENIED_ERRNOS:
+            return total
+        if _regrant_dir_at(root, inside=root):
+            # Ours, and closed to us from inside the box: the bits are back, so open it once more.
+            if regranted is not None:
+                regranted.append(root)
+            try:
+                base_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            except OSError as e2:
+                if blind is None:
+                    raise SandboxError(
+                        f"the workspace root {root} cannot be read by this process and reopening it "
+                        f"after restoring its owner bits still failed: {e2}"
+                    ) from e2
+                blind.append(root)
+                return total
+        elif blind is None:
+            raise SandboxError(
+                f"the workspace root {root} cannot be read by this process and its owner bits could "
+                f"not be restored (not ours, or no /proc to reach the pinned descriptor), so nothing "
+                f"under it can be measured: {e}"
+            ) from e
+        else:
             blind.append(root)
-        return total
+            return total
     # (path, parent descriptor) to open and list, or (None, fd) to close - see `_walk`, same shape.
     stack: "list[tuple[str | None, int]]" = [(root, -1)]
     try:
@@ -151,34 +173,52 @@ def _workspace_usage(root: str, blind: "list[str] | None" = None) -> int:
                 fd = base_fd
             else:
                 flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                name = os.path.basename(current)
                 try:
-                    fd = os.open(os.path.basename(current), flags, dir_fd=parent_fd)
-                except (PermissionError, OSError) as e:
-                    if e.errno in (errno.EACCES, errno.EPERM):
+                    fd = os.open(name, flags, dir_fd=parent_fd)
+                except OSError as e:
+                    if e.errno not in _DENIED_ERRNOS:
+                        if e.errno not in _WALK_GONE:
+                            raise
+                        continue
+                    fd = -1
+                    if _regrant_dir_at(name, parent_fd, inside=root):
+                        if regranted is not None:
+                            regranted.append(current)
+                        try:
+                            fd = os.open(name, flags, dir_fd=parent_fd)
+                        except OSError:
+                            fd = -1
+                    if fd < 0:
                         unreadable.append(current)
-                    elif e.errno not in _WALK_GONE:
-                        raise
-                    continue
+                        continue
             keep_open = False
             try:
-                stats = []
+                stats: "list" = []
                 closed = False
-                try:
-                    with os.scandir(fd) as it:
-                        for entry in it:
-                            try:
-                                stats.append((entry.name, entry.stat(follow_symlinks=False)))
-                            except PermissionError:
-                                closed = True  # listable, not searchable
-                                break
-                            except OSError:
-                                continue
-                except PermissionError:
-                    closed, stats = True, []
-                except OSError as e:
-                    if e.errno not in _WALK_GONE:
-                        raise
-                    stats = []
+                for attempt in (0, 1):
+                    stats, closed = [], False
+                    try:
+                        with os.scandir(fd) as it:
+                            for entry in it:
+                                try:
+                                    stats.append((entry.name, entry.stat(follow_symlinks=False)))
+                                except PermissionError:
+                                    closed = True  # listable, not searchable
+                                    break
+                                except OSError:
+                                    continue
+                    except PermissionError:
+                        closed, stats = True, []
+                    except OSError as e:
+                        if e.errno not in _WALK_GONE:
+                            raise
+                        stats = []
+                    # ONE retry, and only once the mode has actually changed: this cannot loop.
+                    if not closed or attempt or not _regrant_own_dir(fd, root):
+                        break
+                    if regranted is not None:
+                        regranted.append(current)
                 if closed:
                     unreadable.append(current)
                     continue
@@ -210,8 +250,9 @@ def _workspace_usage(root: str, blind: "list[str] | None" = None) -> int:
         if blind is None:
             raise SandboxError(
                 f"the workspace cannot be measured: {len(unreadable)} directory(ies) under "
-                f"{root} cannot be read by this process, and counting them as empty would let a "
-                f"cap's worth of bytes sit where the walk does not look "
+                f"{root} cannot be read by this process and the owner bits could not be restored "
+                f"(not ours, or no /proc to reach the pinned descriptor), and counting them as "
+                f"empty would let a cap's worth of bytes sit where the walk does not look "
                 f"(first: {_quote_untrusted(unreadable[0])})"
             )
         blind.extend(unreadable)
@@ -618,6 +659,124 @@ def _snapshot_origin_note(record: "dict | None", image: str, machine: str, has_d
 # EVERYTHING ELSE IS RAISED. Running out of descriptors or memory, or a failing disk, used to read as
 # churn too, and a walk that loses a subtree to that reports a workspace smaller than it is.
 _WALK_GONE = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
+# "there, and closed to this process": the only refusal a directory of OUR OWN can answer with, and
+# the one a box can produce from inside its workspace with a single `os.chmod(d, 0)`.
+_DENIED_ERRNOS = (errno.EACCES, errno.EPERM)
+# What this process needs on a directory to walk it: read (list the names) and search (stat them).
+_OWN_DIR_BITS = stat.S_IRUSR | stat.S_IXUSR
+
+
+def _pinned_within(fd: int, inside: str) -> bool:
+    """Whether the inode `fd` pins really lies under `inside`, asked of the DESCRIPTOR.
+
+    WHY: three of the repair's callers pass a plain PATH, where `O_NOFOLLOW` guards only the LAST
+    component - the usage walk is by path throughout, and two walks fall back to the root path after a
+    descent has already failed. A box that swaps an intermediate component for a symlink in that
+    window sends the pin somewhere else, and an adversarial review of the first fix showed the `chmod`
+    could then land on a directory of this user's OUTSIDE the workspace. It is not an escalation (the
+    bits are ones this user could already set on a file it already owns), but the comment above
+    claimed the change stays inside the workspace tree, and this is what makes that true rather than
+    nearly true. `/proc/self/fd/<n>` reads back the path of the PINNED INODE, so the answer is about
+    the inode and not about the name it was opened under.
+    """
+    try:
+        real = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return False
+    root = inside.rstrip("/")
+    return real == root or real.startswith(root + "/")
+
+
+def _regrant_own_dir(fd: int, inside: "str | None" = None) -> bool:
+    """Put owner read+search back on the directory `fd` refers to, IF THIS PROCESS OWNS IT.
+
+    WHY IT EXISTS. `os.makedirs("hid"); os.chmod("hid", 0)` is two lines inside a box, and before this
+    every host-side walk answered them with a raw `PermissionError` raised out of the REPORTING path:
+    it destroyed the result of the call that had already run, and every later call on the session
+    failed the same way until someone fixed the mode by hand. The workspace is kern's own reporting
+    surface and the host user owns the directories in it, so that refusal is self-inflicted and
+    repairable without asking anything of anyone.
+
+    IT ALSO CLOSES A COOPERATIVE-CAP BYPASS that `_workspace_usage` documents in full: write two
+    gigabytes into `h/`, `chmod` it to 0, and every later measurement reads those bytes as nothing.
+    With the bits restored the bytes are counted again.
+
+    OWNERSHIP IS THE WHOLE GUARD, AND IT IS READ FROM THE DESCRIPTOR, never from a path. `fstat` on
+    the descriptor the caller already opened `O_NOFOLLOW` names one inode for the whole check, so a
+    directory swapped for a symlink between the test and the change cannot redirect the `chmod` onto
+    a host file. A directory owned by SOMEONE ELSE - the `user=` session, where the box user is a uid
+    of the subordinate range and not ours - is left exactly as it is and handled by the helper box,
+    which is the only thing that can read it.
+
+    Returns True ONLY when the mode actually changed, so a caller may retry exactly once and can
+    never loop on a refusal the mode does not explain (an immutable attribute, a MAC policy, a
+    read-only mount).
+    """
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid != os.geteuid():
+        return False
+    if inside is not None and not _pinned_within(fd, inside):
+        return False
+    want = (st.st_mode & 0o7777) | _OWN_DIR_BITS
+    if want == st.st_mode & 0o7777:
+        return False  # the bits are already there, so the mode is not what refused
+    try:
+        os.fchmod(fd, want)
+        return True
+    except OSError:
+        pass
+    # TWO BRANCHES, AND WHICH ONE RUNS IS THE LIBC'S CHOICE, measured on seven host shapes:
+    #
+    #   * on GLIBC an `O_PATH` descriptor refuses `fchmod` with EBADF, so the `chmod` below does the
+    #     work - `/proc/self/fd/<n>` resolves to the inode that descriptor PINS, so the change still
+    #     cannot be redirected by renaming or symlinking the name it was opened under;
+    #   * on MUSL `fchmod` SUCCEEDS on an `O_PATH` descriptor, because musl's own implementation falls
+    #     back to `/proc/self/fd` internally. Measured on alpine, x86_64 AND aarch64 - which is the
+    #     release's own target - against glibc 2.39/2.41 on Ubuntu 24.04, Debian and the VPS.
+    #
+    # So both paths end in the same syscall on the same pinned inode, and neither is dead code: each
+    # libc exercises exactly one of them, which is also why a test on one of them covers only half.
+    # Without `/proc` at all there is no second way, and the caller falls back to the helper box.
+    try:
+        os.chmod(f"/proc/self/fd/{fd}", want)
+        return True
+    except OSError:
+        return False
+
+
+def _regrant_dir_at(name: str, dir_fd: "int | None" = None, inside: "str | None" = None) -> bool:
+    """`_regrant_own_dir` for a directory that refused the OPEN itself: pin the inode first.
+
+    `O_PATH` needs no permission on the file it opens - only search on the path to it, which the
+    caller already holds through `dir_fd` - so it succeeds on the mode-0 directory that just refused
+    `O_RDONLY`. `O_NOFOLLOW` keeps a symlink planted under that name from being the thing opened, and
+    `dir_fd=None` lets the same spelling serve an absolute root.
+    """
+    try:
+        pfd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        return _regrant_own_dir(pfd, inside)
+    finally:
+        os.close(pfd)
+
+
+def _warn_regranted(names: "list[str]") -> None:
+    """One line when a walk had to put mode bits back, because it changed BOX-VISIBLE state."""
+    if names:
+        warnings.warn(
+            f"restored owner read+search on {len(names)} workspace directory(ies) that the box had "
+            f"closed to this process, so the listing and any size cap stay measurable "
+            f"(first: {_quote_untrusted(names[0])})",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 # -- the standard library's bytecode, compiled once per image and mounted READ-ONLY ------------------
 #
@@ -2214,7 +2373,15 @@ class SandboxFault:
     failure - never MISS a real one, so it fails in the safe direction. Pair this binding with the
     matching (or newer) kern release for the unforgeable guarantee."""
 
-    type: Literal["timeout", "oom", "escape_blocked", "killed", "startup_failed", "exec_failed"]
+    type: Literal[
+        "timeout",
+        "oom",
+        "escape_blocked",
+        "killed",
+        "startup_failed",
+        "exec_failed",
+        "workspace_full",
+    ]
     message: str
 
 
@@ -2688,7 +2855,52 @@ class ExecutionResult:
         return self.success
 
 
-def _wait_for_exit(proc: "subprocess.Popen", timeout: "float | None") -> bool:
+#: The first interval between two in-call workspace measurements. It is only the FIRST: the poller
+#: multiplies it by how long the measurement took, so the walk can never cost more than about a tenth
+#: of the call's wall time on a workspace with many files.
+_CAP_POLL_S = 1.0
+
+
+def _wait_by_backoff(
+    proc: "subprocess.Popen",
+    timeout: "float | None",
+    tick_s: "float | None",
+    on_tick: "Callable[[], float | None] | None",
+) -> bool:
+    """`Popen.wait`, taken in slices when a tick is asked for. The slow path of `_wait_for_exit`: no
+    pidfd on this kernel, or a `poll` that failed. Same contract, same tick semantics.
+
+    `tick is None` is the ONE thing that means "do not slice", derived once from `on_tick` and then
+    re-derived by every answer the callback gives. A separate `ticking` flag was a third piece of state
+    that had to track the other two, and the first thing it did was go stale: it was re-assigned to
+    True where it already was."""
+    end = None if timeout is None else time.monotonic() + timeout
+    tick = tick_s if on_tick is not None else None
+    while True:
+        remaining = None if end is None else end - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            return False
+        if tick is None:
+            slice_s = remaining
+        else:
+            slice_s = tick if remaining is None else min(remaining, tick)
+        try:
+            proc.wait(timeout=slice_s)
+            return True
+        except subprocess.TimeoutExpired:
+            if tick is None or on_tick is None:
+                return False
+            tick = on_tick()
+            if tick is None:
+                return False
+
+
+def _wait_for_exit(
+    proc: "subprocess.Popen",
+    timeout: "float | None",
+    tick_s: "float | None" = None,
+    on_tick: "Callable[[], float | None] | None" = None,
+) -> bool:
     """Block until ``proc`` exits, or until ``timeout`` seconds elapse. True iff it exited.
 
     WHY NOT ``Popen.wait(timeout=...)``
@@ -2721,30 +2933,44 @@ def _wait_for_exit(proc: "subprocess.Popen", timeout: "float | None") -> bool:
         fd = os.pidfd_open(proc.pid, 0)
     except (AttributeError, OSError):
         # No pidfd here. Poll exactly as CPython would have, and keep the same contract.
-        try:
-            proc.wait(timeout=timeout)
-            return True
-        except subprocess.TimeoutExpired:
-            return False
+        return _wait_by_backoff(proc, timeout, tick_s, on_tick)
     try:
         poller = select.poll()
         poller.register(fd, select.POLLIN)
-        # poll() takes milliseconds. Round UP, never down: rounding a sub-millisecond deadline to 0
-        # would turn a short timeout into an instant one and mislabel a healthy run as a timeout.
-        # A negative timeout means "block forever", which is what timeout=None asks for.
-        ms = -1 if timeout is None else int(timeout * 1000.0 + 0.999)
-        # PEP 475: poll() is retried across EINTR with a recomputed deadline, so a signal arriving
-        # mid-wait cannot cut the deadline short.
-        if not poller.poll(ms):
-            return False
+        end = None if timeout is None else time.monotonic() + timeout
+        # `tick is None` means "do not slice", and it is the only state that says so: see
+        # `_wait_by_backoff` for why a separate flag was worse.
+        tick = tick_s if on_tick is not None else None
+        while True:
+            remaining = None if end is None else end - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            # THE SLICE IS THE ONLY THING THE TICK CHANGES, and with no tick there is exactly one
+            # `poll` for the whole deadline - byte for byte the call this function was written to
+            # make. The pidfd becomes readable the instant the child exits, so slicing the wait costs
+            # no latency on the exit itself: what it adds is wake-ups while the box is still running,
+            # and those happen only when a caller asked for them.
+            if tick is None:
+                slice_s = remaining
+            else:
+                slice_s = tick if remaining is None else min(remaining, tick)
+            # poll() takes milliseconds. Round UP, never down: rounding a sub-millisecond deadline to 0
+            # would turn a short timeout into an instant one and mislabel a healthy run as a timeout.
+            # A negative timeout means "block forever", which is what timeout=None asks for.
+            ms = -1 if slice_s is None else int(slice_s * 1000.0 + 0.999)
+            # PEP 475: poll() is retried across EINTR with a recomputed deadline, so a signal arriving
+            # mid-wait cannot cut the deadline short.
+            if poller.poll(ms):
+                break
+            if tick is None or on_tick is None:
+                return False  # the deadline itself
+            tick = on_tick()
+            if tick is None:
+                return False  # the caller stopped the wait, and it knows its own reason
     except OSError:
         # poll() itself failed. Degrade to the backoff wait rather than report an exit we did not
         # observe: claiming a timeout here would kill a healthy box.
-        try:
-            proc.wait(timeout=timeout)
-            return True
-        except subprocess.TimeoutExpired:
-            return False
+        return _wait_by_backoff(proc, timeout, tick_s, on_tick)
     finally:
         os.close(fd)
     # The child is a zombie at this point, so this reap returns at once and cannot poll.
@@ -4896,8 +5122,9 @@ class Sandbox:
         # hottest, turns tracking off and sets no cap.
         if self.workspace_max_bytes is not None and self._ws:
             blind: list[str] = []
+            regranted: list[str] = []
             try:
-                used = _workspace_usage(self._ws, blind if self._shared else None)
+                used = _workspace_usage(self._ws, blind if self._shared else None, regranted)
             except SandboxError as e:
                 # A SESSION WITH NO BOX USER TO ASK. There is no helper box to size what this process
                 # cannot read (the helper runs AS the box user, and here that user is this process),
@@ -4907,6 +5134,8 @@ class Sandbox:
                     f"workspace_max_bytes cannot be measured, so this call was refused before "
                     f"running: {e}"
                 ) from e
+            finally:
+                _warn_regranted(regranted)
             if blind:
                 # WHAT THE BOX USER CLOSED TO US IS MEASURED BY THE BOX USER, in the unit `du` and the
                 # walk share (allocated blocks). Counting it as zero would let a non-root session park a
@@ -5048,7 +5277,44 @@ class Sandbox:
             # polling: `Popen.wait(timeout=)` would sleep past the box's exit by 3.2 ms on every
             # call (see _wait_for_exit). The teardown stays HERE, on this thread, where the child is
             # still an unreaped zombie and its pid therefore cannot have been recycled under us.
-            we_timed_out = not _wait_for_exit(proc, timeout_s)
+            # THE CAP, ENFORCED WHILE THE CALL RUNS AND NOT ONLY BETWEEN CALLS. The check above bounds
+            # what ACCUMULATES across calls, which is all a cooperative cap can do from outside; it does
+            # not bound ONE call, and it was measured not bounding one: a cell wrote 8,115 MB in ten
+            # seconds against a 50 MiB cap and was admitted, because the next check is the next call.
+            # This poller closes that, with three properties that matter more than the feature:
+            #
+            #   * IT COSTS NOTHING WHEN UNSET, which is the default and is the MCP server's shape: with
+            #     no cap there is no tick, and `_wait_for_exit` makes the single `poll` it always made.
+            #   * IT IS SELF-LIMITING. The walk is O(files), so the next interval is ten times the last
+            #     measurement's duration (floor `_CAP_POLL_S`): on a workspace with many files the
+            #     poller backs off instead of competing with the workload for the disk.
+            #   * IT NEVER KILLS ON "I DON'T KNOW". A measurement that cannot be taken (a directory the
+            #     box closed that is not ours to repair, so there is no helper to ask mid-call) keeps the
+            #     wait going; the pre-call check still refuses the NEXT call. The bound it buys is
+            #     therefore for every session the host can read, which is every session without `user=`.
+            #
+            # OVERSHOOT IS REAL AND BOUNDED BY THE INTERVAL: at the ~810 MB/s measured on this host a
+            # one-second floor can let ~800 MB past the cap before the box is stopped. That is the trade
+            # against walking the workspace continuously, and it is three orders off the 8 GB it replaces.
+            cap_overrun: "int | None" = None
+            cap_limit = self.workspace_max_bytes
+
+            def _cap_tick() -> "float | None":
+                # No `cap_limit is None` test: the tick is only installed when it is set, and
+                # `_wait_for_exit` only consults a tick it was given.
+                nonlocal cap_overrun
+                t0 = time.monotonic()
+                try:
+                    used = _workspace_usage(self._ws, None, None)
+                except (SandboxError, OSError):
+                    return _CAP_POLL_S  # cannot measure right now: keep waiting, never kill on unknown
+                if used > cap_limit:
+                    cap_overrun = used
+                    return None
+                return max(_CAP_POLL_S, (time.monotonic() - t0) * 10.0)
+
+            cap_tick = _CAP_POLL_S if (cap_limit is not None and self._ws) else None
+            we_timed_out = not _wait_for_exit(proc, timeout_s, cap_tick, _cap_tick)
             if we_timed_out:
                 # BEFORE THE KILL, and that ordering IS the measurement. Our teardown kills kern, every
                 # copy of the alive fd closes with it, and the read end then shows EOF whatever the box was
@@ -5110,10 +5376,27 @@ class Sandbox:
         # this aligns the number for code that does not.
         if rc < 0:
             rc = 128 + (-rc)
+        # THE OVERRIDE IS HERE AND NOT IN `_classify`, deliberately. That function is a pure function
+        # of the signals kern sends, it is byte-identical in the two bindings, and a value it already
+        # returns changing meaning is a BREAKING change for anyone branching on `fault.type`. The cap
+        # kill is new information this call site owns - it is the thing that stopped the box - so it
+        # replaces the classification afterwards instead of being threaded through it. The teardown
+        # above is the timeout's own, which is why `_classify` would otherwise say `timeout` here: true
+        # of how the box died, wrong about why.
         fault = self._classify(
             rc, stderr, we_timed_out, timeout_s, cap_signal, oom_signal, alive_state, workload_signal,
             box_started,
         )
+        if cap_overrun is not None:  # only ever assigned past the limit, so the limit was set
+            fault = SandboxFault(
+                "workspace_full",
+                f"the workspace reached {cap_overrun} bytes, over the {cap_limit}-byte "
+                f"workspace_max_bytes, so the box was stopped mid-call. The cap is measured while the "
+                f"call runs, so it bounds ONE call and not only what accumulates across them; the "
+                f"overshoot is whatever the box wrote between two measurements. The box writes to a "
+                f"host directory ({self._ws}), so this is still not a kernel boundary: put the "
+                f"workspace on a filesystem whose size you chose and the kernel answers ENOSPC instead",
+            )
         # IDENTIFYING ITSELF IS NOT BEHAVING, and this is the layer that says so. `_verify_is_kern`
         # refuses a binary that does not answer `kern <version>`; a stub that DOES answer it and then
         # exits 0 got through, and the call came back `success=True, exit_code=0, fault=None` with an
@@ -5539,7 +5822,7 @@ class Sandbox:
         parts = [p for p in os.path.relpath(os.path.dirname(full), self._ws).split(os.sep) if p and p != "."]
         if not parts:
             return  # parent is the workspace root itself
-        root = os.open(self._ws, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        root = self._ws_fd()
         try:
             fd = self._descend_dirs(root, parts, create=True)
             if fd != root:
@@ -5564,10 +5847,10 @@ class Sandbox:
             fd = self._open_nofollow(full, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         except PermissionError as e:
             if not self._shared:
-                raise _path_refusal("write", path, e) from e
+                raise _path_refusal("write", path, e, writing=True) from e
             closed = e
         except OSError as e:
-            raise _path_refusal("write", path, e) from e
+            raise _path_refusal("write", path, e, writing=True) from e
         else:
             with os.fdopen(fd, "wb") as f:
                 f.write(payload)
@@ -5612,15 +5895,24 @@ class Sandbox:
             raise SandboxError("refusing to open the workspace root as a file")
         cloexec = getattr(os, "O_CLOEXEC", 0)
         nonblock = getattr(os, "O_NONBLOCK", 0)
-        dir_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | cloexec)
+        base_fd = self._ws_fd()  # `base` IS `self._ws`, and the root needs the same repair
         try:
-            for part in parts[:-1]:
-                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec, dir_fd=dir_fd)
-                os.close(dir_fd)
-                dir_fd = nxt
-            fd = os.open(parts[-1], flags | os.O_NOFOLLOW | cloexec | nonblock, mode, dir_fd=dir_fd)
+            # ONE DESCENT SPELLING, and the difference was visible from outside. This loop used to be
+            # its own, so a directory SYMLINK in the middle of a READ surfaced as a bare
+            # `[Errno 20] Not a directory` while the identical shape on the write path said "path
+            # escapes the workspace via a symlinked directory": same refusal, and only one of them
+            # named the mechanism. `_descend_dirs` is that spelling, with the `O_NOFOLLOW` descent
+            # this docstring describes.
+            dir_fd = self._descend_dirs(base_fd, parts[:-1], create=False)
+            try:
+                fd = os.open(
+                    parts[-1], flags | os.O_NOFOLLOW | cloexec | nonblock, mode, dir_fd=dir_fd
+                )
+            finally:
+                if dir_fd != base_fd:
+                    os.close(dir_fd)
         finally:
-            os.close(dir_fd)
+            os.close(base_fd)
         wanted_dir = bool(flags & getattr(os, "O_DIRECTORY", 0))
         try:
             mode_bits = os.fstat(fd).st_mode
@@ -5656,10 +5948,10 @@ class Sandbox:
             fd = self._open_nofollow(full, os.O_RDONLY)
         except PermissionError as e:
             if not self._shared:
-                raise _path_refusal("read", path, e) from e
+                raise _path_refusal("read", path, e, writing=False) from e
             closed = e
         except OSError as e:
-            raise _path_refusal("read", path, e) from e
+            raise _path_refusal("read", path, e, writing=False) from e
         if closed is not None:
             # A FILE THE BOX USER CLOSED TO US (0600, or inside its 0700): the helper reads it as its owner.
             data = self._helper_read(path, full, max_bytes)
@@ -5684,7 +5976,11 @@ class Sandbox:
     def _helper_refusal(self, verb: str, path: str, r: "subprocess.CompletedProcess[bytes]") -> "SandboxError":
         """The refusal a helper script's exit code stands for, in the words the host path uses."""
         if r.returncode == 40:
-            return _path_refusal(verb, path, OSError(errno.ELOOP, os.strerror(errno.ELOOP)))
+            # `writing=False` is not a guess: this builds an ELOOP refusal, and only the EACCES arm
+            # reads the flag.
+            return _path_refusal(
+                verb, path, OSError(errno.ELOOP, os.strerror(errno.ELOOP)), writing=False
+            )
         if r.returncode == 41:
             return SandboxError(
                 f"refusing to {verb} {path!r}: not a regular file (a FIFO, device or socket planted in "
@@ -5724,13 +6020,13 @@ class Sandbox:
                 os.close(fd)
             except PermissionError as e:
                 if not self._shared:
-                    raise _path_refusal("list", subdir, e) from e
+                    raise _path_refusal("list", subdir, e, writing=False) from e
                 # The same check, by the box user: a directory, no symlink on the way.
                 r = self._ws_helper(_HELPER_ISDIR, *self._helper_parts(root))
                 if r.returncode != 0:
                     raise self._helper_refusal("list", subdir, r) from e
             except OSError as e:
-                raise _path_refusal("list", subdir, e) from e
+                raise _path_refusal("list", subdir, e, root, writing=False) from e
         else:
             root = self._ws  # _ws is canonical (set at enter)
         return [FileInfo(path=p, size=s, change="created") for p, (_, s) in self._walk(root).items()]
@@ -5762,7 +6058,7 @@ class Sandbox:
         # whatever host file it named. Outside the workspace the path is the caller's own.
         out_fd = self._open_in_workspace(dest, write=True)
         out = os.fdopen(out_fd, "wb") if out_fd is not None else None
-        root_fd = os.open(self._ws, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        root_fd = self._ws_fd()
         try:
             with tarfile.open(None if out is not None else dest, "w:gz", fileobj=out, compresslevel=1,
                               format=tarfile.USTAR_FORMAT) as tf:
@@ -5795,10 +6091,14 @@ class Sandbox:
                 info.mode = 0o644
                 tf.addfile(info, _io.BytesIO(record))
                 left_out: "list[str]" = []
+                regranted: "list[str]" = []
                 for entry in entries:
                     if entry in self._ours:
                         continue  # a name a call in flight claimed: ours, not user state
-                    self._snapshot_add(tf, root_fd, entry, entry, blind, dest_id, left_out)
+                    self._snapshot_add(
+                        tf, root_fd, entry, entry, blind, dest_id, left_out, regranted
+                    )
+                _warn_regranted(regranted)
                 if blind:
                     self._snapshot_blind(tf, blind, left_out)
         finally:
@@ -5826,6 +6126,7 @@ class Sandbox:
         blind: "list[str]",
         dest_id: "tuple[int, int] | None" = None,
         left_out: "list[str] | None" = None,
+        regranted: "list[str] | None" = None,
     ) -> None:
         """Archive ``name`` (listed from ``dir_fd``) as ``rel``, and what is under it.
 
@@ -5839,9 +6140,11 @@ class Sandbox:
 
         The members ``tf.add`` produced, from descriptors: a regular file through ``gettarinfo`` on the
         open file (so a second hard link is still a link member), everything else from its ``lstat``
-        and, for a symlink, ``readlink`` relative to ``dir_fd``. What the box user closed to this
-        process goes to ``blind`` on a shared workspace, for the helper; on any other it is the error
-        it always was.
+        and, for a symlink, ``readlink`` relative to ``dir_fd``. A DIRECTORY closed to this process is
+        reopened once its owner bits are put back, which is every directory of a session without
+        ``user=``; one that is NOT ours goes to ``blind`` on a shared workspace, for the helper, and on
+        any other it is the error it always was. A mode-0 FILE is left exactly as the box wrote it (the
+        mode can be the data), so it still takes that last path.
 
         ``dest_id`` is the archive's own (inode, device), skipped wherever it is met.
 
@@ -5851,8 +6154,20 @@ class Sandbox:
         disk is RAISED, because a snapshot that is quietly missing files is one a caller restores
         believing it whole - `tarfile.add` raised these too."""
         def set_aside(e: OSError) -> None:
+            """What this process cannot read. On a shared workspace the helper box takes it whole; with
+            no box user to ask it is RAISED, because a snapshot quietly missing files is one a caller
+            restores believing it whole - but NAMED, never as a bare `PermissionError`. Two shapes reach
+            here now that a directory of ours is repaired and retried: one that is NOT ours, and a box
+            that re-closes a directory inside the retry window (or leaves a mode-0 FILE, whose mode is
+            left exactly as it wrote it, because the mode can be the data). An errno with no subject is
+            what the caller used to get for all of them."""
             if not self._shared:
-                raise e
+                raise SandboxError(
+                    f"snapshot: cannot read {rel!r}, so the archive would be short. A directory of "
+                    f"ours has its owner bits put back and is retried, so this is either not ours, or "
+                    f"a file the box left at mode 0, or a directory it closed again while this walk "
+                    f"ran: {e}"
+                ) from e
             blind.append(rel)
 
         def churn(e: OSError) -> bool:
@@ -5865,8 +6180,19 @@ class Sandbox:
         except FileNotFoundError:
             return  # gone between the listing and the lstat: ordinary in a live workspace
         except PermissionError as e:
-            set_aside(e)
-            return
+            # The SEARCH bit is missing on the PARENT, not on this entry, and the parent is ours.
+            if not _regrant_own_dir(dir_fd, self._ws):
+                set_aside(e)
+                return
+            if regranted is not None:
+                regranted.append(rel)
+            try:
+                st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            except OSError as e2:
+                set_aside(e2)
+                return
         if stat.S_ISREG(st.st_mode):
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | cloexec, dir_fd=dir_fd)
@@ -5897,8 +6223,17 @@ class Sandbox:
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | cloexec, dir_fd=dir_fd)
             except PermissionError as e:
-                set_aside(e)
-                return
+                fd = -1
+                if _regrant_dir_at(name, dir_fd, inside=self._ws):
+                    if regranted is not None:
+                        regranted.append(rel)
+                    try:
+                        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | cloexec, dir_fd=dir_fd)
+                    except OSError:
+                        fd = -1
+                if fd < 0:
+                    set_aside(e)
+                    return
             except OSError as e:
                 if churn(e):
                     return  # swapped for a link or removed since the lstat
@@ -5908,14 +6243,25 @@ class Sandbox:
                 try:
                     names = sorted(os.listdir(fd))
                 except PermissionError as e:
-                    set_aside(e)  # its header is in; the helper's copy repeats it with the contents
-                    return
+                    if not _regrant_own_dir(fd, self._ws):
+                        # its header is in; the helper's copy repeats it with the contents
+                        set_aside(e)
+                        return
+                    if regranted is not None:
+                        regranted.append(rel)
+                    try:
+                        names = sorted(os.listdir(fd))
+                    except OSError as e2:
+                        set_aside(e2)
+                        return
                 except OSError as e:
                     if not churn(e):
                         raise
                     return
                 for child in names:
-                    self._snapshot_add(tf, fd, child, f"{rel}/{child}", blind, dest_id, left_out)
+                    self._snapshot_add(
+                        tf, fd, child, f"{rel}/{child}", blind, dest_id, left_out, regranted
+                    )
             finally:
                 os.close(fd)
             return
@@ -6104,7 +6450,7 @@ class Sandbox:
         owner had none, and is always readable and writable by its owner; a directory's mode is not
         taken from the archive; mtimes are; ownership never is. Directories get their mtime last,
         deepest first, so writing into one does not undo it. A colliding file is overwritten."""
-        root = os.open(self._ws, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        root = self._ws_fd()
         dirs: "list[tuple[list[str], float]]" = []
         try:
             for m in members:
@@ -6127,7 +6473,7 @@ class Sandbox:
                     except PermissionError:
                         raise
                     except OSError as e:
-                        raise _path_refusal("restore", m.name, e) from e
+                        raise _path_refusal("restore", m.name, e, writing=True) from e
                     try:
                         if not stat.S_ISREG(os.fstat(out).st_mode):
                             raise SandboxError(f"refusing to restore {m.name!r}: not a regular file in the workspace")
@@ -6216,7 +6562,7 @@ class Sandbox:
         parts = [p for p in rel.split(os.sep) if p and p != "."]
         if not parts:
             raise SandboxError(f"cannot {verb} the workspace directory itself")
-        root = os.open(self._ws, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        root = self._ws_fd()
         try:
             parent_fd = self._descend_dirs(root, parts[:-1], create=False)
             try:
@@ -6225,7 +6571,9 @@ class Sandbox:
                 try:
                     fd = os.open(parts[-1], flags, 0o644, dir_fd=parent_fd)
                 except OSError as e:
-                    raise _path_refusal(verb, rel, e) from e
+                    # `writing=write` and not a test on `verb`: the verb here is "snapshot to" or
+                    # "restore from", and the fact is the flag three lines up.
+                    raise _path_refusal(verb, rel, e, os.path.join(ws, rel), writing=write) from e
             finally:
                 if parent_fd != root:
                     os.close(parent_fd)
@@ -6238,54 +6586,114 @@ class Sandbox:
             os.set_blocking(fd, True)
         return fd
 
+    def _ws_fd(self) -> int:
+        """A descriptor on the workspace ROOT, with the same repair every directory under it gets.
+
+        THE PLACE A HOSTILE CELL REACHES FIRST, and the one the first version of this repair missed:
+        `os.chmod("/workspace", 0)` is the same primitive as closing a subdirectory, and it came out of
+        here as a bare `PermissionError` - because the descent that repairs is HANDED this descriptor
+        and never opens it, so `_descend_dirs(base_fd, [])` returns it untouched and the refusal has
+        already happened. Found by an adversarial review of the first fix, reproduced in both bindings.
+
+        Six callers open the root (the diff walk, the snapshot, the one descent, read and write,
+        restore, ensure-parents) and they all come through here. `self._ws` is canonical, resolved at
+        enter, so pinning its final component `O_NOFOLLOW` names the workspace and nothing else.
+        """
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        try:
+            return os.open(self._ws, flags)
+        except OSError as e:
+            if e.errno not in _DENIED_ERRNOS or not _regrant_dir_at(self._ws):
+                raise
+            _warn_regranted([self._ws])
+            try:
+                return os.open(self._ws, flags)
+            except OSError as e2:
+                raise SandboxError(
+                    f"the workspace root {self._ws!r} is closed to this process and reopening it after "
+                    f"restoring its owner bits still failed, so nothing here can read it: {e2}"
+                ) from e2
+
     def _descend_dirs(self, base_fd: int, parts: "list[str]", *, create: bool) -> int:
         """The directory ``parts`` names under ``base_fd``, opened one component at a time with
         ``O_NOFOLLOW`` relative to the previous one, and created when ``create`` and missing. Returns a
         descriptor the caller closes (``base_fd`` itself for no parts). A symlink or a non-directory on
-        the way is refused by name; EACCES is raised as it is, for a shared workspace's fallback.
+        the way is refused BY NAME, which is why both the read and the write path descend through here.
+        EACCES is raised as it is, for the caller to answer: `_walk` puts the owner bits back and
+        descends again, and a shared workspace falls back to the helper box.
 
         THE ONE DESCENT for everything the host creates in the workspace. It replaces an `lstat` and a
         `mkdir` by path, between which a box running beside the call could swap the component for a
         symlink: the `mkdir` then made a directory wherever the link pointed."""
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         cur = base_fd
-        for part in parts:
-            try:
+        # ONE LINE FOR THE WHOLE DESCENT, not one per component. A box can plant a chain thousands of
+        # levels deep and close every one of them, and a warning per level would make the warning
+        # itself the denial of service this repair exists to prevent.
+        regranted: "list[str]" = []
+        try:
+            for part in parts:
                 try:
-                    nxt = os.open(part, flags, dir_fd=cur)
-                except FileNotFoundError:
-                    if not create:
-                        raise
                     try:
-                        os.mkdir(part, dir_fd=cur)
-                    except FileExistsError:
-                        pass  # made by someone else in between: open whatever is there, by the same rules
-                    nxt = os.open(part, flags, dir_fd=cur)
-            except OSError as e:
-                # WHICH OF THE TWO IT IS, ASKED RATHER THAN ASSUMED. `O_DIRECTORY|O_NOFOLLOW` on a
-                # symlink answers ENOTDIR on current kernels, not ELOOP (`do_open` checks for a
-                # directory before `may_open` gets to the link), so a symlinked component took the
-                # "not a directory" sentence and the reader lost the one fact that matters: something
-                # in the path points out of the workspace. Both errnos are mapped by LOOKING, with an
-                # `lstat` through the descriptor that was being descended - not by the path, which is
-                # what the refusal is about.
-                # Taken BEFORE the descriptor is closed, because it is the thing being asked about.
-                looked = None
-                if e.errno in (errno.ELOOP, errno.ENOTDIR):
-                    try:
-                        looked = os.lstat(part, dir_fd=cur)
-                    except OSError:
-                        looked = None
+                        nxt = os.open(part, flags, dir_fd=cur)
+                    except FileNotFoundError:
+                        if not create:
+                            raise
+                        try:
+                            os.mkdir(part, dir_fd=cur)
+                        except FileExistsError:
+                            pass  # made by someone else in between: open whatever is there, by the same rules
+                        nxt = os.open(part, flags, dir_fd=cur)
+                except OSError as e:
+                    # THE PARENT, NOT THE MISSING CHILD. With `create` the refusal can come from the
+                    # `mkdir`, and then the directory to repair is `cur`: pinning `part` fails with
+                    # ENOENT because it does not exist yet, so the first version of this repaired
+                    # nothing and `write_file("d/sub/x")` under a closed `d` refused anyway.
+                    if e.errno in _DENIED_ERRNOS and (
+                        _regrant_dir_at(part, cur, inside=self._ws)
+                        or _regrant_own_dir(cur, self._ws)
+                    ):
+                        # OURS, AND CLOSED TO US FROM INSIDE THE BOX. This is THE descent for every read,
+                        # write and listing the host does in the workspace, so one `chmod 0` on a
+                        # component used to end all three. The bits are back: open it once more, and only
+                        # once, because `_regrant_dir_at` answers True only when the mode actually changed.
+                        reopened = -1
+                        try:
+                            reopened = os.open(part, flags, dir_fd=cur)
+                        except OSError:
+                            reopened = -1
+                        if reopened >= 0:
+                            regranted.append(part)
+                            if cur != base_fd:
+                                os.close(cur)
+                            cur = reopened
+                            continue
+                    # WHICH OF THE TWO IT IS, ASKED RATHER THAN ASSUMED. `O_DIRECTORY|O_NOFOLLOW` on a
+                    # symlink answers ENOTDIR on current kernels, not ELOOP (`do_open` checks for a
+                    # directory before `may_open` gets to the link), so a symlinked component took the
+                    # "not a directory" sentence and the reader lost the one fact that matters: something
+                    # in the path points out of the workspace. Both errnos are mapped by LOOKING, with an
+                    # `lstat` through the descriptor that was being descended - not by the path, which is
+                    # what the refusal is about.
+                    # Taken BEFORE the descriptor is closed, because it is the thing being asked about.
+                    looked = None
+                    if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                        try:
+                            looked = os.lstat(part, dir_fd=cur)
+                        except OSError:
+                            looked = None
+                    if cur != base_fd:
+                        os.close(cur)
+                    if e.errno == errno.ELOOP or (looked is not None and stat.S_ISLNK(looked.st_mode)):
+                        raise SandboxError(f"path escapes the workspace via a symlinked directory: {part!r}") from e
+                    if e.errno == errno.ENOTDIR:
+                        raise SandboxError(f"workspace path component is not a directory: {part!r}") from e
+                    raise
                 if cur != base_fd:
                     os.close(cur)
-                if e.errno == errno.ELOOP or (looked is not None and stat.S_ISLNK(looked.st_mode)):
-                    raise SandboxError(f"path escapes the workspace via a symlinked directory: {part!r}") from e
-                if e.errno == errno.ENOTDIR:
-                    raise SandboxError(f"workspace path component is not a directory: {part!r}") from e
-                raise
-            if cur != base_fd:
-                os.close(cur)
-            cur = nxt
+                cur = nxt
+        finally:
+            _warn_regranted(regranted)
         return cur
 
     def _restore_by_helper(self, tf: "object", members: "list") -> None:
@@ -6388,14 +6796,19 @@ class Sandbox:
         out of memory or off a failing disk is raised, because a listing that silently loses a subtree
         is worse than one that says it could not be made."""
         out: dict[str, tuple[int, int]] = {}
-        shared = self._shared
+        # A DENIAL IS NOT GATED ON `user=` ANY MORE. It used to be: the recovery below (a helper box
+        # over the blind subtree) only answers for a SHARED workspace, so every other session let the
+        # EACCES fall through to `raise` - and a box could end a session with one `chmod`. Now the
+        # mode is put back when the directory is ours, which is every non-`user=` session, and the
+        # helper box stays the fallback for the directories that are not.
         blind: list[str] = []
+        regranted: list[str] = []
         top = os.path.relpath(root, os.path.realpath(self._ws))
         top = "" if top == "." else top
         # The workspace root itself: gone means nothing to walk, which is what `os.walk` of a missing
         # root yielded. Anything else (no descriptors, no memory) is this caller's to see.
         try:
-            base_fd = os.open(self._ws, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            base_fd = self._ws_fd()
         except OSError as e:
             if e.errno in _WALK_GONE:
                 return out
@@ -6417,8 +6830,13 @@ class Sandbox:
                             base_fd, top.split(os.sep) if top else [], create=False
                         )
                     except PermissionError:
-                        if shared:
-                            blind.append(top)
+                        # Before this a non-shared session `continue`d here and lost the WHOLE walk in
+                        # silence, which is the same defect one step quieter. ⛔ And it does NOT retry
+                        # the repair: `_descend_dirs` now repairs and reopens each component itself, so
+                        # a refusal that still arrives here is one the repair already failed on - not
+                        # ours, or re-closed inside the window - and trying again would be the only
+                        # site in this file with two attempts where the rule is exactly one.
+                        blind.append(top)
                         continue
                     except (OSError, SandboxError):
                         continue  # nothing there to walk
@@ -6428,34 +6846,60 @@ class Sandbox:
                     try:
                         fd = os.open(name, flags, dir_fd=parent_fd)
                     except OSError as e:
-                        if shared and e.errno in (errno.EACCES, errno.EPERM):
+                        if e.errno not in _DENIED_ERRNOS:
+                            if e.errno in _WALK_GONE:
+                                continue
+                            raise
+                        fd = -1
+                        if _regrant_dir_at(name, parent_fd, inside=self._ws):
+                            regranted.append(rel_dir)
+                            try:
+                                fd = os.open(name, flags, dir_fd=parent_fd)
+                            except OSError:
+                                fd = -1
+                        if fd < 0:
                             blind.append(rel_dir)
                             continue
-                        if e.errno in _WALK_GONE:
-                            continue
-                        raise
                 keep_open = False
                 try:
-                    try:
-                        with os.scandir(fd) as it:
-                            entries = list(it)
-                    except OSError as e:
-                        if shared and e.errno in (errno.EACCES, errno.EPERM):
+                    entries = None
+                    gone = False
+                    for attempt in (0, 1):
+                        try:
+                            with os.scandir(fd) as it:
+                                entries = list(it)
+                            break
+                        except OSError as e:
+                            if e.errno not in _DENIED_ERRNOS:
+                                if e.errno not in _WALK_GONE:
+                                    raise
+                                gone = True
+                                break
+                            # ONE retry, and only once the mode has changed: this cannot loop.
+                            if attempt or not _regrant_own_dir(fd, self._ws):
+                                break
+                            regranted.append(rel_dir)
+                    if entries is None:
+                        if not gone:
                             blind.append(rel_dir)  # it opened, and listing it is still refused
-                            continue
-                        if e.errno in _WALK_GONE:
-                            continue
-                        raise
+                        continue
                     subdirs: "list[str]" = []
                     for entry in entries:
                         rel = f"{rel_dir}/{entry.name}" if rel_dir else entry.name
                         try:
                             st = entry.stat(follow_symlinks=False)
                         except OSError as e:
-                            if shared and e.errno in (errno.EACCES, errno.EPERM):
+                            if e.errno not in _DENIED_ERRNOS:
+                                continue
+                            if not _regrant_own_dir(fd, self._ws):
                                 blind.append(rel_dir)  # listable, not searchable: ask for it whole
                                 break
-                            continue
+                            regranted.append(rel_dir)
+                            try:
+                                st = entry.stat(follow_symlinks=False)
+                            except OSError:
+                                blind.append(rel_dir)
+                                break
                         if stat.S_ISDIR(st.st_mode):
                             if entry.name == _DEPS_DIR:
                                 continue  # exclude deps from the diff, at any depth
@@ -6480,6 +6924,19 @@ class Sandbox:
                 if rel_dir is None and fd != base_fd:
                     os.close(fd)
             os.close(base_fd)
+        _warn_regranted(regranted)
+        if blind and not self._shared:
+            # NO HELPER EXISTS FOR THIS SESSION SHAPE, so asking for one spends a box start to get
+            # back "the workspace helper is for a non-root session only" - a sentence that blames the
+            # helper for what is really "the repair did not work here". Said plainly instead.
+            warnings.warn(
+                f"result.files / list_files may be missing entries: {blind} is closed to this process "
+                f"and its owner bits could not be restored (not ours, or no /proc), and a session "
+                f"without `user=` has no box account to read it for us",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return out
         if blind:
             # ONE helper box for every blind subtree of this walk. Its mtimes are whole seconds, which
             # is all `stat -c %Y` prints; a file is always seen through the same path while its
@@ -8084,6 +8541,15 @@ _PATH_REFUSALS = {
         "reaches a host file it was not given (the kernel reports this as ELOOP). Remove it, or name "
         "the file you meant"
     ),
+    errno.ENOTDIR: (
+        "a component of that path is not a DIRECTORY - and that includes a SYMLINK where a directory "
+        "was expected, which reports this same errno on current kernels: the open is "
+        "O_DIRECTORY|O_NOFOLLOW, and the kernel checks for a directory before it would report the "
+        "link. So it is either something that is not a directory in the way (a regular file, FIFO, "
+        "device, socket) or a link planted inside the workspace that the boundary refused to follow. "
+        "`ls -l` on it says which. (A refusal from a path's INTERMEDIATE component distinguishes the "
+        "two outright, because the descent there holds the parent descriptor and can look)"
+    ),
     errno.ENXIO: (
         "it is a FIFO with no reader. Opening one for writing would block until the box chose to read, "
         "so the open is non-blocking and fails instead"
@@ -8091,7 +8557,9 @@ _PATH_REFUSALS = {
 }
 
 
-def _path_refusal(verb: str, path: str, e: OSError) -> "SandboxError":
+def _path_refusal(
+    verb: str, path: str, e: OSError, full: "str | None" = None, *, writing: bool
+) -> "SandboxError":
     """The message for a host-side open that the workspace boundary refused.
 
     ELOOP here is not a filesystem oddity, it is the boundary doing its job: every component is opened
@@ -8100,7 +8568,51 @@ def _path_refusal(verb: str, path: str, e: OSError) -> "SandboxError":
     reader looking for a broken link chain when what happened is an attempt to reach a host file. Whoever
     reads this (a person, a log, a red team) should be able to tell the two apart.
     """
-    why = _PATH_REFUSALS.get(e.errno)
+    # ASKED RATHER THAN ASSUMED, when the caller can be asked: `O_DIRECTORY|O_NOFOLLOW` on a symlink
+    # answers ENOTDIR, so the generic sentence below has to name both possibilities. With the full path
+    # in hand the two are distinguishable by LOOKING, which is what `_descend_dirs` does for an
+    # intermediate component through its parent descriptor and what the Node binding does here. The
+    # `lstat` races a box that is writing, and the only thing at stake is which sentence is printed.
+    if full is not None and e.errno == errno.ENOTDIR:
+        try:
+            looked = os.lstat(full)
+        except OSError:
+            looked = None
+        if looked is not None and stat.S_ISLNK(looked.st_mode):
+            return SandboxError(
+                f"path escapes the workspace via a symlinked directory: {os.path.basename(full)!r}"
+            )
+    # EACCES IS NOT IN THE TABLE, because the right sentence depends on whether this was a WRITE. A
+    # repaired directory has read and search and NO write, so a refused write is explained by that
+    # repair - and a refused read is the opposite case, a directory whose bits could not be restored at
+    # all. One sentence for both would be wrong half the time, and the half it got wrong is the one a
+    # reader meets first.
+    #
+    # ⛔ AND IT IS A FACT THE CALLER PASSES, NOT THE VERB PARSED. The first version tested
+    # `verb in ("write", "restore")`, which is a membership test on a string built for DISPLAY: the
+    # snapshot path's verb is `"snapshot to"` - a write, opened `O_WRONLY|O_CREAT|O_TRUNC` three lines
+    # from the call - and it matched neither arm, so a refused write got the READ sentence. A cleanup
+    # review found it in both bindings at once. `writing` is keyword-only and has NO DEFAULT so a new
+    # call site cannot forget to decide, which is the part the string could not enforce.
+    if e.errno == errno.EACCES:
+        if writing:
+            why = (
+                "a directory on that path is readable but NOT WRITABLE by this process. That is what a "
+                "repair leaves behind: when code in the box closes a workspace directory with "
+                "`chmod 0`, kern restores read and search on the ones it owns so the walk can still "
+                "report, and deliberately NOT write - the alternative is the host silently re-opening "
+                "for writing a directory the workload shut. So the mode you are looking at (`0o500`) "
+                "may be kern's and not yours: `chmod u+w` on it from inside the box, or write elsewhere"
+            )
+        else:
+            why = (
+                "a directory on that path is closed to this process and its owner bits could not be "
+                "restored - it is not ours (a `user=` session's box account owns it, and only a helper "
+                "box running as that account can read it), or there is no `/proc` to reach the pinned "
+                "descriptor through"
+            )
+    else:
+        why = _PATH_REFUSALS.get(e.errno)
     if why is None:
         return SandboxError(f"cannot {verb} {path!r}: {e}")
     return SandboxError(f"refusing to {verb} {path!r}: {why}")
