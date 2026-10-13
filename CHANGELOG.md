@@ -21,14 +21,35 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
-**Two things a caller can notice, so they lead.** A `kern-sandbox` call that wrote past
-`workspace_max_bytes` *during* the call used to return normally, with the bytes on disk and the refusal
-arriving only at the next call; it now comes back with a new fault, `workspace_full`, and the box is
-stopped mid-call. And `--egress-allow` now refuses a plain-HTTP request whose `Host:` header names a
-different host than the request-target it vetted, or that carries more than one `Host:` line: those used
-to be forwarded.
+**One thing a caller can notice, so it leads.** `--egress-allow` now refuses a plain-HTTP request whose
+`Host:` header names a different host than the request-target it vetted, or that carries more than one
+`Host:` line: those used to be forwarded. It reaches users in the next kern release; the sandbox changes
+dated below it are already published as kern-sandbox 0.2.47.
 
-**kern-sandbox (Python and Node)**
+**Runtime**
+
+- `--egress-allow` refuses a plain-HTTP head that does not name one host (see above). Over HTTPS the
+  same trick is still possible on a shared CDN, because there the `Host` header is inside TLS and only
+  an intercepting proxy could read it; `docs/EGRESS.md` says so and no longer names an SNI check as a
+  planned hardening, which was measured not to close it.
+
+**Documentation**
+
+- `docs/EGRESS.md`, `docs/THREAT_MODEL.md` and the `--egress-allow` notice describe the shared-CDN hole
+  as what it is: the site is chosen by the HTTP `Host` header inside TLS, so a matching SNI does not
+  help. The page also records that its own example is on a shared CDN: `pypi.org` resolves into Fastly
+  and `files.pythonhosted.org` is a CNAME to it, so an allowlist written for `pip install` has allowed
+  that CDN.
+## kern-sandbox 0.2.47 - 2026-10-13
+
+**A call that filled the workspace used to succeed anyway.** `workspace_max_bytes` was only checked
+between calls, so a call that wrote past it returned normally, with the bytes on disk, and the refusal
+arrived at the NEXT call. It now comes back with a new fault, `workspace_full`, and the box is stopped
+mid-call. The second thing a caller notices: one `chmod 0` from inside a box no longer ends the session.
+
+This release carries the kern v0.31.0 binary, the same one the install line serves.
+
+**The bindings**
 
 - `workspace_max_bytes` is enforced WHILE a call runs, not only between calls. Measured before: one call
   wrote 8,115 MB in ten seconds against a 50 MiB cap and was admitted. The measurement is self-limiting
@@ -50,20 +71,8 @@ to be forwarded.
   repair cannot be made; both name what they could not read. The Node binding no longer counts a
   directory closed to it as zero bytes, which is how a cooperative cap is defeated for good.
 
-**Runtime**
-
-- `--egress-allow` refuses a plain-HTTP head that does not name one host (see above). Over HTTPS the
-  same trick is still possible on a shared CDN, because there the `Host` header is inside TLS and only
-  an intercepting proxy could read it; `docs/EGRESS.md` says so and no longer names an SNI check as a
-  planned hardening, which was measured not to close it.
-
 **Documentation**
 
-- `docs/EGRESS.md`, `docs/THREAT_MODEL.md` and the `--egress-allow` notice describe the shared-CDN hole
-  as what it is: the site is chosen by the HTTP `Host` header inside TLS, so a matching SNI does not
-  help. The page also records that its own example is on a shared CDN: `pypi.org` resolves into Fastly
-  and `files.pythonhosted.org` is a CNAME to it, so an allowlist written for `pip install` has allowed
-  that CDN.
 - `docs/MCP.md` documents that the workspace has no size bound by default, with the measured rate, the
   new cap, and a recipe a non-root user can apply (`$XDG_RUNTIME_DIR` is already a sized tmpfs; making a
   new sized mount needs root).
