@@ -346,7 +346,15 @@ def render(
 ) -> str:
     """One guide page. `page` is its file name under /guide/ and `source` the repo-relative path its
     "this page on GitHub" link names; both default to what `md_path` says, which is wrong only for a
-    page generated from a temporary file (the index)."""
+    page generated from a temporary file (the index).
+
+    THE BODY IS WRAPPED IN `<!--email_off-->`, WHICH IS NOT ABOUT EMAIL. Cloudflare's Email Address
+    Obfuscation rewrites anything shaped like an address, and our pages carry such shapes inside CODE:
+    measured 2026-10-13 on the served resources page, the cgroup path `user@1000.service` in a
+    `kern inspect` sample was replaced by `[email protected]` plus a link to
+    `/cdn-cgi/l/email-protection`, which is a 404 on this domain. So a reader was shown a path that does
+    not exist, in the one place a path has to be copied exactly. The marker is Cloudflare's documented
+    opt-out and costs nothing on a page with no address in it."""
     page = page or out_name(md_path.name)
     # Where the page's source lives, for "this page on GitHub" and for resolving its relative links:
     # the README for the Sandbox page, `docs/` for the rest, and `docs/` itself for the index.
@@ -408,9 +416,9 @@ def render(
     <nav>{nav}</nav>
   </div>
 </header>
-<main>
+<!--email_off--><main>
 {body}
-</main>
+</main><!--/email_off-->
 <footer>
 <a href="{SITE}/">getkern.dev</a> &middot;
 <a href="{REPO}/{src_kind}/main/{src_rel.rstrip("/")}">this page on GitHub</a> &middot;
