@@ -411,8 +411,12 @@ fn point_the_box_at_the_egress_proxy(
         "kern: note: --egress-allow gives the box outbound to the listed domains only (over an HTTP \
          CONNECT/forward proxy; the box's isolated netns has no other route). It resolves and pins the \
          dialed host, refuses non-public resolved IPs (SSRF), and tunnels only ports 80/443. The one \
-         hole it can't close is domain fronting on a SHARED CDN (SNI != CONNECT host); see \
-         docs/EGRESS.md. For a fully hostile workload prefer a microVM with a real firewall."
+         hole it can't close, and it is HTTPS-only: any allowed domain hosted on a SHARED CDN reaches \
+         every other tenant of that CDN, because the site is chosen by the HTTP Host header INSIDE the \
+         TLS session, which a non-intercepting proxy cannot read - a matching SNI does not change that. \
+         Over plain HTTP that header is in plaintext and a head naming another host is refused. Allow \
+         only origins you know are not shared; see docs/EGRESS.md. For a fully hostile workload prefer \
+         a microVM with a real firewall."
     );
     let proxy = format!("http://127.0.0.1:{EGRESS_PROXY_PORT}");
     for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {

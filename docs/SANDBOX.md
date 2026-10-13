@@ -143,6 +143,35 @@ accumulates, the PID namespace is shared, and a box built under another posture 
 of adopted. It ends after `persist_ttl_s` (an hour by
 default) or at `destroy()`. Node spells it `persist: true`.
 
+## The one thing the host changes in your workspace
+
+The workspace is yours and the host only reads it, with one exception that is worth knowing because
+code inside the box can trip it.
+
+**A directory the box closes to the host gets its owner bits back.** `os.chmod("d", 0)` on a directory
+of the workspace makes it unreadable to the process that is holding your session, and that process has
+to walk the workspace after every call to tell you which files changed, to size it against
+`workspace_max_bytes`, and to answer `list_files()` and `snapshot()`. So when that directory belongs to
+the host user, kern puts **read and search** back (`0o500`, never write, because the walk does not need
+it) and **says so** in a warning naming how many directories it touched. The practical consequence:
+**a mode-0 directory does not survive a call.** It comes back at `0o500`.
+
+**What that does not buy you: writing.** There is no write bit in `0o500`, on purpose, so a host-side
+`write_file()` into a directory the box closed still refuses, with a message that names the path. The
+alternative would be the host silently re-opening for writing a directory the workload shut, which is a
+bigger surprise than a refusal you can read.
+
+Two reasons it works this way rather than refusing. A refusal is what it did before, and it was worse:
+the error came out of the *reporting* path and took the result of the call with it, so one `chmod`
+ended the session until someone fixed the mode by hand. And counting an unreadable directory as empty
+is how a cooperative size cap is defeated for good: write a cap's worth of bytes into `h/`, `chmod` it
+to 0, and every later measurement reads those bytes as nothing.
+
+**If you need a directory the host cannot read, run the box as another account** (`user=` in the SDK,
+`KERN_MCP_USER` for the MCP server). What that account creates is not the host's to change: kern leaves
+it exactly as it is and asks a short-lived helper box, running as that same account, to list and size it
+for you. A **file** at mode 0 is left alone on every path, because a file's mode can be the data.
+
 ## Move a sandbox to another machine
 
 Every box a sandbox starts has a read-only root, so what a session builds up lives in its

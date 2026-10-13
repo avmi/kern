@@ -341,6 +341,316 @@ function arena(tag) {
   return { t, ws, outside, s };
 }
 
+/** Collect `process.emitWarning` messages produced while `fn` runs. */
+async function warningsFrom(fn) {
+  const seen = [];
+  const on = (w) => seen.push(String(w.message || w));
+  process.on("warning", on);
+  try {
+    const out = await fn();
+    await new Promise((r) => setImmediate(r)); // emitWarning delivers on a later tick
+    return [out, seen];
+  } finally {
+    process.off("warning", on);
+  }
+}
+
+/** A workspace with one visible file and one directory the box closed to us at mode 0. */
+function closedWs(tag) {
+  const t = fs.realpathSync(tmpdir(tag));
+  const ws = path.join(t, "ws");
+  fs.mkdirSync(ws, { recursive: true });
+  fs.writeFileSync(path.join(ws, "visible.txt"), "v");
+  const hid = path.join(ws, "hid");
+  fs.mkdirSync(hid);
+  fs.writeFileSync(path.join(hid, "inside.txt"), "i");
+  fs.chmodSync(hid, 0);
+  const s = cfg();
+  s._ws = ws;
+  s._entered = true;
+  return { t, ws, hid, s };
+}
+
+test(
+  "one chmod from inside the box no longer ends the session",
+  { skip: process.getuid() === 0 && "root reads a 000 directory" },
+  async () => {
+    // THE DEFECT, from a field report: `mkdirSync("hid"); chmodSync("hid", 0)` inside the box, and
+    // every later call raised the raw EACCES out of the REPORTING path - the call's own exit code and
+    // stdout went with it - until someone fixed the mode by hand. All three walks are driven here,
+    // because all three had the same gate, and the mode is reset to 0 before each so none of them is
+    // riding the previous repair. Python's test carries the same name.
+    const { t, hid, s } = closedWs("regrant");
+    try {
+      const [names, said] = await warningsFrom(async () => (await s.listFiles()).map((f) => f.path));
+      assert.deepStrictEqual(names.sort(), ["hid/inside.txt", "visible.txt"]);
+      assert.ok(
+        said.some((m) => m.includes("restored owner read+search")),
+        `the repair changed box-visible state and did not say so: ${said}`,
+      );
+
+      fs.chmodSync(hid, 0);
+      assert.strictEqual(String(await s.readFile("hid/inside.txt")), "i");
+
+      fs.chmodSync(hid, 0);
+      const dest = path.join(t, "snap.tgz");
+      const prev = process.env.KERN_SANDBOX_SNAPSHOT; // opt-in in this binding, see its refusal text
+      process.env.KERN_SANDBOX_SNAPSHOT = "1";
+      try {
+        s.snapshot(dest);
+      } finally {
+        if (prev === undefined) delete process.env.KERN_SANDBOX_SNAPSHOT;
+        else process.env.KERN_SANDBOX_SNAPSHOT = prev;
+      }
+      assert.ok(tarNames(dest).includes("hid/inside.txt"), String(tarNames(dest)));
+    } finally {
+      try {
+        fs.chmodSync(hid, 0o700);
+      } catch {}
+      fs.rmSync(t, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "a refused SNAPSHOT gets the write sentence and not the read one",
+  { skip: process.geteuid() === 0 && "root writes into a 0500 directory" },
+  () => {
+    // The verb is a string built for DISPLAY and it was being used as a fact: the snapshot path's verb
+    // is "snapshot to", the refusal builder tested `verb === "write" || verb === "restore"`, and that
+    // string matches neither - so a refused WRITE was explained with the READ sentence. Found by a
+    // cleanup review in both bindings at once, with no test on it. Python's twin has the same name.
+    const t = fs.realpathSync(tmpdir("snap-verb"));
+    const ws = path.join(t, "ws");
+    const d = path.join(ws, "d");
+    fs.mkdirSync(d, { recursive: true });
+    const s = cfg();
+    s._ws = ws;
+    s._entered = true;
+    const prev = process.env.KERN_SANDBOX_SNAPSHOT;
+    process.env.KERN_SANDBOX_SNAPSHOT = "1";
+    try {
+      fs.chmodSync(d, 0o500); // exactly what the repair leaves behind: read and search, no write
+      assert.throws(
+        () => s.snapshot(path.join(d, "ckpt.tar.gz")),
+        (e) => {
+          assert.match(e.message, /NOT WRITABLE/);
+          assert.ok(!/could not be restored/.test(e.message), e.message);
+          return true;
+        },
+      );
+    } finally {
+      if (prev === undefined) delete process.env.KERN_SANDBOX_SNAPSHOT;
+      else process.env.KERN_SANDBOX_SNAPSHOT = prev;
+      try {
+        fs.chmodSync(d, 0o700);
+      } catch {}
+      fs.rmSync(t, { recursive: true, force: true });
+    }
+  },
+);
+
+test("a cap is enforced DURING a call and not only between calls", async () => {
+  // The measured defect: one call wrote 8,115 MB in ten seconds against a 50 MiB cap and was admitted,
+  // because the next check is the next call. Here the cell writes 4 MiB against a 1 MiB cap and then
+  // sleeps 30 seconds: before this the call returned after those 30 seconds with the bytes on disk and
+  // no fault. Python's test carries the same name and the same numbers.
+  const s = await new Sandbox({ image: "python:3.12-alpine", pycCache: false, workspaceMaxBytes: 1 << 20 }).open();
+  const started = Date.now();
+  try {
+    const r = await s.runCode(
+      "open('big.bin','wb').write(b'x' * (4 << 20))\n" +
+        "import time; time.sleep(30)\n" +
+        "print('this line must never run')\n",
+      { timeoutS: 40 },
+    );
+    assert.ok(r.fault, JSON.stringify(r));
+    assert.strictEqual(r.fault.type, "workspace_full", r.fault.message);
+    assert.match(r.fault.message, /over the 1048576-byte workspaceMaxBytes/);
+    assert.ok(!r.stdout.includes("this line must never run"), JSON.stringify(r.stdout));
+    assert.strictEqual(r.success, false);
+    assert.strictEqual(r.exitCode, 137);
+    // STOPPED AT THE FIRST MEASUREMENT, not at the cell's own 30 seconds and not at `timeoutS`.
+    assert.ok(Date.now() - started < 15000, `the poller did not stop it: ${Date.now() - started}ms`);
+  } finally {
+    await s.close();
+  }
+});
+
+test(
+  "a chmod 0 on the WORKSPACE ROOT no longer ends the session",
+  { skip: process.geteuid() === 0 && "root reads a 000 directory" },
+  async () => {
+    // THE PLACE THE FIRST VERSION OF THIS REPAIR MISSED: `chmodSync("/workspace", 0)` is the same
+    // primitive as closing a subdirectory, and the repair never saw it because the descent that
+    // repairs is HANDED the root descriptor and never opens it. Reproduced raw in both bindings by an
+    // adversarial review; Python's test carries the same name.
+    const t = fs.realpathSync(tmpdir("root-chmod"));
+    const ws = path.join(t, "ws");
+    fs.mkdirSync(ws);
+    fs.writeFileSync(path.join(ws, "f.txt"), "v");
+    const s = cfg();
+    s._ws = ws;
+    s._entered = true;
+    try {
+      fs.chmodSync(ws, 0);
+      const [names, said] = await warningsFrom(async () => (await s.listFiles()).map((f) => f.path));
+      assert.deepStrictEqual(names, ["f.txt"]);
+      assert.ok(said.some((m) => m.includes("restored owner read+search")), JSON.stringify(said));
+
+      fs.chmodSync(ws, 0);
+      assert.strictEqual(String(await s.readFile("f.txt")), "v");
+
+      // AND WHAT THE REPAIR DOES NOT BUY: 0o500 has no write bit, so a host write refuses - by a
+      // sentence that explains the mode, because that mode is kern's and not the reader's.
+      fs.chmodSync(ws, 0);
+      await assert.rejects(s.writeFile("w.txt", "W"), (e) => {
+        assert.ok(e instanceof SandboxError, String(e));
+        assert.match(e.message, /NOT WRITABLE/);
+        assert.match(e.message, /may be kern's and not yours/);
+        return true;
+      });
+    } finally {
+      try {
+        fs.chmodSync(ws, 0o700);
+      } catch {}
+      fs.rmSync(t, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "the repair refuses a directory OUTSIDE the workspace",
+  { skip: process.geteuid() === 0 && "root is not refused by a mode" },
+  () => {
+    // The repair's containment, with a POSITIVE CONTROL first so the refusal is not a skip. Three
+    // callers hand it a plain PATH, where O_NOFOLLOW guards only the last component, so a swapped
+    // intermediate could send the pin outside the workspace. Never an escalation (the bits are ones
+    // this user could set anyway), but the comment claimed the change stays inside the tree.
+    const t = fs.realpathSync(tmpdir("containment"));
+    const ws = path.join(t, "ws");
+    const outside = path.join(t, "outside");
+    fs.mkdirSync(ws);
+    fs.mkdirSync(outside);
+    const O_PATH = 0o10000000;
+    const fd = fs.openSync(outside, O_PATH | fs.constants.O_NOFOLLOW);
+    try {
+      fs.chmodSync(outside, 0);
+      assert.strictEqual(kern._regrantOwnDirFd(fd), true, "the positive control did not repair");
+      assert.strictEqual(fs.statSync(outside).mode & 0o500, 0o500);
+      fs.chmodSync(outside, 0);
+      assert.strictEqual(kern._regrantOwnDirFd(fd, ws), false, "the guard did not refuse");
+      assert.strictEqual(fs.statSync(outside).mode & 0o500, 0, "the chmod landed outside the workspace");
+    } finally {
+      fs.closeSync(fd);
+      try {
+        fs.chmodSync(outside, 0o700);
+      } catch {}
+      fs.rmSync(t, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "a snapshot that cannot repair refuses BY NAME and never throws the errno",
+  { skip: process.getuid() === 0 && "root reads a 000 directory" },
+  async () => {
+    // A snapshot may not quietly drop files, so it REFUSES - but it has to say what it refused about.
+    // Measured against this commit's parent with a `chmod 0` loop beside the call: 20 out of 20 came
+    // back as a bare EACCES with no subject in it. Python's test carries the same name.
+    const { t, hid, s } = closedWs("snap-refusal");
+    const realUid = process.geteuid;
+    process.geteuid = () => realUid() + 1;
+    const prev = process.env.KERN_SANDBOX_SNAPSHOT;
+    process.env.KERN_SANDBOX_SNAPSHOT = "1";
+    try {
+      assert.throws(
+        () => s.snapshot(path.join(t, "snap.tgz")),
+        (e) => e instanceof SandboxError && /hid/.test(e.message) && /archive would be short/.test(e.message),
+      );
+    } finally {
+      process.geteuid = realUid;
+      if (prev === undefined) delete process.env.KERN_SANDBOX_SNAPSHOT;
+      else process.env.KERN_SANDBOX_SNAPSHOT = prev;
+      try {
+        fs.chmodSync(hid, 0o700);
+      } catch {}
+      fs.rmSync(t, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "the repair says it ONCE per descent however many components it touched",
+  { skip: process.getuid() === 0 && "root reads a 000 directory" },
+  async () => {
+    // The warning must not become the denial of service the repair exists to prevent: the descent used
+    // to say it once PER COMPONENT, so a chain a thousand levels deep produced a thousand lines.
+    const t = fs.realpathSync(tmpdir("one-warning"));
+    const ws = path.join(t, "ws");
+    const chain = ["a", "b", "c", "d", "e"];
+    let cur = ws;
+    fs.mkdirSync(ws);
+    for (const c of chain) {
+      cur = path.join(cur, c);
+      fs.mkdirSync(cur);
+    }
+    fs.writeFileSync(path.join(cur, "leaf.txt"), "L");
+    const s = cfg();
+    s._ws = ws;
+    s._entered = true;
+    const closed = [];
+    let p = ws;
+    for (const c of chain) {
+      p = path.join(p, c);
+      closed.push(p);
+    }
+    try {
+      for (const d of [...closed].reverse()) fs.chmodSync(d, 0); // deepest first: closing keeps search
+      const [data, said] = await warningsFrom(() => s.readFile("a/b/c/d/e/leaf.txt"));
+      assert.strictEqual(String(data), "L");
+      // THE SUBJECT HAS TO BE THIS TEST'S OWN EVENT. `process.on("warning")` is a PROCESS channel and
+      // `emitWarning` delivers on a later tick, so filtering on "restored owner" also catches the line
+      // a SIBLING test emitted: this passed alone and failed beside its peers, which reads as flaky and
+      // is deterministic. The count in the sentence is what makes it ours.
+      const lines = said.filter((m) => /on 5 workspace directory\(ies\)/.test(m));
+      assert.strictEqual(lines.length, 1, JSON.stringify(said));
+    } finally {
+      // TOP DOWN, and the order is the point: `chmod` on a deep component needs search on every one
+      // above it, so bottom-up only works once the repair has already put the bits back - a teardown
+      // written that way hides the regression this test exists to catch.
+      for (const d of closed)
+        try {
+          fs.chmodSync(d, 0o700);
+        } catch {}
+      fs.rmSync(t, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "without the repair the closed subtree is lost from the listing",
+  { skip: process.getuid() === 0 && "root reads a 000 directory" },
+  async () => {
+    // THE SABOTAGE for the test above: with the ownership test failing, the subtree falls back to the
+    // helper box, and the listing comes back SHORT. Before the fix this same shape threw instead,
+    // which is what took the session down.
+    const { t, hid, s } = closedWs("regrant-off");
+    const realUid = process.geteuid;
+    process.geteuid = () => realUid() + 1;
+    try {
+      const [names] = await warningsFrom(async () => (await s.listFiles()).map((f) => f.path));
+      assert.deepStrictEqual(names, ["visible.txt"]);
+    } finally {
+      process.geteuid = realUid;
+      try {
+        fs.chmodSync(hid, 0o700);
+      } catch {}
+      fs.rmSync(t, { recursive: true, force: true });
+    }
+  },
+);
+
 test("the walk never lists a host directory a box swapped in for one it had", async () => {
   const { t, ws, outside, s } = arena("walk");
   const undo = swapOnce(ws, outside, { before: ["openSync", "readdirSync", "lstatSync"] });
@@ -465,25 +775,64 @@ test("the helper list parses a name with a newline and skips junk", () => {
   assert.deepStrictEqual(kern._parseHelperList(raw), [["a\nb", 0o100644, 5, 100], ["d", 0o40755, 4096, 7]]);
 });
 
-test("a directory closed to this process is reported whole and not counted", { skip: process.getuid() === 0 && "root reads it" }, () => {
-  const t = tmpdir("usage");
+/** An `open` directory, one at mode 0, and one `r--` (listable, NOT searchable: the names come back and
+ * every `lstat` is refused). Both owned by this process. */
+function closedTree(t) {
   const closed = path.join(t, "closed");
   const half = path.join(t, "half");
+  fs.mkdirSync(path.join(t, "open"));
+  fs.writeFileSync(path.join(t, "open", "f"), Buffer.alloc(8192));
+  fs.mkdirSync(closed);
+  fs.writeFileSync(path.join(closed, "big"), Buffer.alloc(1 << 20));
+  fs.chmodSync(closed, 0);
+  fs.mkdirSync(half);
+  for (let i = 0; i < 50; i++) fs.writeFileSync(path.join(half, `f${String(i).padStart(2, "0")}`), Buffer.alloc(65536));
+  fs.chmodSync(half, 0o444);
+  return [closed, half];
+}
+
+test("a directory of OURS that the box closed is opened again and counted", { skip: process.getuid() === 0 && "root reads it" }, () => {
+  const t = tmpdir("usage");
+  const [closed, half] = closedTree(t);
   try {
-    fs.mkdirSync(path.join(t, "open"));
-    fs.writeFileSync(path.join(t, "open", "f"), Buffer.alloc(8192));
-    fs.mkdirSync(closed);
-    fs.writeFileSync(path.join(closed, "big"), Buffer.alloc(1 << 20));
-    fs.chmodSync(closed, 0);
-    fs.mkdirSync(half);
-    for (let i = 0; i < 50; i++) fs.writeFileSync(path.join(half, `f${String(i).padStart(2, "0")}`), Buffer.alloc(65536));
-    fs.chmodSync(half, 0o444); // listable, not searchable: every lstat refused
+    // THE BYPASS THIS CLOSES, and the one this binding had worse than Python's: a closed directory
+    // used to be SKIPPED when there was no list to collect into, so two gigabytes behind a `chmod 0`
+    // measured as nothing and every later call was admitted. The assertion that used to be here read
+    // `without a list, the count is unchanged`, which is that bypass written down as intent.
+    const regranted = [];
+    const used = kern._workspaceUsage(t, null, regranted);
+    assert.deepStrictEqual(regranted.sort(), [closed, half].sort());
+    assert.ok(used > (1 << 20) + 50 * 65536, `the repaired directories were not counted: ${used}`);
+    // ONLY WHAT THE WALK NEEDS: the box asked for 0, so write does not come back.
+    assert.strictEqual(fs.statSync(closed).mode & 0o500, 0o500, "the search bit was not put back");
+    assert.strictEqual(fs.statSync(closed).mode & 0o200, 0, "write was handed back and should not be");
+  } finally {
+    for (const d of [closed, half])
+      try {
+        fs.chmodSync(d, 0o700);
+      } catch {}
+    fs.rmSync(t, { recursive: true, force: true });
+  }
+});
+
+test("a directory that is NOT ours is still reported whole and not counted", { skip: process.getuid() === 0 && "root reads it" }, () => {
+  const t = tmpdir("usage");
+  const [closed, half] = closedTree(t);
+  // The `user` session, where the closed directory belongs to the box account and no `chmod` of ours
+  // can touch it. Simulated by making the ownership test fail, which is what a uid of the subordinate
+  // range does for real; the real thing is measured end to end by the `user: "nobody"` test below.
+  const realUid = process.geteuid;
+  process.geteuid = () => realUid() + 1;
+  try {
     const blind = [];
     const used = kern._workspaceUsage(t, blind);
     assert.deepStrictEqual(blind.sort(), [closed, half].sort());
     assert.ok(used < 1 << 20, `a closed directory's contents were counted from here: ${used}`);
-    assert.strictEqual(kern._workspaceUsage(t), used, "without a list, the count is unchanged");
+    // WITHOUT A LIST THERE IS NO ONE TO ASK, so this refuses rather than returning a number that is
+    // short by whatever is hidden. Python's `_workspace_usage` raises in the same words.
+    assert.throws(() => kern._workspaceUsage(t), /cannot be measured/);
   } finally {
+    process.geteuid = realUid;
     for (const d of [closed, half])
       try {
         fs.chmodSync(d, 0o700);

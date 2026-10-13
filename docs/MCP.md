@@ -85,6 +85,7 @@ Every knob is an environment variable in the client's `env` block. There is no c
 | `KERN_MCP_PREWARM` | `1` | how many boxes are kept started in advance, each holding a booted interpreter that has run nothing. A call claims one instead of starting its own, so the per-call cost drops from ~38 ms to ~1.6 ms **without** changing what a call gets: each prewarmed box serves exactly one cell and is destroyed. `0` turns it off |
 | `KERN_MCP_KERNEL` | off | `1` routes Python through ONE warm interpreter. Unlike prewarming, this DOES change the contract: state persists between calls. [What it costs](#what-it-costs) compares them |
 | `KERN_MCP_TMPFS_MB` | `64` | scratch at `/tmp`, charged to the box's own memory cap |
+| `KERN_MCP_WORKSPACE_MAX_MB` | `0` (no cap) | a size in MiB for the workspace, measured **while a call runs**, so one runaway cell is stopped mid-call instead of merely refused at the next one |
 | `KERN_MCP_USER` | the image's own `USER` | the account of the image the code runs as, e.g. `node` or `1000`. A non-root one shares the workspace through a POSIX ACL: [Safe by default](SANDBOX.md#safe-by-default) |
 | `KERN_MCP_QUIET` | on | `0` restores kern's non-fatal notes, which otherwise land in the model's output as if the cell had printed them |
 | `KERN_BIN` | `kern` on `PATH` | where the binary is |
@@ -123,6 +124,60 @@ They need the sentinel for one shared reason: every other path here turns the va
 int, so without it "off" cannot be spelled and an operator who typed `0` silently gets the default.
 
 Garbage and negative values fall back to the default on both, deliberately: a typo is not a decision.
+
+## The workspace has no size bound
+
+`KERN_MCP_TMPFS_MB` bounds `/tmp`, because that scratch is a tmpfs charged to the box's own memory cap.
+**The workspace is not bounded by anything.** It is a host directory, the box writes to it directly, and
+one call can write as much as the filesystem holds until the per-call deadline kills it.
+
+Measured on 0.31.0, one call, no cap: **8,115 MB on disk in 10 seconds**. At that rate the 60-second
+default of `KERN_MCP_TIMEOUT` is tens of gigabytes in a single cell. On WSL the bytes land in the
+distro's virtual disk, which **grows and does not shrink** when the files are deleted, so the space is
+not returned without compacting that disk by hand.
+
+What bounds it, and what it costs: **`KERN_MCP_WORKSPACE_MAX_MB`**. The cap used to be checked only
+BETWEEN calls, which bounds what accumulates and nothing a single cell does - measured, one call wrote
+100 MB against a 50 MiB cap and was not stopped - so this server did not expose it. The SDK now measures
+the workspace **while the call runs** and stops the box when it crosses, with a fault that names the cap
+(`workspace_full`) rather than reading as a timeout or an OOM. Three things to know before relying on it:
+
+- **the overshoot is the interval.** Measurements start one second apart and the next one is scheduled at
+  ten times the last measurement's duration, so a workspace with many files makes the poller back off
+  rather than compete for the disk. At the ~810 MB/s above, one second can let ~800 MB past the cap -
+  against the tens of gigabytes it replaces;
+- **it is still not a kernel boundary.** The box writes to a host directory; the cap is a measurement
+  and a kill, not a refusal from the filesystem. A sized filesystem answers `ENOSPC` instead, and that
+  is the stronger option below;
+- **a session with a non-root `KERN_MCP_USER` keeps the old behaviour** for any directory the box account
+  closed to the host: there is nothing to measure mid-call and no helper to ask, so the cap falls back to
+  the between-calls check rather than killing on a number it could not take.
+
+And the memory cap does not apply to any of this: these are file writes, not pages.
+
+What does: give the workspace a filesystem that is **sized**. Then the cell gets `ENOSPC`, which is a
+kernel answer and not a cooperative one. Two ways, and only one of them needs root:
+
+- **Without root, use a sized filesystem that already exists.** `$XDG_RUNTIME_DIR` is a per-user tmpfs
+  whose size the login manager sets (`RuntimeDirectorySize`, 10% of RAM by default):
+
+      KERN_MCP_WORKSPACE="$XDG_RUNTIME_DIR/kern-mcp"
+
+  Measured on one host: `/run/user/1000` is a 3.1 GB tmpfs, and a cell writing past it stopped at
+  **3190 MiB with ENOSPC**. ⚠️ Two costs, both real: it is **RAM-backed**, so those bytes are memory
+  rather than disk, and it is **cleared when the session's last login goes away**, so file state does
+  not outlive a logout the way a workspace on disk does. `/dev/shm` is the same trade with a larger
+  default and no per-user isolation.
+- **With root, make one**: a loopback image, an XFS/ext4 project quota, a dedicated volume. A
+  non-superuser cannot: `mount -t tmpfs -o size=64m` answers `must be superuser to use mount`,
+  measured, so a document that only said "point it at a sized mount" was asking for a privilege the
+  host where this was measured does not have.
+
+And the one lever that needs nothing at all: **the per-call deadline bounds the write by rate times
+time.** At the ~810 MB/s measured above, `KERN_MCP_TIMEOUT=10` bounds one runaway cell to about 8 GB
+instead of tens. It is a blunt instrument - it also kills slow legitimate work - but it is the only
+bound available on a default `/tmp` that is part of the root filesystem, which is what that default
+usually is.
 
 ## The server is stdio, so it travels
 

@@ -8,9 +8,11 @@ of that range; they skip, naming which one is missing.
 import errno
 import os
 import pathlib
+import re
 import stat
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -310,6 +312,247 @@ def _arena(tmp_path):
     return ws.resolve(), outside, s
 
 
+def _closed_ws(tmp_path):
+    """A workspace with one visible file and one directory the box closed to us at mode 0."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "visible.txt").write_text("v")
+    hid = ws / "hid"
+    hid.mkdir()
+    (hid / "inside.txt").write_text("i")
+    os.chmod(hid, 0)
+    s = _cfg()
+    s._ws = str(ws.resolve())
+    s._entered = True
+    return hid, s
+
+
+def test_one_chmod_from_inside_the_box_no_longer_ends_the_session(tmp_path):
+    """THE DEFECT, from a field report: `os.makedirs("hid"); os.chmod("hid", 0)` inside the box, and
+    every later call on the session raised a raw `PermissionError` out of the REPORTING path - the
+    call's own exit code and stdout went with it - until someone fixed the mode by hand.
+
+    All three walks are driven here, because all three had the same gate: the diff/`list_files` walk,
+    the descent `read_file` and `write_file` share, and the snapshot. The mode is reset to 0 before
+    each one so none of them is riding the previous repair."""
+    if os.getuid() == 0:
+        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+    hid, s = _closed_ws(tmp_path)
+    try:
+        with pytest.warns(RuntimeWarning, match="restored owner read\\+search"):
+            listed = {f.path for f in s.list_files()}
+        assert listed == {"visible.txt", "hid/inside.txt"}, listed
+
+        os.chmod(hid, 0)
+        assert s.read_file("hid/inside.txt") == b"i"
+
+        os.chmod(hid, 0)
+        dest = tmp_path / "snap.tgz"
+        s.snapshot(str(dest))
+        with tarfile.open(dest) as tf:
+            assert "hid/inside.txt" in tf.getnames(), tf.getnames()
+    finally:
+        os.chmod(hid, 0o700)
+
+
+def test_the_repair_refuses_a_directory_OUTSIDE_the_workspace(tmp_path):
+    """The repair's containment, with a POSITIVE CONTROL first so the refusal is not a skip.
+
+    Three callers hand the repair a plain PATH, where `O_NOFOLLOW` guards only the last component, so a
+    box that swaps an intermediate one for a symlink in the retry window could send the pin outside the
+    workspace. The bits are ones this user could set anyway, so it was never an escalation - but the
+    comment on the repair claimed the change stays inside the workspace tree, and an adversarial review
+    showed that claim was only nearly true."""
+    if os.getuid() == 0:
+        pytest.skip("root is not refused by a mode, so neither half of this measures anything")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    fd = os.open(str(outside), os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.chmod(outside, 0)
+        # POSITIVE CONTROL: ours, a directory, missing the bits, so WITHOUT the guard it repairs.
+        assert kern._regrant_own_dir(fd) is True
+        assert os.stat(outside).st_mode & 0o500 == 0o500
+        os.chmod(outside, 0)
+        # AND WITH THE GUARD it refuses, on the same descriptor and the same mode.
+        assert kern._regrant_own_dir(fd, str(ws)) is False
+        assert os.stat(outside).st_mode & 0o500 == 0, "the chmod landed outside the workspace"
+    finally:
+        os.close(fd)
+        os.chmod(outside, 0o700)
+
+
+def test_a_refused_SNAPSHOT_gets_the_write_sentence_and_not_the_read_one(tmp_path):
+    """The verb is a string built for DISPLAY, and it was being used as a fact.
+
+    The snapshot path's verb is `"snapshot to"`, opened `O_WRONLY|O_CREAT|O_TRUNC`; the refusal builder
+    tested `verb in ("write", "restore")`, which that string does not match, so a refused WRITE was
+    explained with the READ sentence - told its owner bits could not be restored, when what happened is
+    that the repair deliberately left the directory at `0o500`. Found by a cleanup review reading the
+    two bindings side by side, in both of them, with no test on it."""
+    if os.getuid() == 0:
+        pytest.skip("root writes into a 0500 directory, so nothing here is refused")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    d = ws / "d"
+    d.mkdir()
+    s = _cfg()
+    s._ws = str(ws.resolve())
+    s._entered = True
+    try:
+        os.chmod(d, 0o500)  # exactly what the repair leaves behind: read and search, no write
+        with pytest.raises(SandboxError) as e:
+            s.snapshot(str(d / "ckpt.tar.gz"))
+        said = str(e.value)
+        assert "NOT WRITABLE" in said, said
+        assert "could not be restored" not in said, said
+    finally:
+        os.chmod(d, 0o700)
+
+
+def test_a_write_under_a_repaired_directory_is_refused_by_a_sentence_that_explains_the_mode(tmp_path):
+    """`write_file("d/sub/x")` where the box did `mkdir d; chmod 0 d`, and why it REFUSES.
+
+    The repair gives read and search, never write, so creating `sub` inside `d` is a write and is
+    refused. That is the contract - the alternative is the host silently re-opening for writing a
+    directory the workload shut - but the mode the reader then sees (`0o500`) is KERN'S, not theirs, so
+    the refusal owes them that fact. Before this it was `[Errno 13] Permission denied: 'sub'` in Python
+    and a BARE EACCES in Node, where the write path's first call was unwrapped. Found by an adversarial
+    review of the first fix."""
+    if os.getuid() == 0:
+        pytest.skip("root writes into a 000 directory, so nothing here is closed to it")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    d = ws / "d"
+    d.mkdir()
+    (d / "ok.txt").write_text("R")  # written BEFORE the box closes it: 0o500 refuses this too
+    s = _cfg()
+    s._ws = str(ws.resolve())
+    s._entered = True
+    try:
+        os.chmod(d, 0)
+        with pytest.raises(SandboxError) as e:
+            s.write_file("d/sub/x.txt", "X")
+        said = str(e.value)
+        assert "NOT WRITABLE" in said, said
+        assert "may be kern's and not yours" in said, said
+        assert "Errno 13" not in said, said
+        # AND THE READ SIDE OF THE SAME DIRECTORY WORKS, which is what the repair bought.
+        assert s.read_file("d/ok.txt") == b"R"
+    finally:
+        os.chmod(d, 0o700)
+
+
+def test_a_chmod_0_on_the_WORKSPACE_ROOT_no_longer_ends_the_session(tmp_path):
+    """THE FIFTH PLACE, and the one the first version of this repair missed.
+
+    `os.chmod("/workspace", 0)` is the same primitive as closing a subdirectory and it is the one a
+    hostile cell reaches first, but the repair never saw it: the descent that repairs is HANDED the
+    root descriptor and never opens it, so the refusal had already happened on the `os.open` above.
+    Found by an adversarial review of the first fix, reproduced raw in BOTH bindings, and closed by
+    routing every root open through `_ws_fd`."""
+    if os.getuid() == 0:
+        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "f.txt").write_text("v")
+    s = _cfg()
+    s._ws = str(ws.resolve())
+    s._entered = True
+    try:
+        os.chmod(ws, 0)
+        with pytest.warns(RuntimeWarning, match="restored owner read\\+search"):
+            assert {f.path for f in s.list_files()} == {"f.txt"}
+        os.chmod(ws, 0)
+        assert s.read_file("f.txt") == b"v"
+        # AND WHAT THE REPAIR DOES NOT BUY: `0o500` has no write bit, deliberately, so a host write
+        # into a directory the box closed still refuses - BY NAME, which is the whole contract. The
+        # alternative would be the host silently re-opening for writing a directory the workload shut.
+        os.chmod(ws, 0)
+        with pytest.raises(SandboxError) as e:
+            s.write_file("w.txt", "W")
+        said = str(e.value)
+        assert "w.txt" in said and "NOT WRITABLE" in said, said
+        os.chmod(ws, 0)
+        dest = tmp_path / "snap.tgz"
+        s.snapshot(str(dest))
+        with tarfile.open(dest) as tf:
+            assert "f.txt" in tf.getnames(), tf.getnames()
+    finally:
+        os.chmod(ws, 0o700)
+
+
+def test_a_snapshot_that_cannot_repair_refuses_BY_NAME_and_never_raises_the_errno(tmp_path, monkeypatch):
+    """A snapshot may not quietly drop files, so it REFUSES - but it has to say what it refused about.
+
+    Two shapes reach here: a directory that is not ours, and a box that closes one again inside the
+    retry window. Measured against this commit's parent with a `chmod 0` loop running beside the call:
+    20 snapshots out of 20 came back as a bare `PermissionError`, with no subject in it."""
+    if os.getuid() == 0:
+        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+    hid, s = _closed_ws(tmp_path)
+    _no_repair(monkeypatch)
+    try:
+        with pytest.raises(SandboxError) as e:
+            s.snapshot(str(tmp_path / "snap.tgz"))
+        assert "hid" in str(e.value), str(e.value)
+        assert "the archive would be short" in str(e.value), str(e.value)
+    finally:
+        os.chmod(hid, 0o700)
+
+
+def test_the_repair_says_it_ONCE_per_walk_however_many_directories_it_touched(tmp_path):
+    """The warning must not become the denial of service the repair exists to prevent.
+
+    A box can close a thousand directories, or plant a chain a thousand levels deep and close every
+    level, and the descent used to say it once PER COMPONENT. Measured on the fixed code: 5000 closed
+    directories walk in 123 ms behind ONE warning of 166 bytes, and a 1201-level closed chain descends
+    in 14 ms behind one more."""
+    if os.getuid() == 0:
+        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+    deep = tmp_path / "a" / "b" / "c" / "d" / "e"
+    deep.mkdir(parents=True)
+    (deep / "leaf.txt").write_text("L")
+    closed = [tmp_path / "a", tmp_path / "a" / "b", tmp_path / "a" / "b" / "c",
+              tmp_path / "a" / "b" / "c" / "d", deep]
+    s = _cfg()
+    s._ws = str(tmp_path.resolve())
+    s._entered = True
+    try:
+        for d in reversed(closed):
+            os.chmod(d, 0)
+        with pytest.warns(RuntimeWarning) as w:
+            assert s.read_file("a/b/c/d/e/leaf.txt") == b"L"
+        said = [str(x.message) for x in w if "restored owner" in str(x.message)]
+        assert len(said) == 1, said
+        assert "on 5 workspace directory(ies)" in said[0], said[0]
+    finally:
+        # TOP DOWN, and the order is the point: a chain is re-opened from the root, because `chmod` on
+        # a deep component needs search on every one above it. Bottom-up only works when the repair
+        # already put the bits back, so a teardown written that way would hide the very regression this
+        # test exists to catch - it would fail in teardown instead of in the assertion.
+        for d in closed:
+            os.chmod(d, 0o700)
+
+
+def test_without_the_repair_the_closed_subtree_is_lost_from_the_listing(tmp_path, monkeypatch):
+    """THE SABOTAGE for the test above: with the repair refused, the subtree falls back to the helper
+    box, which an arena with no box cannot run, so the listing comes back SHORT and says so. Before
+    the fix this same shape raised instead, which is what took the session down."""
+    if os.getuid() == 0:
+        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+    hid, s = _closed_ws(tmp_path)
+    _no_repair(monkeypatch)
+    try:
+        with pytest.warns(RuntimeWarning, match="may be missing entries"):
+            listed = {f.path for f in s.list_files()}
+        assert listed == {"visible.txt"}, listed
+    finally:
+        os.chmod(hid, 0o700)
+
+
 def test_the_walk_never_lists_a_host_directory_a_box_swapped_in(tmp_path, monkeypatch):
     ws, outside, s = _arena(tmp_path)
     _swap_once(monkeypatch, ws, outside, before=[(os, "scandir"), (os, "open")])
@@ -356,31 +599,81 @@ def test_the_helper_list_parses_a_name_with_a_newline_and_skips_junk():
     assert kern._parse_helper_list(raw) == [("a\nb", 0o100644, 5, 100), ("d", 0o40755, 4096, 7)]
 
 
-def test_a_directory_closed_to_this_process_is_reported_whole_and_not_counted(tmp_path):
-    if os.getuid() == 0:
-        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+def _no_repair(monkeypatch):
+    """Refuse the repair, which is how every negative control for it is built.
+
+    ONE PLACE, and the reason is not brevity. It was four copies, each restating both helpers' full
+    signatures, and these four tests are the ONLY negative controls the repair has: when a parameter
+    was added to the helpers (the containment root), all four turned into `TypeError`s that read as
+    product failures - twice in one session. A patch whose signature has stopped matching is also
+    exactly how a sabotage test quietly stops sabotaging."""
+    monkeypatch.setattr(kern, "_regrant_own_dir", lambda *a, **k: False)
+    monkeypatch.setattr(kern, "_regrant_dir_at", lambda *a, **k: False)
+
+
+def _closed_tree(tmp_path):
+    """An `open` directory, one at mode 0, and one `r--` (listable, NOT searchable: the names come back
+    and every `stat` is refused). Returns the two closed paths, both owned by this process."""
     (tmp_path / "open").mkdir()
     (tmp_path / "open" / "f").write_bytes(b"x" * 8192)
     closed = tmp_path / "closed"
     closed.mkdir()
     (closed / "big").write_bytes(b"y" * (1 << 20))
     os.chmod(closed, 0)
-    # LISTABLE BUT NOT SEARCHABLE, the other shape: `r--` lists the names and refuses every `stat`. The
-    # entries listed before the refusal must not be counted here AND again by the helper.
     half = tmp_path / "half"
     half.mkdir()
     for i in range(50):
         (half / f"f{i:02d}").write_bytes(b"h" * 65536)
     os.chmod(half, 0o444)
+    return closed, half
+
+
+def test_a_directory_of_OURS_that_the_box_closed_is_opened_again_and_counted(tmp_path):
+    """One `chmod 0` from inside the box used to END THE SESSION, and the bytes behind it were a cap
+    bypass. Both are closed by putting the owner bits back, because the host user OWNS those
+    directories: the refusal is self-inflicted and repairable without asking anyone.
+
+    Measured before the fix, same tree: `_workspace_usage` RAISED `PermissionError` out of the walk
+    with no list to collect into, and with one it reported the directory whole and counted its
+    megabyte as nothing."""
+    if os.getuid() == 0:
+        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+    closed, half = _closed_tree(tmp_path)
+    try:
+        regranted: list = []
+        used = kern._workspace_usage(str(tmp_path), None, regranted)
+        assert sorted(regranted) == sorted([str(closed), str(half)])
+        assert used > (1 << 20) + (50 * 65536), "the repaired directories were still not counted"
+        assert os.stat(closed).st_mode & 0o500 == 0o500, "the search bit was not put back"
+        assert os.stat(half).st_mode & 0o500 == 0o500
+        # ONLY WHAT THE WALK NEEDS. The box asked for 0, so it does not get write back: `0o500`, not
+        # `0o700`. A caller is TOLD, because this changed state the box can see.
+        assert os.stat(closed).st_mode & 0o200 == 0
+        with pytest.warns(RuntimeWarning, match="restored owner read\\+search"):
+            kern._warn_regranted(regranted)
+    finally:
+        os.chmod(closed, 0o700)
+        os.chmod(half, 0o700)
+
+
+def test_a_directory_that_is_NOT_ours_is_still_reported_whole_and_not_counted(tmp_path, monkeypatch):
+    """The `user=` session, where the closed directory belongs to the box account and no `chmod` of
+    ours can touch it. Simulated by refusing the repair, which is what the ownership test does for a
+    uid of the subordinate range; the real thing is measured end to end in
+    `test_what_the_box_user_closes_to_the_host_is_still_read_listed_counted_snapshotted_and_removed`."""
+    if os.getuid() == 0:
+        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+    closed, half = _closed_tree(tmp_path)
+    _no_repair(monkeypatch)
     try:
         blind: list = []
         used = kern._workspace_usage(str(tmp_path), blind)
         assert sorted(blind) == sorted([str(closed), str(half)])
         assert used < (1 << 20), "a closed directory's contents were counted from here"
         # WITHOUT A LIST THERE IS NO ONE TO ASK, so the walk refuses instead of returning a number
-        # that is short by whatever is hidden. That is the cap bypass this closes: with the workspace
-        # owned by this process's own uid, one call writes a cap's worth of bytes into a directory and
-        # chmods it to 0, and every later call measured those bytes as nothing and was admitted.
+        # that is short by whatever is hidden. That is the cap bypass this closes: one call writes a
+        # cap's worth of bytes into a directory it then chmods to 0, and every later call measured
+        # those bytes as nothing and was admitted.
         with pytest.raises(SandboxError) as e:
             kern._workspace_usage(str(tmp_path))
         assert "cannot be measured" in str(e.value) and str(closed) in str(e.value)
@@ -749,28 +1042,144 @@ def test_the_walk_raises_on_a_resource_error_instead_of_reporting_a_smaller_work
     assert "top.txt" in got and "sub/f.txt" not in got
 
 
-def test_an_unreadable_directory_cannot_hide_bytes_from_workspace_max_bytes(tmp_path):
-    """The cap is cooperative, but it must not be defeatable for good by one `chmod`.
-
-    In a default session the box runs as this process's own uid, so the code in the box owns the
-    workspace and can close a directory to the host. The usage walk counted such a directory as zero,
-    so: call one writes a cap's worth of bytes into `h/` and runs `os.chmod("h", 0)`, and every call
-    after that measures those bytes as nothing and is admitted. The cap is gone for the life of the
-    session, with nothing said.
-
-    There is no helper to ask here - the helper runs AS the box user, which in this session is this
-    process - so the only honest outcomes are to refuse or to admit on a number known to be short.
-    This asserts the refusal, and that it names the cap rather than leaving the reader with an
-    unexplained error from a listing.
-    """
-    if os.getuid() == 0:
-        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+def _hidden_cap_arena(tmp_path):
+    """A 1 MiB cap and two megabytes behind a directory the box closed to the host."""
     s = _cfg(workspace_max_bytes=1 << 20)
     s._ws = str(tmp_path)
     hidden = tmp_path / "h"
     hidden.mkdir()
     (hidden / "big").write_bytes(b"y" * (2 << 20))
     os.chmod(hidden, 0)
+    return s, hidden
+
+
+def test_the_tick_of_the_wait_costs_nothing_when_nobody_asks_for_it():
+    """`_wait_for_exit`'s contract, both ways, without a box.
+
+    The wait blocks on a pidfd because `Popen.wait(timeout=)` polls with a backoff and slept 3.2 ms
+    past the exit on every call, 26% of the wall time. Slicing that wait for a periodic check must not
+    give those milliseconds back, so with no tick asked for there is exactly ONE `poll` for the whole
+    deadline and the callback is never consulted."""
+    seen: list = []
+
+    def tick() -> "float | None":
+        seen.append(time.monotonic())
+        return None if len(seen) >= 3 else 0.02
+
+    slow = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        # NO TICK: the callback is not called at all, and the deadline is the only thing that ends it.
+        t0 = time.monotonic()
+        assert kern._wait_for_exit(slow, 0.15) is False
+        assert seen == [], seen
+        assert time.monotonic() - t0 >= 0.15
+
+        # WITH A TICK: consulted once per slice, and the third answer stops the wait.
+        assert kern._wait_for_exit(slow, 30.0, 0.02, tick) is False
+        assert len(seen) == 3, seen
+        assert slow.poll() is None, "the wait must not touch the process it is waiting on"
+    finally:
+        slow.kill()
+        slow.wait()
+
+
+def test_the_tick_works_on_a_kernel_WITHOUT_pidfd_too(monkeypatch):
+    """The fallback path, FORCED, because no host here can reach it on its own.
+
+    `_wait_for_exit` prefers a pidfd and falls back to `Popen.wait` in slices when `os.pidfd_open` is
+    missing or refused - an old kernel (pre-5.3), or a syscall filter in whatever sandbox the CALLER is
+    itself running under. Every machine this is tested on has pidfd, so that branch ships unexercised
+    unless it is forced; a cleanup review pointed out it holds the cap poller's whole timing contract
+    on those hosts. Forced here by removing `os.pidfd_open`, which is the same thing the kernel does."""
+    seen: list = []
+
+    def tick() -> "float | None":
+        seen.append(time.monotonic())
+        return None if len(seen) >= 3 else 0.02
+
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    slow = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        # NO TICK: the deadline is still the only thing that ends it, and the callback is not consulted.
+        t0 = time.monotonic()
+        assert kern._wait_for_exit(slow, 0.15) is False
+        assert seen == [], seen
+        assert time.monotonic() - t0 >= 0.15
+        # WITH A TICK: the same contract as the pidfd path - consulted once per slice, third answer ends it.
+        assert kern._wait_for_exit(slow, 30.0, 0.02, tick) is False
+        assert len(seen) == 3, seen
+        assert slow.poll() is None
+    finally:
+        slow.kill()
+        slow.wait()
+
+
+def test_a_cap_is_enforced_DURING_a_call_and_not_only_between_calls(tmp_path):
+    """The measured defect: one call wrote 8,115 MB in ten seconds against a 50 MiB cap and was
+    admitted, because the next check is the next call.
+
+    Here the cell writes 4 MiB against a 1 MiB cap and then sleeps 30 seconds. Before this the call
+    returned after those 30 seconds with the bytes on disk and no fault; now the box is stopped at the
+    first measurement, the fault NAMES the cap rather than reading as a timeout or an OOM, and the
+    result still comes back as a result."""
+    with Sandbox(image="python:3.12-alpine", pyc_cache=False, workspace_max_bytes=1 << 20) as s:
+        started = time.monotonic()
+        r = s.run_code(
+            "open('big.bin','wb').write(b'x' * (4 << 20))\n"
+            "import time; time.sleep(30)\n"
+            "print('this line must never run')\n",
+            timeout_s=40,
+        )
+        took = time.monotonic() - started
+        assert r.fault is not None, r
+        assert r.fault.type == "workspace_full", r.fault
+        assert "over the 1048576-byte workspace_max_bytes" in r.fault.message, r.fault.message
+        assert "this line must never run" not in r.stdout, r.stdout
+        assert not r.success and r.exit_code == 137, r
+        # STOPPED AT THE FIRST MEASUREMENT, not at the cell's own 30 seconds and not at `timeout_s`.
+        assert took < 15, f"the poller did not stop it: {took:.1f}s"
+
+
+def test_an_unreadable_directory_cannot_hide_bytes_from_workspace_max_bytes(tmp_path):
+    """The cap is cooperative, but it must not be defeatable for good by one `chmod`.
+
+    In a default session the box runs as this process's own uid, so the code in the box owns the
+    workspace and can close a directory to the host. The usage walk counted such a directory as zero,
+    so: call one writes a cap's worth of bytes into `h/` and runs `os.chmod("h", 0)`, and every call
+    after that measured those bytes as nothing and was admitted. The cap was gone for the life of the
+    session, with nothing said.
+
+    THE PROPERTY IS "the bytes are not hidden", and it is now met by MEASURING them rather than by
+    refusing to measure: the directory is ours, so the owner bits go back and the walk reads it. The
+    refusal that arrives is therefore the cap's own, with the total in it - which is also the sentence
+    a reader can act on. The version of this test that asserted "cannot be measured" was asserting the
+    mechanism, and the mechanism is the half below."""
+    if os.getuid() == 0:
+        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+    s, hidden = _hidden_cap_arena(tmp_path)
+    try:
+        with pytest.raises(SandboxError) as e:
+            s._spawn(["true"], timeout_s=5, network=False)
+        said = str(e.value)
+        assert "over the 1048576-byte workspace_max_bytes" in said, said
+        assert "refused before running" in said, said
+        # The total itself is the walk's and depends on block size, so the assertion is that the
+        # sentence carries one at all, not its value.
+        assert re.search(r"workspace holds \d+ bytes", said), said
+    finally:
+        os.chmod(hidden, 0o700)
+
+
+def test_when_the_bytes_cannot_be_measured_at_all_the_call_is_refused_for_that(tmp_path, monkeypatch):
+    """The other half, and the one that is left when the repair is impossible: a directory owned by the
+    box account in a `user=` session. There is no helper to ask here - the helper runs AS the box user,
+    which in this session is this process - so the only honest outcomes are to refuse or to admit on a
+    number known to be short. The refusal names the cap rather than leaving the reader with an
+    unexplained error from a listing."""
+    if os.getuid() == 0:
+        pytest.skip("root reads a 000 directory, so nothing here is closed to it")
+    s, hidden = _hidden_cap_arena(tmp_path)
+    _no_repair(monkeypatch)
     try:
         with pytest.raises(SandboxError) as e:
             s._spawn(["true"], timeout_s=5, network=False)
@@ -789,12 +1198,18 @@ def test_a_symlinked_path_component_is_refused_by_the_sentence_that_names_the_sy
     regular file in the way too, and it drops the fact that matters: something in this path points
     out of the workspace. Both shapes are asserted, because one sentence for both is how the
     distinction was lost in the first place.
-    """
+
+    AND BOTH DIRECTIONS, because that is how it came back. The read path had its OWN descent loop, so
+    `read_file("link/secret")` answered `cannot read 'link/secret': [Errno 20] Not a directory: 'link'`
+    while the identical shape on the write path named the symlink - reported from outside, measured
+    against this commit's parent. Both now descend through `_descend_dirs`, which is the only place
+    that mapping lives."""
     s = _cfg()
     s._ws = str(tmp_path)
     s._entered = True
     outside = tmp_path.parent / f"outside-{uuid.uuid4().hex[:8]}"
     outside.mkdir()
+    (outside / "secret").write_text("host")
     os.symlink(outside, tmp_path / "evil")
     (tmp_path / "plain").write_text("not a directory")
     try:
@@ -806,6 +1221,30 @@ def test_a_symlinked_path_component_is_refused_by_the_sentence_that_names_the_sy
         with pytest.raises(SandboxError) as e:
             s.write_file("plain/x", "nope")
         assert "not a directory" in str(e.value), str(e.value)
+
+        with pytest.raises(SandboxError) as e:
+            s.read_file("evil/secret")
+        assert "symlinked directory" in str(e.value), str(e.value)
+        assert "Errno 20" not in str(e.value), str(e.value)
+
+        with pytest.raises(SandboxError) as e:
+            s.read_file("plain/x")
+        assert "not a directory" in str(e.value), str(e.value)
+
+        # THE FINAL COMPONENT, where the descent holds no parent descriptor: before this it came back
+        # as a bare `[Errno 20] Not a directory`, while the NODE binding looked and named the link.
+        # Both now print the same sentence, measured side by side on the same tree.
+        with pytest.raises(SandboxError) as e:
+            s.list_files("evil")
+        assert str(e.value) == "path escapes the workspace via a symlinked directory: 'evil'", str(e.value)
+
+        # AND WHEN LOOKING CANNOT DECIDE, the sentence names both possibilities instead of printing
+        # the errno: a FIFO as the final component of a listing is ENOTDIR and is not a link.
+        os.mkfifo(tmp_path / "pipe")
+        with pytest.raises(SandboxError) as e:
+            s.list_files("pipe")
+        assert "not a DIRECTORY" in str(e.value) and "SYMLINK" in str(e.value), str(e.value)
+        assert "Errno 20" not in str(e.value), str(e.value)
     finally:
         shutil.rmtree(outside, ignore_errors=True)
 

@@ -17,7 +17,7 @@
 // law of the platform, and the README should not imply otherwise.
 
 /** What stopped the code at the SANDBOX level. Reported as data on a result, never thrown. */
-export type SandboxFaultType = "timeout" | "oom" | "escape_blocked" | "killed" | "startup_failed" | "exec_failed";
+export type SandboxFaultType = "timeout" | "oom" | "escape_blocked" | "killed" | "startup_failed" | "exec_failed" | "workspace_full";
 
 export interface SandboxFault {
   type: SandboxFaultType;

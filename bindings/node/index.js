@@ -68,6 +68,128 @@ function isClosedErr(e) {
   return !!e && (e.code === "EACCES" || e.code === "EPERM");
 }
 
+/** The first interval between two in-call workspace measurements. Only the FIRST: the poller multiplies
+ * it by how long the measurement took, so a workspace with many files makes it back off rather than
+ * compete with the workload for the disk. Mirrors Python's `_CAP_POLL_S`. */
+const CAP_POLL_MS = 1000;
+
+/** What this process needs on a directory to walk it: read (list the names) and search (stat them).
+ * Deliberately NOT write: the walk does not need it, and the box asked for 0. */
+const OWN_DIR_BITS = 0o500;
+
+/**
+ * Put owner read+search back on the directory `fd` refers to, IF THIS PROCESS OWNS IT.
+ *
+ * WHY IT EXISTS. `mkdirSync("hid"); chmodSync("hid", 0)` is two lines inside a box, and before this
+ * every host-side walk answered them with the raw EACCES raised out of the REPORTING path: it destroyed
+ * the result of a call that had already run, and every later call on the session failed the same way
+ * until someone fixed the mode by hand. The workspace is kern's own reporting surface and the host user
+ * owns the directories in it, so that refusal is self-inflicted and repairable.
+ *
+ * OWNERSHIP IS THE WHOLE GUARD, AND IT IS READ FROM THE DESCRIPTOR. `fstat` on a descriptor names one
+ * inode for the whole check, so a directory swapped for a symlink between the test and the change
+ * cannot redirect the `chmod`. A directory owned by someone ELSE - the `user` session, where the box
+ * user is a uid of the subordinate range - is left exactly as it is for the helper box, which is the
+ * only thing that can read it.
+ *
+ * Returns true ONLY when the mode actually changed, so a caller may retry exactly once and can never
+ * loop on a refusal the mode does not explain (a MAC policy, a read-only mount).
+ */
+/** Whether the inode `fd` pins really lies under `inside`, asked of the DESCRIPTOR.
+ *
+ * Three of the repair's callers pass a plain PATH, where `O_NOFOLLOW` guards only the LAST component:
+ * the usage walk is by path throughout, and two walks fall back to the root path after a descent has
+ * already failed. A box that swaps an intermediate component for a symlink in that window sends the
+ * pin elsewhere, and an adversarial review of the first fix showed the `chmod` could then land on a
+ * directory of this user's OUTSIDE the workspace. Not an escalation - the bits are ones this user
+ * could already set on a file it already owns - but the comment on the repair claimed the change stays
+ * inside the workspace tree, and this makes that true rather than nearly true. Mirrors Python's
+ * `_pinned_within`. */
+function pinnedWithin(fd, inside) {
+  let real;
+  try {
+    real = fs.readlinkSync(`/proc/self/fd/${fd}`);
+  } catch {
+    return false;
+  }
+  const root = inside.replace(/\/+$/, "");
+  return real === root || real.startsWith(root + "/");
+}
+
+function regrantOwnDirFd(fd, inside) {
+  // `geteuid`, not `getuid`: the kernel checks the FSUID, which follows the effective uid. Python
+  // reads `os.geteuid()`, and in a process with a real uid different from its effective one the two
+  // bindings would otherwise disagree about what they own.
+  if (typeof process.geteuid !== "function") return false; // not a POSIX host: no owner to be
+  let st;
+  try {
+    st = fs.fstatSync(fd);
+  } catch {
+    return false;
+  }
+  if (!st.isDirectory()) return false;
+  if (st.uid !== process.geteuid()) return false;
+  if (inside !== undefined && inside !== null && !pinnedWithin(fd, inside)) return false;
+  const want = (st.mode & 0o7777) | OWN_DIR_BITS;
+  if (want === (st.mode & 0o7777)) return false; // the bits are there, so the mode is not what refused
+  try {
+    fs.fchmodSync(fd, want);
+    return true;
+  } catch {
+    /* on glibc an `O_PATH` descriptor answers EBADF: fall through to the magic link */
+  }
+  try {
+    // TWO BRANCHES, AND WHICH ONE RUNS IS THE LIBC'S CHOICE, measured on seven host shapes: glibc
+    // refuses `fchmod` on an `O_PATH` descriptor with EBADF so this line does the work, while MUSL
+    // succeeds above because its own `fchmod` falls back to `/proc/self/fd` internally - measured on
+    // alpine for x86_64 AND aarch64, the release's own target. Both end in the same syscall on the
+    // same pinned inode, so neither branch is dead and a test on one libc covers only half.
+    //
+    // `/proc/self/fd/<n>` resolves to the inode that descriptor PINS, so this cannot be redirected by
+    // renaming or symlinking the name it was opened under. Without `/proc` there is no second way.
+    fs.chmodSync(`/proc/self/fd/${fd}`, want);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `regrantOwnDirFd` for a directory that refused the OPEN: pin the inode with `O_PATH` first.
+ * `at` is either a `/proc/self/fd/<parent>/<name>` path - where the parent is pinned by its descriptor,
+ * so no intermediate component can be swapped - or a plain path, where the exposure is the one the
+ * caller's own `lstat`/`readdir` by path already has, and the primitive is bounded to "add owner
+ * read+search to a directory this process already owns". */
+function regrantOwnDir(at, inside) {
+  let fd;
+  try {
+    // `O_PATH` (declared with the ACL helpers below) asks for no permission on the file it opens,
+    // which is the only way to pin a directory whose mode is 0: `O_RDONLY` on one answers EACCES,
+    // and that refusal is the whole problem.
+    fd = fs.openSync(at, O_PATH | fs.constants.O_NOFOLLOW);
+  } catch {
+    return false;
+  }
+  try {
+    return regrantOwnDirFd(fd, inside);
+  } finally {
+    closeQuietly(fd); // the helper this file has had since long before the repair
+  }
+}
+
+/** One line when a walk had to put mode bits back, because it changed BOX-VISIBLE state. */
+function warnRegranted(names) {
+  if (names && names.length)
+    process.emitWarning(
+      `restored owner read+search on ${names.length} workspace directory(ies) that the box had ` +
+        `closed to this process, so the listing and any size cap stay measurable ` +
+        `(first: ${JSON.stringify(names[0])})`,
+      // NAMED like every other workspace warning this binding emits ("KernWorkspaceListing" on the
+      // three listing-gap notices): the name is the filterable part of `process.emitWarning`, and
+      // without one a consumer filtering on it does not see the repair notice at all.
+      "KernWorkspaceRepair",
+    );
+}
+
 /**
  * Bytes a directory tree occupies ON DISK, or 0 when it cannot be read.
  *
@@ -86,14 +208,17 @@ function isClosedErr(e) {
  * Iterative with an explicit stack, not recursion: a deep tree is something the box chooses, and a
  * 2000-level one is enough to end a recursive walk in a stack overflow.
  *
- * Best effort, never throwing: a file deleted mid-walk is ordinary in a live workspace, and a
- * measurement that can abort a call is worse than one that is slightly stale. With `blind` (a shared
- * workspace) a directory closed to this process is pushed there whole, uncounted, for the caller to
- * measure another way.
+ * Churn is best effort: a file deleted mid-walk is ordinary in a live workspace and is skipped. A
+ * DIRECTORY CLOSED TO THIS PROCESS IS NOT churn. Its owner bits are put back when it is ours (every
+ * session without `user`), it goes to `blind` whole and uncounted when it is the box user's and the
+ * caller passed a list, and otherwise this THROWS - because counting it as zero is how a cooperative
+ * cap is defeated for good. Mirrors Python's `_workspace_usage`.
  */
-function workspaceUsage(root, blind = null) {
+function workspaceUsage(root, blind = null, regranted = null) {
   let total = 0;
   const seen = new Set();
+  const unreadable = [];
+  const retried = new Set();
   const stack = [root];
   // A DIRECTORY THIS PROCESS CANNOT READ is not an empty one. With a non-root `user` the box user can
   // close one to us (`mkdtemp`'s 0700), and counting it as zero would let the code in the box keep a
@@ -105,8 +230,26 @@ function workspaceUsage(root, blind = null) {
     try {
       entries = fs.readdirSync(current, { withFileTypes: true });
     } catch (e) {
-      if (blind && isClosedErr(e)) blind.push(current);
-      continue;
+      if (!isClosedErr(e)) continue; // gone or replaced: ordinary in a live workspace
+      let back = false;
+      if (regrantOwnDir(current, root)) {
+        if (regranted) regranted.push(current);
+        try {
+          entries = fs.readdirSync(current, { withFileTypes: true });
+          back = true;
+        } catch {
+          back = false;
+        }
+      }
+      if (!back) {
+        // NOT SILENTLY ZERO. Before this a session without `user` (so `blind` null) just skipped the
+        // directory, which is precisely the bypass the comment below describes: two gigabytes in `h/`,
+        // `chmod 0`, and every later measurement read those bytes as nothing. Python refused instead,
+        // and the two bindings have to answer the same. One list, handed to the caller or thrown at the
+        // end: `(blind || unreadable)` made the reader prove the two were exclusive at every push.
+        unreadable.push(current);
+        continue;
+      }
     }
     const stats = [];
     let closed = false;
@@ -122,7 +265,16 @@ function workspaceUsage(root, blind = null) {
       }
     }
     if (closed) {
-      if (blind) blind.push(current);
+      // ONE retry, counted. Without the counter a box flipping the mode from another cell beside this
+      // walk re-entered as often as it won the race, because every successful regrant pushed the
+      // directory back on the stack. Python bounds the same loop with `for attempt in (0, 1)`.
+      if (!retried.has(current) && regrantOwnDir(current, root)) {
+        retried.add(current);
+        if (regranted) regranted.push(current);
+        stack.push(current); // the bits are back: list it once more, from the top
+        continue;
+      }
+      unreadable.push(current);
       continue;
     }
     for (const [full, st] of stats) {
@@ -133,6 +285,15 @@ function workspaceUsage(root, blind = null) {
       total += (st.blocks || 0) * 512;
     }
   }
+  if (unreadable.length && blind) {
+    blind.push(...unreadable); // the caller asked to be handed them; Python does the same
+  } else if (unreadable.length)
+    throw new SandboxError(
+      `the workspace cannot be measured: ${unreadable.length} directory(ies) under ${root} cannot be ` +
+        `read by this process and the owner bits could not be restored (not ours, or no /proc to ` +
+        `reach the pinned descriptor), and counting them as empty would let a cap's worth of bytes ` +
+        `sit where the walk does not look (first: ${JSON.stringify(unreadable[0])})`,
+    );
   return total;
 }
 
@@ -2929,20 +3090,55 @@ function tarWriteFile(out, name, content, mtime = 0, fileMode = 0o644) {
  * `/proc/self/fd/<dir>`, opened `O_NOFOLLOW` relative to it, and judged on the open descriptor. By path,
  * a box running beside the snapshot could turn a directory into a symlink after the check and have the
  * next read archive a HOST file. Regular files only, as this format always held; symlinks never.
- * `blind`, on a shared workspace, collects what the box user closed to this process instead of failing
- * on it; null is the old behaviour, every error raised. */
-function tarCollect(dirFd, rel, skipId, out, blind, skipped) {
+ * `inside` is the workspace root, threaded in like `regranted` because this is a module function with
+ * no `this`: it is what the repair's containment check compares the pinned inode against. ⛔ It was
+ * MISSING at the three sites below while the Python twin passed it, so the guard an adversarial review
+ * had just added was absent on this binding's snapshot path - a cleanup review reading the two side by
+ * side found it.
+ *
+ * A DIRECTORY closed to this process is reopened once its owner bits are put back, which is every
+ * directory of a session without `user`. One that is NOT ours goes to `blind` on a shared workspace,
+ * for the helper; with `blind` null every error is still raised, which is what a mode-0 FILE takes -
+ * its mode can be the data, so it is left exactly as the box wrote it. */
+function tarCollect(dirFd, rel, skipId, out, blind, skipped, regranted, inside) {
   const nofollow = fs.constants.O_NOFOLLOW;
+  // What this process cannot read. On a shared workspace the helper box takes it whole; with no box
+  // user to ask it is THROWN, because a snapshot quietly missing files is one a caller restores
+  // believing it whole - but NAMED, never as a bare EACCES. Two shapes reach here now that a directory
+  // of ours is repaired and retried: one that is NOT ours, and a box that re-closes a directory inside
+  // the retry window (or leaves a mode-0 FILE, whose mode is left exactly as it wrote it). Python's
+  // `set_aside` says the same in the same order.
   const closed = (e, at) => {
-    if (!blind || !isClosedErr(e)) throw e;
+    if (!isClosedErr(e)) throw e; // out of descriptors, out of memory, a read error off the disk
+    if (!blind)
+      throw new SandboxError(
+        `snapshot: cannot read ${JSON.stringify(at)}, so the archive would be short. A directory of ` +
+          "ours has its owner bits put back and is retried, so this is either not ours, or a file the " +
+          "box left at mode 0, or a directory it closed again while this walk ran",
+        { cause: e },
+      );
     blind.push(at);
   };
   let names;
   try {
     names = fs.readdirSync(`/proc/self/fd/${dirFd}`).sort();
   } catch (e) {
-    closed(e, rel);
-    return;
+    // OURS AND CLOSED TO US: one `chmod 0` inside the box used to end `snapshot()` outright on every
+    // session without `user`, because `closed` re-throws when there is no helper to ask.
+    let back = false;
+    if (isClosedErr(e) && regrantOwnDirFd(dirFd, inside)) {
+      if (regranted) regranted.push(rel);
+      try {
+        names = fs.readdirSync(`/proc/self/fd/${dirFd}`).sort();
+        back = true;
+      } catch {
+        back = false;
+      }
+    }
+    if (!back) {
+      closed(e, rel);
+      return;
+    }
   }
   for (const entry of names) {
     const at = `/proc/self/fd/${dirFd}/${entry}`;
@@ -2952,8 +3148,21 @@ function tarCollect(dirFd, rel, skipId, out, blind, skipped) {
       st = fs.lstatSync(at);
     } catch (e) {
       if (e.code === "ENOENT") continue;
-      closed(e, rel); // listable, not searchable: the helper takes it whole
-      return;
+      // The SEARCH bit is missing on THIS directory, not on the entry, and it may be ours.
+      let back = false;
+      if (isClosedErr(e) && regrantOwnDirFd(dirFd, inside)) {
+        if (regranted) regranted.push(rel);
+        try {
+          st = fs.lstatSync(at);
+          back = true;
+        } catch {
+          back = false;
+        }
+      }
+      if (!back) {
+        closed(e, rel); // listable, not searchable: the helper takes it whole
+        return;
+      }
     }
     // ONLY WHAT restore() WRITES: regular files and directories. A symlink, FIFO, device or socket is
     // named in `skipped` instead, so the caller can say the archive is not the whole tree; it was left
@@ -2968,8 +3177,20 @@ function tarCollect(dirFd, rel, skipId, out, blind, skipped) {
         fd = fs.openSync(at, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | nofollow);
       } catch (e) {
         if (["ENOENT", "ELOOP", "ENOTDIR"].includes(e.code)) continue; // swapped since the lstat
-        closed(e, child);
-        continue;
+        let got = null;
+        if (isClosedErr(e) && regrantOwnDir(at, inside)) {
+          if (regranted) regranted.push(child);
+          try {
+            got = fs.openSync(at, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | nofollow);
+          } catch {
+            got = null;
+          }
+        }
+        if (got === null) {
+          closed(e, child);
+          continue;
+        }
+        fd = got;
       }
       try {
         // THE MEMBER FIRST, THEN ITS CHILDREN: an extractor creates a directory before writing into
@@ -2978,7 +3199,7 @@ function tarCollect(dirFd, rel, skipId, out, blind, skipped) {
         // swapped between the two cannot contribute a timestamp from somewhere else.
         const dst = fs.fstatSync(fd);
         if (dst.isDirectory()) tarWriteDir(out, child, Math.floor(dst.mtimeMs / 1000));
-        tarCollect(fd, child, skipId, out, blind, skipped);
+        tarCollect(fd, child, skipId, out, blind, skipped, regranted, inside);
       } finally {
         fs.closeSync(fd);
       }
@@ -3894,6 +4115,12 @@ class Sandbox {
     // Python's.
     if (hostUid === own) return; // the account writes as this process: already shared
     this._userHostUid = hostUid;
+    // THE ACL WALK IS A FIFTH TRAVERSAL, and it opens the root itself (`aclGrantBatches` is a module
+    // generator, so it cannot reach `_wsFd`). On a PERSISTENT workspace whose root a previous session's
+    // box left at mode 0, that open threw a raw EACCES out of the enter path - the exact shape `_wsFd`
+    // exists for, on the one traversal the repair had not reached. Repaired here, at the call site that
+    // has `this`, before the walk starts. A cleanup review found it.
+    closeQuietly(this._wsFd());
     let foreign = 0;
     let example = "";
     try {
@@ -4030,7 +4257,9 @@ class Sandbox {
 
   /** The refusal a helper script's exit code stands for, in the words the host path uses. */
   _helperRefusal(verb, rel, r) {
-    if (r.code === 40) return pathRefusal(verb, rel, Object.assign(new Error("ELOOP"), { code: "ELOOP" }));
+    // `false` is not a guess: this builds an ELOOP refusal, and only the EACCES arm reads the flag.
+  if (r.code === 40)
+    return pathRefusal(verb, rel, Object.assign(new Error("ELOOP"), { code: "ELOOP" }), false);
     if (r.code === 41)
       return new SandboxError(
         `refusing to ${verb} ${JSON.stringify(rel)}: not a regular file (a FIFO, device or socket ` +
@@ -4337,7 +4566,22 @@ class Sandbox {
     // nothing when unset, which is the default.
     if (this.workspaceMaxBytes !== null && this._ws) {
       const blind = [];
-      let used = workspaceUsage(this._ws, this._shared ? blind : null);
+      const regranted = [];
+      let used;
+      try {
+        used = workspaceUsage(this._ws, this._shared ? blind : null, regranted);
+      } catch (e) {
+        // A SESSION WITH NO BOX USER TO ASK: there is no helper that could size what this process
+        // cannot read, so the only honest answers are "refuse" and "admit the call on a number that is
+        // short by whatever is hidden". The cap says which one it is. Mirrors Python.
+        if (!(e instanceof SandboxError)) throw e;
+        throw new SandboxError(
+          `workspaceMaxBytes cannot be measured, so this call was refused before running: ${e.message}`,
+          { cause: e },
+        );
+      } finally {
+        warnRegranted(regranted);
+      }
       if (blind.length) {
         // WHAT THE BOX USER CLOSED TO US IS MEASURED BY THE BOX USER, in the unit `du` and the walk
         // share (allocated blocks). Counting it as zero would let a non-root session park a cap's worth
@@ -4477,12 +4721,19 @@ class Sandbox {
       // whatever the callback ordering turns out to be.
       let timer = null;
       let hardTimer = null;
+      let capTimer = null;
+      let capOverrun = null;
+      const capLimit = this.workspaceMaxBytes;
 
       const finish = (code, signal) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
         if (hardTimer) clearTimeout(hardTimer);
+        // CLEARED HERE WITH ITS SIBLINGS, and the comment on `timer` below is why it has to be: a timer
+        // this function forgets keeps the event loop alive until its own next tick, which cost 224 to
+        // 232 ms of dead time per call the last time it happened in this file.
+        if (capTimer) clearTimeout(capTimer);
         // kern has read the file by the time it exits; leaving it behind would accrete one per call
         // in a persistent `workspace`.
         this._removeEnvFile(name);
@@ -4494,6 +4745,23 @@ class Sandbox {
           rc, signal, stderr, timedOut, timeoutS, capSignal, oomSignal, aliveState, workloadSignal,
           boxStarted,
         );
+        // HERE AND NOT IN `_classify`, deliberately: that function is a pure function of the signals
+        // kern sends, it is byte-identical in the two bindings, and a value it already returns changing
+        // meaning is a BREAKING change for anyone branching on `fault.type`. The cap kill is new
+        // information this call site owns, so it replaces the classification afterwards. The teardown
+        // it used is the deadline's, which is why `_classify` would otherwise say `timeout`: true of how
+        // the box died, wrong about why.
+        if (capOverrun !== null) {  // only ever assigned past the limit, so the limit was set
+          fault = sandboxFault(
+            "workspace_full",
+            `the workspace reached ${capOverrun} bytes, over the ${capLimit}-byte workspaceMaxBytes, ` +
+              "so the box was stopped mid-call. The cap is measured while the call runs, so it bounds " +
+              "ONE call and not only what accumulates across them; the overshoot is whatever the box " +
+              `wrote between two measurements. The box writes to a host directory (${this._ws}), so ` +
+              "this is still not a kernel boundary: put the workspace on a filesystem whose size you " +
+              "chose and the kernel answers ENOSPC instead",
+          );
+        }
         const execFail = execFailureBinary(stderr);
         if (execFail !== null && rc !== 0) {
           // BEFORE the suppression below, which would erase it: the box started, so that branch
@@ -4595,15 +4863,65 @@ class Sandbox {
         hardTimer = setTimeout(() => finish(EXIT_SIGKILL, "SIGKILL"), 10000);
       };
 
-      timer = setTimeout(() => {
+      // THE ONE PLACE THAT DECIDES TO KILL, and it has to stay one: the hard net is armed HERE because
+      // it used to be noticed instead by a 250 ms setInterval that `finish` never cleared, so after
+      // every call that interval kept the event loop alive until its own next tick - measured 224 to
+      // 232 ms of dead time between a call resolving and the process being able to exit, against 19 to
+      // 27 ms of real work. Two callers reach it now, the deadline and the workspace cap, and the first
+      // version of the cap COPIED these three lines instead of calling them, which made the sentence
+      // above false the moment it was written.
+      const stopBox = () => {
         timedOut = true;
         this._teardown(child, name, childEnv);
-        // Armed HERE, at the one place that decides to kill. It used to be noticed instead by a
-        // 250 ms setInterval that `finish` never cleared, so after every call that interval kept the
-        // event loop alive until its own next tick: measured 224 to 232 ms of dead time between a
-        // call resolving and the process being able to exit, against 19 to 27 ms of real work.
         armHardNet();
-      }, timeoutS * 1000);
+      };
+
+      // THE CAP, ENFORCED WHILE THE CALL RUNS AND NOT ONLY BETWEEN CALLS. The check in `_spawn` bounds
+      // what ACCUMULATES across calls, which is all a cooperative cap can do from outside; it does not
+      // bound ONE call, and it was measured not bounding one: a cell wrote 8,115 MB in ten seconds
+      // against a 50 MiB cap and was admitted, because the next check is the next call.
+      //
+      //   * COSTS NOTHING WHEN UNSET, which is the default and the MCP server's shape: no cap, no timer.
+      //   * SELF-LIMITING. `workspaceUsage` is SYNCHRONOUS and walks the tree, so on this runtime it
+      //     holds the event loop for its duration - the same cost the pre-call check already pays once.
+      //     The next delay is ten times the last measurement, floor `CAP_POLL_MS`, so the poller cannot
+      //     take more than about a tenth of the loop however many files the box creates.
+      //   * NEVER KILLS ON "I DON'T KNOW": a measurement that throws keeps the call going, and the
+      //     pre-call check still refuses the next one.
+      //
+      // Overshoot is real and bounded by the interval: at ~810 MB/s measured, the one-second floor can
+      // let ~800 MB past before the box is stopped, against the 8 GB it replaces. Mirrors Python.
+      const armCapPoll = (delayMs) => {
+        capTimer = setTimeout(() => {
+          capTimer = null;
+          // `capLimit`/`_ws` are not re-tested: the timer is only armed when both hold, and they are a
+          // snapshot taken before the call - re-testing them reads as a hint that they can change.
+          if (settled) return;
+          let used;
+          try {
+            used = workspaceUsage(this._ws, null, null);
+          } catch {
+            // AND IT DOES NOT TRY AGAIN. The first version re-armed at the floor here, which is the one
+            // path with no backoff at all: on a `user` session the box account owns directories the
+            // repair refuses BY DESIGN, there is no helper to ask mid-call, so the measurement throws on
+            // every tick - a guaranteed-useless full walk of the tree every second for the rest of the
+            // call, measured at a 40% duty cycle on a 500k-file workspace. Nothing is lost by stopping:
+            // the pre-call check still refuses the NEXT call, which is what the comment above promises.
+            return;
+          }
+          const t0 = process.hrtime.bigint();
+          if (used > capLimit) {
+            capOverrun = used;
+            stopBox(); // the same three lines the deadline uses; the FAULT is overridden below
+            return;
+          }
+          const tookMs = Number((process.hrtime.bigint() - t0) / 1000000n);
+          armCapPoll(Math.max(CAP_POLL_MS, tookMs * 10));
+        }, delayMs);
+      };
+      if (capLimit !== null && this._ws) armCapPoll(CAP_POLL_MS);
+
+      timer = setTimeout(() => stopBox(), timeoutS * 1000);
     });
   }
 
@@ -4747,8 +5065,34 @@ class Sandbox {
   }
 
   /** The workspace's own directory as a descriptor: where every descent into it starts. */
+  /** A descriptor on the workspace ROOT, with the same repair every directory under it gets.
+   *
+   * THE PLACE A HOSTILE CELL REACHES FIRST, and the one the first version of this repair missed:
+   * `chmodSync("/workspace", 0)` is the same primitive as closing a subdirectory, and it came out of
+   * here as a bare EACCES - because the descent that repairs is HANDED this descriptor and never opens
+   * it. Found by an adversarial review of the first fix, reproduced in both bindings.
+   *
+   * ⛔ EVERY root open goes through here, and the count is deliberately NOT written down: the first
+   * version of this comment said "five callers" and a cleanup review counted nine, because the
+   * invariant is held by convention and a number in prose goes stale the first time someone adds a
+   * caller. `grep -n '_wsFd()'` answers it. */
   _wsFd() {
-    return fs.openSync(this._ws, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY;
+    try {
+      return fs.openSync(this._ws, flags);
+    } catch (e) {
+      if (!isClosedErr(e) || !regrantOwnDir(this._ws, this._ws)) throw e;
+      warnRegranted([this._ws]);
+      try {
+        return fs.openSync(this._ws, flags);
+      } catch (e2) {
+        throw new SandboxError(
+          `the workspace root ${JSON.stringify(this._ws)} is closed to this process and reopening it ` +
+            "after restoring its owner bits still failed, so nothing here can read it",
+          { cause: e2 },
+        );
+      }
+    }
   }
 
   /** The directory `parts` names under `baseFd`, opened one component at a time with `O_NOFOLLOW`
@@ -4798,7 +5142,9 @@ class Sandbox {
         try {
           fd = fs.openSync(`/proc/self/fd/${parent}/${parts[parts.length - 1]}`, flags, 0o644);
         } catch (e) {
-          throw pathRefusal(verb, rel, e);
+          // `write` and not a test on `verb`: the verb here is "snapshot to" or "restore from", and
+          // the fact is the flag this function already took.
+          throw pathRefusal(verb, rel, e, write);
         }
       } finally {
         if (parent !== root) fs.closeSync(parent);
@@ -4816,31 +5162,61 @@ class Sandbox {
   _descendDirs(baseFd, parts, { create = false } = {}) {
     const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
     let cur = baseFd;
-    for (const part of parts) {
-      const at = `/proc/self/fd/${cur}/${part}`;
-      let next;
-      try {
+    // ONE LINE FOR THE WHOLE DESCENT, not one per component. A box can plant a chain thousands of
+    // levels deep and close every one of them, and a warning per level would make the warning itself
+    // the denial of service this repair exists to prevent.
+    const regranted = [];
+    try {
+      for (const part of parts) {
+        const at = `/proc/self/fd/${cur}/${part}`;
+        let next;
         try {
-          next = fs.openSync(at, flags);
-        } catch (e) {
-          if (e.code !== "ENOENT" || !create) throw e;
           try {
-            fs.mkdirSync(at);
-          } catch (m) {
-            if (m.code !== "EEXIST") throw m; // made by someone else in between: opened by the same rules
+            next = fs.openSync(at, flags);
+          } catch (e) {
+            if (e.code !== "ENOENT" || !create) throw e;
+            try {
+              fs.mkdirSync(at);
+            } catch (m) {
+              if (m.code !== "EEXIST") throw m; // made by someone else in between: opened by the same rules
+            }
+            next = fs.openSync(at, flags);
           }
-          next = fs.openSync(at, flags);
+        } catch (e) {
+          // THE PARENT, NOT THE MISSING CHILD. With `create` the refusal can come from the `mkdir`,
+          // and then the directory to repair is `cur`: pinning `at` fails with ENOENT because it does
+          // not exist yet, so the first version repaired nothing and `writeFile("d/sub/x")` under a
+          // closed `d` threw a bare EACCES. Python's `_descend_dirs` has the same pair.
+          if (isClosedErr(e) && (regrantOwnDir(at, this._ws) || regrantOwnDirFd(cur, this._ws))) {
+            // OURS, AND CLOSED TO US FROM INSIDE THE BOX. This is THE descent for every read, write and
+            // listing the host does in the workspace, so one `chmod 0` on a component used to end all
+            // three. `at` goes through the parent's descriptor, so no intermediate component can be
+            // swapped, and the retry happens once because the regrant answers true once.
+            let reopened = null;
+            try {
+              reopened = fs.openSync(at, flags);
+            } catch {
+              reopened = null;
+            }
+            if (reopened !== null) {
+              regranted.push(part);
+              if (cur !== baseFd) fs.closeSync(cur);
+              cur = reopened;
+              continue;
+            }
+          }
+          if (cur !== baseFd) fs.closeSync(cur);
+          if (e.code === "ELOOP")
+            throw new SandboxError(`path escapes the workspace via a symlinked directory: ${JSON.stringify(part)}`, { cause: e });
+          if (e.code === "ENOTDIR")
+            throw new SandboxError(`workspace path component is not a directory: ${JSON.stringify(part)}`, { cause: e });
+          throw e;
         }
-      } catch (e) {
         if (cur !== baseFd) fs.closeSync(cur);
-        if (e.code === "ELOOP")
-          throw new SandboxError(`path escapes the workspace via a symlinked directory: ${JSON.stringify(part)}`, { cause: e });
-        if (e.code === "ENOTDIR")
-          throw new SandboxError(`workspace path component is not a directory: ${JSON.stringify(part)}`, { cause: e });
-        throw e;
+        cur = next;
       }
-      if (cur !== baseFd) fs.closeSync(cur);
-      cur = next;
+    } finally {
+      warnRegranted(regranted);
     }
     return cur;
   }
@@ -4877,27 +5253,36 @@ class Sandbox {
    *
    * The fd is the caller's to close. A refusal carries the OS error as its `cause`. */
   _openParentDirNofollow(rel) {
-    const base = fs.realpathSync(this._ws);
     const full = this._wsPath(rel);
-    const relDir = path.relative(base, path.dirname(full));
-    let dirFd = fs.openSync(base, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
-    if (relDir === "" || relDir === ".") return dirFd;
-    for (const part of relDir.split(path.sep)) {
-      if (!part || part === ".") continue;
-      let next;
+    // `this._ws` IS the canonical path (resolved at enter), which the comment below already asserts -
+    // so the `realpathSync` that used to produce a `base` local here was a syscall to compute a value
+    // equal to the one `_wsFd()` opens. A derived value asserted equal to its source in a comment
+    // instead of in code is the two-truths shape; this just uses the source.
+    const relDir = path.relative(this._ws, path.dirname(full));
+    // THROUGH `_wsFd`, which is the one place that repairs the ROOT. This had its own `openSync` of
+    // the workspace, so `writeFile("x")` after a cell ran `chmod 0 /workspace` threw a bare EACCES
+    // from here while every other root open was repaired. `this._ws` is already canonical, so `base`
+    // and it are the same directory.
+    const baseFd = this._wsFd();
+    if (relDir === "" || relDir === ".") return baseFd;
+    // ONE DESCENT SPELLING. This was a fourth copy of the same loop, and the copies had drifted: the
+    // one in `_descendDirs` names a symlinked component and puts the owner bits back on a directory of
+    // ours the box closed, so a `chmod 0` ended every WRITE while a read through the same shape was
+    // repaired. Its refusals are already SandboxErrors with the mechanism in them; anything else keeps
+    // this function's contract and comes back as a `write` path refusal.
+    try {
+      const fd = this._descendDirs(baseFd, relDir.split(path.sep));
+      if (fd !== baseFd) fs.closeSync(baseFd);
+      return fd;
+    } catch (e) {
       try {
-        next = fs.openSync(
-          `/proc/self/fd/${dirFd}/${part}`,
-          fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
-        );
-      } catch (e) {
-        fs.closeSync(dirFd);
-        throw pathRefusal("write", rel, e);
+        fs.closeSync(baseFd);
+      } catch {
+        /* the descent closed what it owned; this is the base it never touches */
       }
-      fs.closeSync(dirFd);
-      dirFd = next;
+      if (e instanceof SandboxError) throw e;
+      throw pathRefusal("write", rel, e, true);
     }
-    return dirFd;
   }
 
   /** Write `data` (Buffer|string) to `path` (workspace-relative) - host-direct, so the box sees it next
@@ -4919,7 +5304,15 @@ class Sandbox {
 
   /** `writeFile` on the host. */
   _writeFileHost(rel, full, payload) {
-    this._ensureParentDirs(full); // creates missing dirs, symlink-safe, NOT mkdir -p (which follows one)
+    try {
+      this._ensureParentDirs(full); // creates missing dirs, symlink-safe, NOT mkdir -p (which follows one)
+    } catch (e) {
+      // NAMED, like Python's. `_openParentDirNofollow` below has gone through `pathRefusal` all along,
+      // but this call runs FIRST and was unwrapped, so a write that had to CREATE a component under a
+      // directory the box closed threw a bare EACCES here. Found by an adversarial review.
+      if (e instanceof SandboxError) throw e;
+      throw pathRefusal("write", rel, e, true);
+    }
     // THE LEAF IS OPENED THROUGH A PINNED PARENT FD, not by path: see `_openParentDirNofollow`.
     const dirFd = this._openParentDirNofollow(rel);
     let fd;
@@ -4939,7 +5332,7 @@ class Sandbox {
         this._shared ? 0o664 : 0o644,
       );
     } catch (e) {
-      throw pathRefusal("write", rel, e);
+      throw pathRefusal("write", rel, e, true);
     } finally {
       fs.closeSync(dirFd);
     }
@@ -5021,9 +5414,51 @@ class Sandbox {
     return r.stdout;
   }
 
+  /** Put the owner bits back on any PARENT of `full` the box closed to us, and say whether the descent
+   * then completed. Node has no `openat`, so the read path opens the full path in one call and verifies
+   * the descriptor afterwards: it cannot repair on the way down the way Python's opener does. Running
+   * `_descendDirs` - THE descent, which repairs as it goes - for its side effect is that repair. */
+  _regrantDirPath(dir) {
+    // TAKES THE DIRECTORY, because every caller has one. The first version took a FILE and did
+    // `dirname` itself, so the listing caller had to invent a leaf (`path.join(root, "x")`, a
+    // component that does not exist) to get back the directory it already held - and the
+    // parent-is-the-root case needed a ten-line second body, because `"".split(path.sep)` yields
+    // `[""]` rather than `[]`. Filtering the parts makes the root `[]`, which `_descendDirs` already
+    // handles by returning `baseFd` untouched, and `_wsFd` is the one place that repairs the root.
+    const rel = path.relative(this._ws, dir);
+    if (rel.startsWith("..")) return false;
+    const parts = rel.split(path.sep).filter((p) => p && p !== ".");
+    let baseFd;
+    try {
+      baseFd = this._wsFd();
+    } catch {
+      return false;
+    }
+    try {
+      const fd = this._descendDirs(baseFd, parts);
+      if (fd !== baseFd) closeQuietly(fd);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      closeQuietly(baseFd);
+    }
+  }
+
   /** `readFile` on the host. */
   _readFileHost(rel, full, maxBytes) {
-    this._verifyParentDirs(full); // fast reject + nice error before we open (host-leak guard)
+    // THE PRE-CHECK REFUSES FIRST, and that is why the repair sits here and not only around the open.
+    // `_verifyParentDirs` `lstat`s each parent BY PATH, so a component at mode 0 makes the one BELOW it
+    // unstattable and the refusal arrives as "cannot resolve workspace path component" before any open
+    // happens. Measured: a five-level chain the box had closed failed here while a single closed
+    // directory - where the pre-check still passes and the open is what fails - was repaired. One
+    // repair, one retry, and `_regrantParents` completes only after a mode actually changed.
+    try {
+      this._verifyParentDirs(full); // fast reject + nice error before we open (host-leak guard)
+    } catch (e) {
+      if (!isClosedErr(e.cause ?? e) || !this._regrantDirPath(path.dirname(full))) throw e;
+      this._verifyParentDirs(full);
+    }
     let fd;
     try {
       // O_NONBLOCK: opening a FIFO returns a descriptor instead of WAITING FOR A WRITER. Measured
@@ -5032,7 +5467,16 @@ class Sandbox {
       // a denial of service the workspace hands out for free, and O_NOFOLLOW does not touch it.
       fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     } catch (e) {
-      throw pathRefusal("read", rel, e);
+      // A PARENT OF OURS THE BOX CLOSED: `lstat` on a mode-0 directory succeeds, so
+      // `_verifyParentDirs` lets it through and the refusal lands here, on the open. One repair, one
+      // retry: `_regrantParents` only completes after a mode actually changed.
+      if (!isClosedErr(e) || !this._regrantDirPath(path.dirname(full)))
+        throw pathRefusal("read", rel, e, false);
+      try {
+        fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      } catch (e2) {
+        throw pathRefusal("read", rel, e2, false);
+      }
     }
     try {
       this._assertFdInWorkspace(fd, rel); // race-free backstop: a swapped-in parent symlink is caught here
@@ -5069,7 +5513,20 @@ class Sandbox {
         this._verifyParentDirs(root);
         st = fs.lstatSync(root);
       } catch (e) {
-        if (!(this._shared && isClosedErr(e.cause ?? e))) {
+        // A PARENT OF OURS THE BOX CLOSED: `lstat` of the subdir needs search on every component above
+        // it, so `listFiles("a/b")` refused while `listFiles("a")` was repaired, and the Python
+        // binding repaired both. One repair, one retry, then the pre-existing fallbacks.
+        let back = false;
+        if (isClosedErr(e.cause ?? e) && this._regrantDirPath(root)) {
+          try {
+            this._verifyParentDirs(root);
+            st = fs.lstatSync(root);
+            back = true;
+          } catch {
+            back = false;
+          }
+        }
+        if (!back && !(this._shared && isClosedErr(e.cause ?? e))) {
           if (e instanceof SandboxError) throw e;
           throw new SandboxError(`cannot list ${JSON.stringify(subdir)}`, { cause: e });
         }
@@ -5126,6 +5583,7 @@ class Sandbox {
     // helper's part of it is bounded by the same 1 GiB `restore` refuses past.
     const out = [];
     const blind = this._shared ? [] : null;
+    const regranted = [];
     const skipped = [];
     // The identity of `dest`, which the walk skips, or every checkpoint written into the workspace
     // would carry the one before it.
@@ -5158,7 +5616,8 @@ class Sandbox {
         Math.floor(Date.now() / 1000),
         0o644,
       );
-      tarCollect(root, "", destId, out, blind, skipped);
+      tarCollect(root, "", destId, out, blind, skipped, regranted, this._ws);
+      warnRegranted(regranted);
     } finally {
       fs.closeSync(root);
     }
@@ -5326,7 +5785,16 @@ class Sandbox {
             try {
               fs.mkdirSync(`/proc/self/fd/${parent}/${leaf}`);
             } catch (e) {
-              if (e.code !== "EEXIST") throw e;
+              // A REPAIRED DIRECTORY HAS NO WRITE BIT (0o500 by design), so creating inside one the
+              // box closed is refused - and it was refused as a bare EACCES, where the file members
+              // two branches down have gone through `pathRefusal` all along.
+              if (e.code === "EEXIST") {
+                /* already there, which is what this branch wants */
+              } else if (isClosedErr(e)) {
+                throw pathRefusal("restore", m.name, e, true);
+              } else {
+                throw e;
+              }
             }
             try {
               fs.closeSync(this._descendDirs(parent, [leaf])); // a real directory, not a link swapped in
@@ -5340,7 +5808,7 @@ class Sandbox {
           try {
             fd = fs.openSync(`/proc/self/fd/${parent}/${leaf}`, flags, createMode);
           } catch (e) {
-            throw pathRefusal("restore", m.name, e);
+            throw pathRefusal("restore", m.name, e, true);
           }
           try {
             if (!fs.fstatSync(fd).isFile())
@@ -5456,7 +5924,11 @@ class Sandbox {
     // user can close one to us, and its files would be missing from `files` and `listFiles` with
     // nothing to say so.
     const out = {};
+    // A DENIAL IS NOT GATED ON `user` ANY MORE. It used to be, so every other session let the EACCES
+    // fall through and a box could end a call with one `chmod`. Now the mode is put back when the
+    // directory is ours, and the helper box stays the fallback for the ones that are not.
     const blind = [];
+    const regranted = [];
     const dirFlags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
     const top = path.relative(this._ws, root);
     const rootFd = this._wsFd();
@@ -5483,25 +5955,44 @@ class Sandbox {
           try {
             fd = this._descendDirs(rootFd, top ? top.split(path.sep) : []);
           } catch (e) {
-            if (this._shared && isClosedErr(e.cause ?? e)) blind.push(top);
             // otherwise nothing there to walk, as a walk of a missing root yielded nothing
+            if (!isClosedErr(e.cause ?? e)) continue;
+            // ⛔ AND IT DOES NOT TRY THE REPAIR AGAIN. `_descendDirs` repairs and reopens each
+            // component itself, so a refusal that still arrives here is one the repair already failed
+            // on - not ours, or re-closed inside the window - and retrying would make this the only
+            // site in the file with two attempts where the rule everywhere else is exactly one.
+            blind.push(top);
             continue;
           }
         } else {
           const name = relDir.slice(relDir.lastIndexOf("/") + 1);
+          const at = `/proc/self/fd/${parentFd}/${name}`;
           try {
-            fd = fs.openSync(`/proc/self/fd/${parentFd}/${name}`, dirFlags);
+            fd = fs.openSync(at, dirFlags);
           } catch (e) {
-            if (this._shared && isClosedErr(e)) {
-              blind.push(relDir);
-              continue;
-            }
+            if (isClosedErr(e)) {
+              let got = null;
+              if (regrantOwnDir(at, this._ws)) {
+                regranted.push(relDir);
+                try {
+                  got = fs.openSync(at, dirFlags);
+                } catch {
+                  got = null;
+                }
+              }
+              if (got === null) {
+                blind.push(relDir);
+                continue;
+              }
+              fd = got;
+            } else {
             // GONE IS CHURN, ANYTHING ELSE IS NOT: a workspace a box is writing to loses entries
             // (ENOENT) and has them replaced by non-directories (ENOTDIR for a symlink under
             // O_NOFOLLOW, ELOOP). Running out of descriptors or memory is thrown, because a listing
             // that quietly drops a subtree reports a workspace smaller than it is.
-            if (WALK_GONE.has(e.code)) continue;
-            throw e;
+              if (WALK_GONE.has(e.code)) continue;
+              throw e;
+            }
           }
         }
         let keepOpen = false;
@@ -5510,14 +6001,28 @@ class Sandbox {
           try {
             entries = fs.readdirSync(`/proc/self/fd/${fd}`, { withFileTypes: true });
           } catch (e) {
-            // A directory that OPENED and will not list: on a shared workspace that is the box
-            // user's to read (`tarCollect` already treated it so), and it used to vanish in silence.
-            if (this._shared && isClosedErr(e)) {
-              blind.push(relDir);
+            // A directory that OPENED and will not list: ours to reopen, or the box user's to read
+            // through the helper (`tarCollect` already treated it so).
+            if (isClosedErr(e)) {
+              let back = false;
+              if (regrantOwnDirFd(fd, this._ws)) {
+                regranted.push(relDir);
+                try {
+                  entries = fs.readdirSync(`/proc/self/fd/${fd}`, { withFileTypes: true });
+                  back = true;
+                } catch {
+                  back = false;
+                }
+              }
+              if (!back) {
+                blind.push(relDir);
+                continue;
+              }
+            } else if (WALK_GONE.has(e.code)) {
               continue;
+            } else {
+              throw e;
             }
-            if (WALK_GONE.has(e.code)) continue;
-            throw e;
           }
           const subdirs = [];
           for (const ent of entries) {
@@ -5526,11 +6031,18 @@ class Sandbox {
             try {
               st = fs.lstatSync(`/proc/self/fd/${fd}/${ent.name}`);
             } catch (e) {
-              if (this._shared && isClosedErr(e)) {
+              if (!isClosedErr(e)) continue;
+              if (!regrantOwnDirFd(fd, this._ws)) {
                 blind.push(relDir); // listable, not searchable: ask for it whole
                 break;
               }
-              continue;
+              regranted.push(relDir);
+              try {
+                st = fs.lstatSync(`/proc/self/fd/${fd}/${ent.name}`);
+              } catch {
+                blind.push(relDir);
+                break;
+              }
             }
             if (st.isDirectory()) {
               if (ent.name === DEPS_DIR) continue; // exclude deps from the diff, at any depth
@@ -5561,10 +6073,38 @@ class Sandbox {
       for (const [rel, fd] of stack) if (rel === null && fd !== rootFd) closeQuietly(fd);
       fs.closeSync(rootFd);
     }
+    warnRegranted(regranted);
+    if (blind.length && !this._shared) {
+      // NO HELPER EXISTS FOR THIS SESSION SHAPE, so asking for one spends a box start to get back
+      // "the workspace helper is for a non-root session only" - a sentence that blames the helper for
+      // what is really "the repair did not work here". Said plainly instead. Python does the same.
+      process.emitWarning(
+        `result.files / listFiles may be missing entries: ${JSON.stringify(blind)} is closed to this ` +
+          `process and its owner bits could not be restored (not ours, or no /proc), and a session ` +
+          `without \`user\` has no box account to read it for us`,
+        "KernWorkspaceListing",
+      );
+      return out;
+    }
     if (blind.length) {
       // ONE helper box for every blind subtree. Its mtimes are whole seconds (`stat -c %Y`); a file is
       // always seen through the same path while its directory keeps its mode.
-      const r = await this._wsHelper(HELPER_LIST, blind.map(helperSubtree));
+      //
+      // AND THAT INCLUDES THE HELPER NOT RUNNING AT ALL - no kern binary, an argument list past the
+      // kernel's limit with many blind subtrees, the helper box timing out, `find` missing from the
+      // image. That exception used to come out of the diff and discard the stdout and stderr of a call
+      // that had already run. Python says this in the same words.
+      let r;
+      try {
+        r = await this._wsHelper(HELPER_LIST, blind.map(helperSubtree));
+      } catch (e) {
+        process.emitWarning(
+          `result.files / listFiles may be missing entries: the helper that lists ` +
+            `${JSON.stringify(blind)} did not run (${e && e.message ? e.message : String(e)})`,
+          "KernWorkspaceListing",
+        );
+        return out;
+      }
       if (r.code !== 0)
         // SAID, NOT THROWN: `files` is a report and the call it describes already ran. Mirrors Python.
         process.emitWarning(
@@ -5894,7 +6434,7 @@ function kernelDriver(outCap, resCap, hello = false) {
  * O_NOFOLLOW, so a symlink the BOX planted at a path the host is about to touch fails instead of
  * redirecting. Raw, it reads `ELOOP: too many symbolic links encountered`, which sends a reader looking
  * for a broken link chain when what happened is an attempt to reach a host file. */
-function pathRefusal(verb, rel, e) {
+function pathRefusal(verb, rel, e, writing) {
   const cause = { cause: e };
   if (e && e.code === "ELOOP")
     return new SandboxError(
@@ -5902,6 +6442,46 @@ function pathRefusal(verb, rel, e) {
         "reads and writes never follow one (O_NOFOLLOW), because a link planted inside the workspace is " +
         "how a box reaches a host file it was not given (the kernel reports this as ELOOP). Remove it, " +
         "or name the file you meant",
+      cause,
+    );
+  if (e && e.code === "EACCES")
+    // DECIDED BY A FACT THE CALLER PASSES, word for word as Python's `_path_refusal` does it: a
+    // repaired directory has read and search and NO write, so a refused WRITE is explained by the
+    // repair, and a refused READ is the opposite case - bits that could not be restored at all.
+    //
+    // ⛔ NOT BY PARSING THE VERB. The first version tested `verb === "write" || verb === "restore"`,
+    // and the verb is a string built for DISPLAY: the snapshot path's is `"snapshot to"` - a write,
+    // opened `O_WRONLY|O_CREAT|O_TRUNC` - which matched neither arm, so a refused write got the READ
+    // sentence. A cleanup review found it in both bindings at once, with no test on it.
+    return new SandboxError(
+      writing
+        ? `refusing to ${verb} ${JSON.stringify(rel)}: a directory on that path is readable but NOT ` +
+            "WRITABLE by this process. That is what a repair leaves behind: when code in the box " +
+            "closes a workspace directory with `chmod 0`, kern restores read and search on the ones " +
+            "it owns so the walk can still report, and deliberately NOT write - the alternative is " +
+            "the host silently re-opening for writing a directory the workload shut. So the mode you " +
+            "are looking at (`0o500`) may be kern's and not yours: `chmod u+w` on it from inside the " +
+            "box, or write elsewhere"
+        : `refusing to ${verb} ${JSON.stringify(rel)}: a directory on that path is closed to this ` +
+            "process and its owner bits could not be restored - it is not ours (a `user` session's " +
+            "box account owns it, and only a helper box running as that account can read it), or " +
+            "there is no `/proc` to reach the pinned descriptor through",
+      cause,
+    );
+  if (e && e.code === "ENOTDIR")
+    // THE SAME SENTENCE AS PYTHON'S `_PATH_REFUSALS[ENOTDIR]`, word for word, because a reader who
+    // meets this in one binding and searches for it must find the other. It exists because
+    // `O_DIRECTORY|O_NOFOLLOW` on a symlink answers ENOTDIR, so the raw errno sent a reader looking
+    // for a regular file in the way when the path pointed OUT of the workspace.
+    return new SandboxError(
+      `refusing to ${verb} ${JSON.stringify(rel)}: a component of that path is not a DIRECTORY - and ` +
+        "that includes a SYMLINK where a directory was expected, which reports this same errno on " +
+        "current kernels: the open is O_DIRECTORY|O_NOFOLLOW, and the kernel checks for a directory " +
+        "before it would report the link. So it is either something that is not a directory in the way " +
+        "(a regular file, FIFO, device, socket) or a link planted inside the workspace that the " +
+        "boundary refused to follow. `ls -l` on it says which. (A refusal from a path's INTERMEDIATE " +
+        "component distinguishes the two outright, because the descent there holds the parent " +
+        "descriptor and can look)",
       cause,
     );
   if (e && e.code === "ENXIO")
@@ -6987,6 +7567,7 @@ module.exports = {
   _aclGrantBatches: aclGrantBatches,
   _aclGrantTreeAsync: aclGrantTreeAsync,
   _workspaceUsage: workspaceUsage,
+  _regrantOwnDirFd: regrantOwnDirFd, // for the containment test, like `_workspaceUsage` above
   _HELPER_SCRIPTS: { HELPER_READ, HELPER_WRITE, HELPER_LIST, HELPER_DU, HELPER_ISDIR, HELPER_CLEAN, HELPER_TAR, HELPER_UNTAR },
   _pycDirFor: pycDirFor,
   _pycBuild: pycBuild,
