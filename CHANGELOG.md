@@ -19,6 +19,15 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
+## kern-sandbox 0.2.48 - 2026-10-13
+
+**It carries the kern v0.32.0 binary**, so `--egress-allow` on a sandbox refuses a plain-HTTP head
+whose `Host:` names a host other than the vetted target. No binding code changed since 0.2.47.
+
+The package descriptions did change, because two sentences in them were false: they said the workspace
+cannot be bounded, which 0.2.47 had already stopped being true. They now say the cap is measured while
+a call runs, and what it still is not.
+
 ## v0.32.0 - 2026-10-13
 
 **A request `--egress-allow` used to forward is now refused, which is why this is a minor bump.** With
