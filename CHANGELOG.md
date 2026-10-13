@@ -22,32 +22,12 @@ both halves of that rule, so removing one from the parser fails the build by nam
 ## v0.32.0 - 2026-10-13
 
 **A request `--egress-allow` used to forward is now refused, which is why this is a minor bump.** With
-an allowlist in force, a plain-HTTP request whose `Host:` header names a different host than the
-request-target that was vetted, or that carries more than one `Host:` line, is answered 403 instead of
-being forwarded. If something you run depends on sending one host in the target and another in the
-header, it stops working here, and that is the point: it was the way out of the allowlist over port 80.
+an allowlist in force, a plain-HTTP head whose `Host:` names a host other than the vetted
+request-target, or that carries two of them, is answered 403. It was the way out of an allowlist over
+port 80, and the check runs after the allowlist, so a refusal cannot probe it.
 
-The refusal is checked AFTER the allowlist, so it cannot be used to probe what is on the list. Over
-HTTPS the same trick is still possible on a shared CDN and no release closes it: there the `Host`
-header travels inside TLS, where only an intercepting proxy could read it.
-
-Nothing else in the binary changed since v0.31.0. The sandbox fixes of the same days ship separately,
-in kern-sandbox 0.2.47, which carries the v0.31.0 binary.
-
-**Runtime**
-
-- `--egress-allow` refuses a plain-HTTP head that does not name one host (see above). Over HTTPS the
-  same trick is still possible on a shared CDN, because there the `Host` header is inside TLS and only
-  an intercepting proxy could read it; `docs/EGRESS.md` says so and no longer names an SNI check as a
-  planned hardening, which was measured not to close it.
-
-**Documentation**
-
-- `docs/EGRESS.md`, `docs/THREAT_MODEL.md` and the `--egress-allow` notice describe the shared-CDN hole
-  as what it is: the site is chosen by the HTTP `Host` header inside TLS, so a matching SNI does not
-  help. The page also records that its own example is on a shared CDN: `pypi.org` resolves into Fastly
-  and `files.pythonhosted.org` is a CNAME to it, so an allowlist written for `pip install` has allowed
-  that CDN.
+Over HTTPS the trick still works on a shared CDN, where that header is inside TLS; `docs/EGRESS.md`
+says so. Nothing else in the binary changed since v0.31.0.
 
 ## kern-sandbox 0.2.47 - 2026-10-13
 
