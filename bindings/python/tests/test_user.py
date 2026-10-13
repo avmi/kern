@@ -1122,6 +1122,12 @@ def test_a_cap_is_enforced_DURING_a_call_and_not_only_between_calls(tmp_path):
     returned after those 30 seconds with the bytes on disk and no fault; now the box is stopped at the
     first measurement, the fault NAMES the cap rather than reading as a timeout or an OOM, and the
     result still comes back as a result."""
+    # THIS TEST DRIVES A REAL BOX, so it has to say so. Without this line it did not skip where no kern
+    # can run: it went RED on CI, which has no kern on PATH, while passing on every machine that has
+    # one. The suite's other box-backed tests all carry the same guard, and this one was written
+    # without it because the machine it was written on could always start a box.
+    if _kern_bin() is None:
+        pytest.skip("no runnable kern (set KERN_BIN)")
     with Sandbox(image="python:3.12-alpine", pyc_cache=False, workspace_max_bytes=1 << 20) as s:
         started = time.monotonic()
         r = s.run_code(

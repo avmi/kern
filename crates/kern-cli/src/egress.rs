@@ -21,11 +21,6 @@ use std::os::unix::io::FromRawFd; // for File::from_raw_fd (the pid-delivery pip
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt; // for Command::pre_exec
 
-/// Is `host` covered by the allowlist? A match is an EXACT equal to an entry, or a subdomain of one
-/// (`host` ends with `.<entry>`). Case-insensitive; a trailing dot is ignored. This is the whole
-/// security decision, so it is deliberately strict:
-///  * `pypi.org` matches `pypi.org` and `files.pypi.org`, NOT `evilpypi.org` or `pypi.org.evil.com`.
-///  * an IP literal never matches a domain entry (no entry contains a bare IP unless you list it).
 /// "The same host", spelled ONCE. The root label's trailing dot is not part of the name and the
 /// comparison is case-insensitive, so `PyPI.ORG.` and `pypi.org` are one host - and every decision in
 /// this file that asks "is this that host?" has to agree about it. `None` for a name that normalises
@@ -40,9 +35,18 @@ use std::os::unix::process::CommandExt; // for Command::pre_exec
 /// direction for a control, so the two cannot be allowed to drift apart by construction.
 fn normalized_host(host: &str) -> Option<String> {
     let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if h.is_empty() { None } else { Some(h) }
+    if h.is_empty() {
+        None
+    } else {
+        Some(h)
+    }
 }
 
+/// Is `host` covered by the allowlist? A match is an EXACT equal to an entry, or a subdomain of one
+/// (`host` ends with `.<entry>`). Case-insensitive; a trailing dot is ignored. This is the whole
+/// security decision, so it is deliberately strict:
+///  * `pypi.org` matches `pypi.org` and `files.pypi.org`, NOT `evilpypi.org` or `pypi.org.evil.com`.
+///  * an IP literal never matches a domain entry (no entry contains a bare IP unless you list it).
 pub fn host_allowed(host: &str, allow: &[String]) -> bool {
     let Some(h) = normalized_host(host) else {
         return false;
@@ -132,7 +136,9 @@ pub fn parse_http_host(request_line: &str, headers: &str) -> Option<String> {
         }
     }
     // fall back to the Host header, through the one function that recognises it
-    host_header_values(headers).next().and_then(host_of_authority)
+    host_header_values(headers)
+        .next()
+        .and_then(host_of_authority)
 }
 
 /// Every `Host:` field value in a head, in order, borrowed from it.
@@ -1012,15 +1018,36 @@ mod tests {
             "\r\nHost: www.python.org\r\nAccept: */*\r\n\r\n"
         ));
         // Agreement, in every spelling of the same host.
-        assert!(http_head_names_one_host("pypi.org", "\r\nHost: pypi.org\r\n\r\n"));
-        assert!(http_head_names_one_host("pypi.org", "\r\nHost: PyPI.ORG\r\n\r\n")); // case
-        assert!(http_head_names_one_host("pypi.org", "\r\nHost: pypi.org.\r\n\r\n")); // trailing dot
-        assert!(http_head_names_one_host("pypi.org", "\r\nHost: pypi.org:80\r\n\r\n")); // port
-        assert!(http_head_names_one_host("pypi.org", "\r\nhost: pypi.org\r\n\r\n")); // header case
-        assert!(http_head_names_one_host("pypi.org", "\r\nHost:   pypi.org  \r\n\r\n")); // padding
-        // NO `Host:` AT ALL is consistent: HTTP/1.0 without one is legal, the target was vetted, and
-        // there is nothing that could disagree with it.
-        assert!(http_head_names_one_host("pypi.org", "\r\nAccept: */*\r\n\r\n"));
+        assert!(http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost: pypi.org\r\n\r\n"
+        ));
+        assert!(http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost: PyPI.ORG\r\n\r\n"
+        )); // case
+        assert!(http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost: pypi.org.\r\n\r\n"
+        )); // trailing dot
+        assert!(http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost: pypi.org:80\r\n\r\n"
+        )); // port
+        assert!(http_head_names_one_host(
+            "pypi.org",
+            "\r\nhost: pypi.org\r\n\r\n"
+        )); // header case
+        assert!(http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost:   pypi.org  \r\n\r\n"
+        )); // padding
+            // NO `Host:` AT ALL is consistent: HTTP/1.0 without one is legal, the target was vetted, and
+            // there is nothing that could disagree with it.
+        assert!(http_head_names_one_host(
+            "pypi.org",
+            "\r\nAccept: */*\r\n\r\n"
+        ));
         assert!(http_head_names_one_host("pypi.org", ""));
         // TWO `Host:` LINES are refused whatever they say, including when they agree: RFC 9112 makes
         // such a message invalid, and the reason is that we vet one and an upstream may honour another.
@@ -1043,7 +1070,10 @@ mod tests {
             "\r\nHost: pypi.org@evil.com\r\n\r\n"
         ));
         // A `Host:` that does not parse to a host at all (empty authority) is not agreement.
-        assert!(!http_head_names_one_host("pypi.org", "\r\nHost:   \r\n\r\n"));
+        assert!(!http_head_names_one_host(
+            "pypi.org",
+            "\r\nHost:   \r\n\r\n"
+        ));
     }
 
     /// WHAT IS NOT THE `Host:` HEADER, asserted through the function that decides rather than through
@@ -1051,7 +1081,10 @@ mod tests {
     /// a head carrying only those has nothing that could disagree with the vetted target.
     #[test]
     fn a_header_that_is_not_the_host_field_does_not_count_as_one() {
-        assert!(http_head_names_one_host("pypi.org", "\r\nX-Forwarded-Host: evil.com\r\n\r\n"));
+        assert!(http_head_names_one_host(
+            "pypi.org",
+            "\r\nX-Forwarded-Host: evil.com\r\n\r\n"
+        ));
         assert!(http_head_names_one_host("pypi.org", "\r\nHost\r\n\r\n"));
         // And the one that IS the header still decides, next to them.
         assert!(!http_head_names_one_host(
