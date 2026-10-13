@@ -218,8 +218,9 @@ new Sandbox({
   image,           // default "python:3.12-slim"
   setup,           // one-time, network-on, e.g. "pip install pandas"
   workspace,       // host dir to persist; omit for a temp dir deleted on close()
-  workspaceMaxBytes, // default null; caps what the workspace ACCUMULATES across calls. Cooperative:
-                   // the call that exceeds it runs, the next is refused
+  workspaceMaxBytes, // default null; measured WHILE a call runs, so the call that crosses it is
+                   // stopped with a `workspace_full` fault. Cooperative: a measurement and a kill,
+                   // not a refusal from the filesystem
   persist,         // default false; true = ONE resident box per name, every call `kern exec`s into it.
                    // Keeps the box, not the interpreter. Needs name + workspace; survives close(),
                    // destroy() stops it
