@@ -11,6 +11,10 @@ blockchain via [OpenTimestamps](https://opentimestamps.org). One release, one pa
 Together they let anyone prove the release existed at a given time, with no trust in this repo, in
 GitHub, or in the author.
 
+Records from before the 2026-10-13 timestamp rewrite sit beside the live ones as
+`<tag>.provenance.pre-rewrite.txt` and its `.ots`; [PRE-REWRITE.md](PRE-REWRITE.md) says what they
+are and why they were kept.
+
 > **A record for every release you can still download.** One pair of files per published release,
 > including the one `releases/latest` serves, so what is here is what you can verify end to end
 > against the binary the install line gives you. This said the opposite of the truth once, in the
