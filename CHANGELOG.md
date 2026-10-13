@@ -19,12 +19,20 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
-## Unreleased
+## v0.32.0 - 2026-10-13
 
-**One thing a caller can notice, so it leads.** `--egress-allow` now refuses a plain-HTTP request whose
-`Host:` header names a different host than the request-target it vetted, or that carries more than one
-`Host:` line: those used to be forwarded. It reaches users in the next kern release; the sandbox changes
-dated below it are already published as kern-sandbox 0.2.47.
+**A request `--egress-allow` used to forward is now refused, which is why this is a minor bump.** With
+an allowlist in force, a plain-HTTP request whose `Host:` header names a different host than the
+request-target that was vetted, or that carries more than one `Host:` line, is answered 403 instead of
+being forwarded. If something you run depends on sending one host in the target and another in the
+header, it stops working here, and that is the point: it was the way out of the allowlist over port 80.
+
+The refusal is checked AFTER the allowlist, so it cannot be used to probe what is on the list. Over
+HTTPS the same trick is still possible on a shared CDN and no release closes it: there the `Host`
+header travels inside TLS, where only an intercepting proxy could read it.
+
+Nothing else in the binary changed since v0.31.0. The sandbox fixes of the same days ship separately,
+in kern-sandbox 0.2.47, which carries the v0.31.0 binary.
 
 **Runtime**
 
@@ -40,6 +48,7 @@ dated below it are already published as kern-sandbox 0.2.47.
   help. The page also records that its own example is on a shared CDN: `pypi.org` resolves into Fastly
   and `files.pythonhosted.org` is a CNAME to it, so an allowlist written for `pip install` has allowed
   that CDN.
+
 ## kern-sandbox 0.2.47 - 2026-10-13
 
 **A call that filled the workspace used to succeed anyway.** `workspace_max_bytes` was only checked
