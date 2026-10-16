@@ -70,10 +70,15 @@ impl R {
 /// Read-only, as this module promises: the branch is decided from `/proc/self/cgroup`, not by calling
 /// `direct_caps_available()`, which would CREATE the slice as a side effect.
 fn check_scope_toll() -> R {
-    let uid = unsafe { libc::getuid() };
-    let mine = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     // Inside `user@<uid>.service` = inside the user manager's tree = kern caps directly, no toll.
-    if mine.contains(&format!("/user@{uid}.service/")) {
+    //
+    // THE SHARED PREDICATE, not a second copy of it. This read the file and did the `contains` here,
+    // while `kern exec` decides whether it can join a box from the same fact: two places computing
+    // one derived condition is this repository's recurring defect, and the consequence here would be
+    // a doctor row that says one thing about a host while `exec` acts on another. It is still
+    // read-only, which is what this function's doc promises: one `read` of `/proc/self/cgroup`, and
+    // never `direct_caps_available()`, which would CREATE the slice as a side effect.
+    if kern_isolation::inside_user_manager_tree() {
         return R::ok("caps go direct into kern.slice: no per-box systemd round trip".into());
     }
     if !kern_isolation::user_systemd_present() {
@@ -158,11 +163,18 @@ fn check_scope_toll() -> R {
         // The boards say nothing to someone on WSL, the figure ages and cannot carry its method,
         // and the slice is an implementation detail the reader does not act on. 640 characters to
         // about 350, with all three facts still in it.
+        // UPDATED WHEN `kern exec` STOPPED REFUSING HERE. This row said "on this host `kern exec`
+        // also refuses with 126", which was true for as long as the verb was lost on this host
+        // class and is false now that it pays a transient scope of its own. A doctor row that
+        // describes a refusal the reader will not get is worse than no row: it sends them to
+        // `KERN_ALLOW_UNCAPPED` to buy their way out of a problem they do not have, and that
+        // variable drops the caps.
         "every box pays an extra startup cost here. Pay it once instead: \
          `systemd-run --user --scope bash`, then run kern in that shell. Caps are enforced either \
-         way. On this host `kern exec` also refuses with 126 unless KERN_ALLOW_UNCAPPED=1 says the \
-         uncapped command is intended (namespaces, seccomp and AppArmor still apply), and a \
-         `--health-cmd` probe is never refused but runs outside the box's caps."
+         way, and `kern exec` takes such a scope itself, one per command, so it works here rather \
+         than refusing - the shell above removes that per-command cost too. KERN_ALLOW_UNCAPPED=1 \
+         runs it uncapped instead, and a `--health-cmd` probe is never refused but runs outside \
+         the box's caps."
             .into(),
     )
 }

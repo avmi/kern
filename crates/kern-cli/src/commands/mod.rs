@@ -2469,6 +2469,37 @@ struct ScopeReexec<'a> {
     allow_uncapped: bool,
 }
 
+/// Should `kern exec` replace itself with a copy running inside a transient user scope?
+///
+/// A PURE DECISION OVER FOUR FACTS, separated from the world so it can be tested on a host that does
+/// not have the shape it is about. Every machine that runs this suite is INSIDE the user manager's
+/// tree, which is the branch where nothing happens, so the branch that matters would otherwise be
+/// asserted by nobody.
+///
+/// * `inside_user_tree` - the only fact that makes an exec impossible rather than merely slower. A
+///   box's cgroup lives under the user's delegated tree; from outside `user@<uid>.service` the common
+///   ancestor of this process and that cgroup is the ROOT, and cgroup v2 delegation containment needs
+///   write access THERE to move a process across. No implementation can grant itself that.
+/// * `manager_present` - a scope has to be created by someone, and that someone is the user manager.
+///   Without one there is no way in, and the refusal stands.
+/// * `already_scoped` - the recursion guard. The scope kern creates re-runs this same argv.
+/// * `scope_opted_out` - `KERN_NO_SCOPE`, which already means "skip the systemd round trip" for
+///   `kern box` and `kern run`; it means the same thing here, with the same consequence stated.
+fn exec_wants_scope(
+    inside_user_tree: bool,
+    already_scoped: bool,
+    scope_opted_out: bool,
+    manager_present: impl FnOnce() -> bool,
+) -> bool {
+    // ⛔ THE ORDER IS THE COST, and the manager probe is LAST because it is the only one that is not
+    // free. The first two read an environment variable, the third reads one procfs file, and the
+    // fourth opens a socket to the user manager. Passed as a value, that probe would run on EVERY
+    // `kern exec` on EVERY host - including the overwhelming majority, which are inside the tree and
+    // will not take a scope whatever it answers. A closure costs nothing when it is not called, and
+    // `manager_live_from` in the isolation crate already takes its expensive halves this way.
+    !already_scoped && !scope_opted_out && !inside_user_tree && manager_present()
+}
+
 /// The ceiling the per-box SCOPE gets, in bytes: the box's own `--memory` (or the default) plus kern's
 /// supervisor headroom.
 ///

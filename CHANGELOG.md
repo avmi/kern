@@ -21,6 +21,28 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**`kern exec` works on hosts where it used to refuse outright.** With an allowlist of host shapes
+that is not exotic at all - a shell in `/init.scope`, which is how WSL starts every terminal, and an
+ordinary `ssh` session on Ubuntu 24.04, Fedora 44, Debian 13 and Rocky 10.2 - kern runs outside the
+cgroup tree it delegates, and a process there cannot be moved into a box's cgroup: cgroup v2
+delegation containment needs write access to the common ancestor, which is the root. `kern exec` and
+`kern compose exec` therefore refused with 126, on hosts where the box itself was up and correctly
+capped. The refusal told the reader to re-enter with `systemd-run --user --scope bash` and run kern
+in that shell, which works; kern now does that itself, once per command, when a user manager exists
+to create the scope. The command keeps the box's caps, not the scope's: measured against a box capped
+at 128 MiB, the exec reads `memory.max = 134217728` through the scope exactly as it does without one,
+and the command's exit status is preserved.
+
+The scope carries no resource properties of its own and is named `kern-exec-<pid>.scope`, which is
+deliberately not the `kern-box-` prefix that marks a cgroup kern may reap. Where no user manager
+exists there is nobody to create a scope and the refusal stands, saying so; `KERN_NO_SCOPE` skips it
+as it already does for `kern box` and `kern run`. Hosts inside the user manager's tree, which is every
+ordinary desktop, pay nothing: measured over 20 alternating pairs, the difference is -0.03 ms with a
+95% interval of [-0.06, +0.03] ms against an A/A floor of ±0.33 ms.
+
+`kern doctor`'s scope-toll row said `kern exec` refuses on such a host. It no longer does, so the row
+no longer says it.
+
 **A build could reuse a layer that had been half-deleted, and say `built`.** `kern gc` reclaims build
 layers no image references, and it did that with `remove_dir_all`, which stops at the first directory
 it has no write permission on: a layer carrying a subuid-owned file, or any read-only directory, was

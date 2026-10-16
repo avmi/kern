@@ -946,6 +946,31 @@ fn manager_live_from(
     private_live || (bus_live() && manager_runs())
 }
 
+/// Is THIS process inside the user manager's own tree (`user@<uid>.service`)?
+///
+/// WHY IT DECIDES WHETHER AN EXEC CAN JOIN A BOX. cgroup v2 delegation containment lets an
+/// unprivileged process move another into a cgroup only with write access to the `cgroup.procs` of
+/// the COMMON ANCESTOR of the source and the destination. A box lives under the user's delegated
+/// tree, so from inside `user@<uid>.service` that ancestor is in the delegated tree and is ours to
+/// write; from OUTSIDE it the ancestor is the ROOT cgroup, which is not, and the move is EPERM
+/// whatever kern does. The two host shapes that land outside it are not exotic: a shell in
+/// `/init.scope`, which is how WSL starts every terminal, and an ordinary `ssh` session, which is
+/// outside the user manager on Ubuntu 24.04, Fedora 44, Debian 13 and Rocky 10.2 alike.
+///
+/// ONE SPELLING, because this is a DERIVED CONDITION and this repository's recurring defect is
+/// computing one of those in two places. `kern doctor` read the same file with the same `contains`
+/// and reported the same fact for its scope-toll row; it calls this now, so a sentence in the doctor
+/// and a decision in `kern exec` cannot come to disagree about the same host.
+///
+/// Read-only and allocation-light: one `read` of one procfs file, no bus round-trip. An unreadable
+/// `/proc/self/cgroup` answers `false`, which routes the caller to the cautious branch (take the
+/// scope) rather than to the one that assumes a permission it may not have.
+pub fn inside_user_manager_tree() -> bool {
+    let uid = unsafe { libc::getuid() };
+    fs::read_to_string("/proc/self/cgroup")
+        .is_ok_and(|s| s.contains(&format!("/user@{uid}.service/")))
+}
+
 /// Is `systemd --user` RUNNING for this uid, read from the cgroup systemd puts it in
 /// (`user@<uid>.service/init.scope`)? One read of one file, no bus round-trip, and it answers the
 /// half of [`manager_live_under`] that a bare session bus cannot.
@@ -6602,6 +6627,19 @@ mod tests {
             Some(PathBuf::from(
                 "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/kern-box-1815.scope"
             ))
+        );
+        // THE SCOPE `kern exec` ASKS FOR IS NOT A BOX, and the name is what keeps it that way. On a
+        // host outside the user manager's tree an exec cannot be placed in the box's cgroup at all,
+        // so kern re-runs itself inside a transient `kern-exec-<pid>.scope` first. That scope holds
+        // the exec'd command, never a box, and it must fail this gate for the same reason an ambient
+        // one must: a leaf kern records is a leaf a later reap may `cgroup.kill`, and killing an
+        // exec's scope would take down a command the box is still serving. The `kern-box-` prefix is
+        // the proof of ownership, and `kern-exec-` deliberately is not it.
+        assert_eq!(
+            parse_box_cgroup_line(
+                "0::/user.slice/user-1000.slice/user@1000.service/kern-exec-4242.scope\n"
+            ),
+            None
         );
         // An AMBIENT scope kern did not create stays unrecorded, whatever it holds. This is the case
         // `kern doctor` tells users to create (`systemd-run --user --scope bash`): recording it would

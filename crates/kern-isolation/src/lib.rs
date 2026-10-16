@@ -178,6 +178,9 @@ pub use cgroup::oom_kill_count;
 /// `oom_kill` read from a directory already resolved. See [`cgroup::oom_kill_count_at`].
 pub use cgroup::oom_kill_count_at;
 
+/// Is the systemd manager kern would use present? (root → the system manager `/run/systemd/system`,
+/// else a per-user `systemd` dir under `$XDG_RUNTIME_DIR`). See [`cgroup::user_systemd_present`].
+pub use cgroup::inside_user_manager_tree;
 /// The cgroup directory whose `oom_kill` counter covers the box a pid runs in, resolved while that
 /// pid is alive. See [`cgroup::oom_kill_dir_for_pid`].
 pub use cgroup::oom_kill_dir_for_pid;
@@ -201,8 +204,6 @@ pub use cgroup::sweep_orphans_off_hot_path;
 pub use cgroup::systemd_scope_mode;
 /// The capped cgroup this process created for its box. See [`cgroup::this_box_cgroup_dir`].
 pub use cgroup::this_box_cgroup_dir;
-/// Is the systemd manager kern would use present? (root → the system manager `/run/systemd/system`,
-/// else a per-user `systemd` dir under `$XDG_RUNTIME_DIR`). See [`cgroup::user_systemd_present`].
 pub use cgroup::user_systemd_present;
 pub use cgroup::warn_unenforced_caps;
 /// The RAII handle on a capped cgroup leaf: it names the directory the workload must run in and

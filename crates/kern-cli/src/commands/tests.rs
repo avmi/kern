@@ -7770,3 +7770,162 @@ mod layer_sweep_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod exec_scope_decision_tests {
+    use crate::commands::*;
+
+    /// THE BRANCH NO DEVELOPER MACHINE EXERCISES, which is why it is a pure function and why this
+    /// test exists at all.
+    ///
+    /// `kern exec` refused outright on every host that runs kern outside the cgroup tree it
+    /// delegates: a shell in `/init.scope`, which is how WSL starts every terminal, and an ordinary
+    /// `ssh` session on Ubuntu 24.04, Fedora 44, Debian 13 and Rocky 10.2. A desktop session is
+    /// INSIDE that tree, so the interesting half of this decision is the half that never runs where
+    /// the suite runs, and a test that only drove the real predicate would assert the no-op.
+    #[test]
+    fn the_scope_is_taken_only_where_an_exec_is_otherwise_impossible() {
+        // Outside the tree, a manager to ask, not already scoped, not opted out: the one case.
+        assert!(
+            exec_wants_scope(false, false, false, || true),
+            "outside the user manager's tree an exec cannot be placed at all, and a transient \
+             scope is the only way in"
+        );
+
+        // INSIDE the tree nothing is wrong, so nothing is paid - whatever the other three say. This
+        // is every ordinary desktop, and it is the case that must stay free.
+        for manager in [false, true] {
+            for scoped in [false, true] {
+                for opted_out in [false, true] {
+                    assert!(
+                        !exec_wants_scope(true, scoped, opted_out, || manager),
+                        "inside the tree the placement already works: no scope, no systemd round \
+                         trip (manager={manager}, scoped={scoped}, opted_out={opted_out})"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            !exec_wants_scope(false, false, false, || false),
+            "with no user manager there is nobody to create a scope, so the refusal stands and the \
+             message must say so rather than suggesting a shell that cannot be made"
+        );
+        assert!(
+            !exec_wants_scope(false, true, false, || true),
+            "already inside kern's own scope: taking another would recurse forever"
+        );
+        assert!(
+            !exec_wants_scope(false, false, true, || true),
+            "KERN_NO_SCOPE means skip the systemd round trip, the same as it does for box and run"
+        );
+    }
+
+    /// THE EXPENSIVE FACT IS NOT ASKED WHEN THE CHEAP ONES ALREADY DECIDE, and that is a cost
+    /// contract rather than a style note. Three of the four inputs are an environment read or one
+    /// procfs read; the fourth opens a socket to the user manager. Evaluated eagerly it would run on
+    /// every `kern exec` on every host, including the overwhelming majority that are inside the tree
+    /// and will not take a scope whatever it answers.
+    #[test]
+    fn the_manager_probe_is_not_run_when_the_cheap_facts_settle_it() {
+        use std::cell::Cell;
+        let asked = Cell::new(0u32);
+        let probe = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        assert!(!exec_wants_scope(true, false, false, probe));
+        assert_eq!(
+            asked.get(),
+            0,
+            "inside the tree the answer is already known: the manager must not be probed"
+        );
+
+        let asked = Cell::new(0u32);
+        let probe = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        assert!(!exec_wants_scope(false, true, false, probe));
+        assert_eq!(asked.get(), 0, "already scoped: no probe either");
+
+        let asked = Cell::new(0u32);
+        let probe = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        assert!(exec_wants_scope(false, false, false, probe));
+        assert_eq!(
+            asked.get(),
+            1,
+            "and where it IS the deciding fact it must be asked, exactly once"
+        );
+    }
+
+    /// THE NAME IS THE SAFETY PROPERTY, so it is pinned where it is written.
+    ///
+    /// `is_kern_box_leaf` accepts a leaf iff it starts with `kern-box-`, and a leaf kern accepts is
+    /// one a later reap may `cgroup.kill`. The transient scope `kern exec` asks for holds the exec'd
+    /// command, never a box: naming it `kern-box-…` would hand a reap the right to kill a command
+    /// the box is still serving. The isolation crate pins the PARSER's answer for this name; this
+    /// pins that the name kern actually asks systemd for is that one, which a rename would otherwise
+    /// change while both halves kept passing.
+    #[test]
+    fn the_exec_scope_unit_is_not_named_like_a_box() {
+        let src = std::fs::read_to_string("src/commands/start.rs")
+            .or_else(|_| std::fs::read_to_string("crates/kern-cli/src/commands/start.rs"))
+            .expect("the start source sits next to this test");
+        let anchor = "--unit=kern-exec-";
+        assert!(
+            src.contains(anchor),
+            "the exec scope must be named `kern-exec-<pid>.scope`: anything starting with \
+             `kern-box-` is a leaf a reap may kill"
+        );
+        assert!(
+            !src.contains("--unit=kern-box-exec"),
+            "a `kern-box-` prefix on the exec scope would make it reapable as a box"
+        );
+    }
+
+    /// ONE SPELLING OF A DERIVED CONDITION, pinned at the source.
+    ///
+    /// "Am I inside `user@<uid>.service`?" decides a doctor ROW and an exec DECISION. Two places
+    /// computing one derived condition is this repository's recurring defect, and here the two
+    /// outputs are read together: a row saying the host caps directly while `exec` acts as though it
+    /// cannot would be a contradiction a reader has no way to resolve. The doctor called
+    /// `inside_user_manager_tree` when this was written; if a later edit inlines the read again,
+    /// this fails rather than letting the two drift.
+    #[test]
+    fn the_user_slice_question_is_asked_in_one_place() {
+        let doctor = std::fs::read_to_string("src/doctor.rs")
+            .or_else(|_| std::fs::read_to_string("crates/kern-cli/src/doctor.rs"))
+            .expect("the doctor source sits next to this test");
+        assert!(
+            doctor.contains("inside_user_manager_tree()"),
+            "the doctor must ASK the shared predicate rather than carry its own copy"
+        );
+        for line in doctor.lines() {
+            assert!(
+                !(line.contains("/proc/self/cgroup") && line.contains("user@")),
+                "the doctor is computing the user-slice condition itself again: {line}"
+            );
+        }
+    }
+
+    /// The real predicate must agree with what this very process can read, which is the only
+    /// statement about it that holds on every host this runs on. On a desktop both are true; in a
+    /// container or a session outside the manager both are false. What is asserted is the AGREEMENT,
+    /// never a particular answer, because a test that demanded `true` would fail on exactly the
+    /// hosts the change is for.
+    #[test]
+    fn the_predicate_answers_what_this_process_cgroup_says() {
+        let uid = unsafe { libc::getuid() };
+        let raw = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let expected = raw.contains(&format!("/user@{uid}.service/"));
+        assert_eq!(
+            kern_isolation::inside_user_manager_tree(),
+            expected,
+            "the predicate and this process's own cgroup line must not disagree: {raw:?}"
+        );
+    }
+}

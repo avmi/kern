@@ -6969,10 +6969,20 @@ impl Drop for RefusalWatch {
 /// CAUSE TWO, the host layout forbids the migration: cgroup v2 delegation containment needs write
 /// access to the `cgroup.procs` of the COMMON ANCESTOR of the source and destination, and from a
 /// shell in `/init.scope` that ancestor is the root cgroup. MEASURED on WSL2 with `systemd=true` by
-/// an outside independent test: `kern exec` refused every single time, on a host where nothing was wrong
-/// with the box. No implementation fixes that one. A process in `/init.scope` cannot reach the
-/// user's delegated tree, and it cannot move itself there either, because that migration needs the
-/// same permission on the same root.
+/// an outside independent test: `kern exec` refused every single time, on a host where nothing was
+/// wrong with the box. An ordinary `ssh` session is outside that tree on Ubuntu 24.04, Fedora 44,
+/// Debian 13 and Rocky 10.2 alike, so this is not an exotic shape.
+///
+/// ⛔ THIS PARAGRAPH USED TO END "No implementation fixes that one", AND THAT WAS A NON SEQUITUR.
+/// What is true is the half before it: a process outside the delegated tree cannot MOVE ITSELF into
+/// it, because that migration needs the same permission on the same root. What does not follow is
+/// that no implementation can get there - it does not have to move an existing process, it can be
+/// BORN inside the tree by asking the user manager for a transient scope. `kern box` had been doing
+/// exactly that for every box it starts, in this same codebase, and the refusal printed below told
+/// the reader to do it by hand with `systemd-run --user --scope bash`. `kern exec` now does it
+/// itself, once, before it forks, when a user manager exists to do it with. What remains genuinely
+/// unreachable is a host with no user manager at all: there is nobody to create the scope, and the
+/// refusal is then the honest answer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Unplaceable {
     /// Refuse with 126 and say why. The default for `kern exec`, because a command that steps around
@@ -7390,7 +7400,7 @@ pub fn exec_in_box(
                     // `KERN_ALLOW_UNCAPPED=1` (drop the caps) or a pointer to another command. The
                     // fix that costs nothing and keeps the caps enforced is one line, so it goes
                     // where the refusal is read.
-                    const MSG: &[u8] = b"kern: exec: refusing: the command could not be placed in the box's cgroup, so it would run outside its --memory/--pids caps. Either the box is at its --pids-limit, or this host runs kern outside the cgroup tree it delegates and no exec can join a box here - an ordinary ssh session is outside it on most distributions. Re-enter once with `systemd-run --user --scope bash` and run kern in that shell: caps stay enforced and exec works. `kern doctor` reports which cap path this host takes, and KERN_ALLOW_UNCAPPED=1 runs the command uncapped instead.\n";
+                    const MSG: &[u8] = b"kern: exec: refusing: the command could not be placed in the box's cgroup, so it would run outside its --memory/--pids caps. Either the box is at its --pids-limit, or this host runs kern outside the cgroup tree it delegates and nothing could put this exec inside it: kern re-runs itself in a transient `systemd --user` scope when there is a user manager to create one, so reaching this means there is none here, or KERN_NO_SCOPE is set. `kern doctor` reports which cap path this host takes, and KERN_ALLOW_UNCAPPED=1 runs the command uncapped instead.\n";
                     unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
                     exec_child_says_refused();
                     unsafe { libc::_exit(126) };
