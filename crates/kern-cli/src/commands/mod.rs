@@ -3415,18 +3415,26 @@ pub(crate) fn image_entries_in(
 /// tagged image is kept; only dangling layers are freed. Invoked from the `kern top` Images tab (`p`);
 /// the CLI equivalent is `kern gc` (which also prunes dead-box sidecars).
 pub(crate) fn image_prune() -> Result<(), Error> {
-    let (n, freed) = sweep_orphan_layers(&cache_dir());
+    let swept = sweep_orphan_layers(&cache_dir());
     let p = crate::ui::Palette::detect();
-    if n == 0 {
+    if swept.removed == 0 {
         println!("{}nothing to prune - no orphaned layers{}", p.d, p.z);
     } else {
         println!(
-            "{}pruned{} {n} orphaned layer{}, freed {}",
+            "{}pruned{} {} orphaned layer{}, freed {}",
             p.g,
             p.z,
-            if n == 1 { "" } else { "s" },
-            human_bytes(freed)
+            swept.removed,
+            if swept.removed == 1 { "" } else { "s" },
+            human_bytes(swept.freed)
         );
+    }
+    // The same sentence `gc` prints, for the same reason: a layer the sweep could not remove is
+    // bytes nobody will reclaim, and saying nothing about it is how it stays unfound. This path is
+    // reached from the `kern top` Images tab, where "nothing to prune" over a cache that did not
+    // shrink is exactly the report a reader cannot argue with and should not have to.
+    if let Some(note) = swept.stuck_note("layer") {
+        eprintln!("{note}");
     }
     Ok(())
 }

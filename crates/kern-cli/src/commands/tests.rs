@@ -7500,3 +7500,273 @@ fn a_mount_carries_a_source_a_dash_v_cannot_express_and_the_refusal_says_which()
         "a real typo must still read as a typo: {opt}"
     );
 }
+
+#[cfg(test)]
+mod layer_sweep_tests {
+    use crate::commands::*;
+
+    /// A cache holding ONE orphaned build layer: `L/<key>/` with a payload file, its `<key>.ok`
+    /// sentinel, and no `.layers` manifest naming it. The key is a valid `<32hex>`, which is the only
+    /// shape the sweep will touch.
+    fn orphaned_layer(tag: &str, payload: usize) -> (std::path::PathBuf, String) {
+        let cache = std::env::temp_dir().join(format!("kern-sweep-{tag}-{}", std::process::id()));
+        let _ = remove_tree_forced(&cache);
+        let key = String::from("0123456789abcdef0123456789abcdef");
+        let dir = cache.join("L").join(&key);
+        std::fs::create_dir_all(&dir).expect("mkdir layer");
+        std::fs::write(dir.join("payload"), vec![0u8; payload]).expect("write payload");
+        std::fs::write(cache.join("L").join(format!("{key}.ok")), b"").expect("write sentinel");
+        (cache, key)
+    }
+
+    /// THE DEFECT, in the state an outside report measured it in against v0.32.0.
+    ///
+    /// A build layer can hold a directory with no owner write bit: `dr-xr-xr-x` is ordinary in
+    /// Fedora-based images, and a layer built around a non-root user leaves worse. Unlinking a child
+    /// needs write ON ITS PARENT, so `std::fs::remove_dir_all` stops at the first such directory,
+    /// removes everything it reached on the way, and returns an error. The sweep's old shape was
+    /// `if remove_dir_all(..).is_ok() { count += 1 }` with no other arm, so that layer was left on
+    /// disk, uncounted and unnamed, while its `<key>.ok` sentinel could survive the same pass - and
+    /// `layer_cached` reads sentinel-plus-directory as a HIT. The next build then treated a
+    /// half-emptied layer as complete: measured from outside, a layer from `RUN useradd -m -u 10001
+    /// app` kept `home/app` and `sys/` while `etc/passwd` was gone, `compose build` printed `built`,
+    /// and the box died with "user 'app' has no account in the image's /etc/passwd".
+    ///
+    /// The control is armed deliberately and it doubles as the fixture: the failed `remove_dir_all`
+    /// IS the partial removal, so the sweep below runs against the exact state that was reported.
+    #[test]
+    fn the_sweep_reclaims_a_layer_a_plain_remove_dir_all_cannot() {
+        use std::os::unix::fs::PermissionsExt;
+        let (cache, key) = orphaned_layer("ro", 4096);
+        let lc = cache.join("L");
+        let dir = lc.join(&key);
+        let ro = dir.join("proc");
+        std::fs::create_dir_all(&ro).expect("mkdir ro");
+        std::fs::write(ro.join("kmsg"), b"x").expect("write kmsg");
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+
+        if crate::commands::tests::permission_bits_block_unlink() {
+            assert!(
+                std::fs::remove_dir_all(&dir).is_err(),
+                "remove_dir_all unexpectedly succeeded - the fixture no longer reproduces the bug"
+            );
+            assert!(
+                dir.is_dir(),
+                "the partial layer must still be a directory - that is what makes the hit false"
+            );
+            assert!(
+                layer_cached(&lc, &key),
+                "and before the sweep it still reads as a cache HIT, which is the defect itself"
+            );
+        } else {
+            // Said out loud rather than skipped silently: as root `CAP_DAC_OVERRIDE` walks straight
+            // through a 0o555 directory, so the control cannot be armed. The sweep is still asserted.
+            eprintln!(
+                "SKIP(partial): running as root, so a 0o555 directory does not block the unlink and \
+                 the positive control cannot be armed; the sweep below is still asserted"
+            );
+        }
+
+        let swept = sweep_orphan_layers_charged(&cache, None);
+        assert_eq!(swept.removed, 1, "the orphaned layer must be reclaimed");
+        assert!(
+            swept.freed > 0,
+            "and its bytes charged, got {}",
+            swept.freed
+        );
+        assert_eq!(
+            swept.stuck.len(),
+            0,
+            "nothing should be stuck on a tree this user owns"
+        );
+        assert!(!dir.exists(), "the layer directory must be gone");
+        assert!(
+            !lc.join(format!("{key}.ok")).exists(),
+            "its sentinel must be gone with it"
+        );
+        assert!(
+            !layer_cached(&lc, &key),
+            "and the key must no longer read as a cache hit"
+        );
+        let _ = remove_tree_forced(&cache);
+    }
+
+    /// THE SENTINEL GOES FIRST, so a key the sweep considered is never hittable afterwards - whatever
+    /// happened to its directory. Here the directory is already absent, which is the one shape an
+    /// unprivileged test can construct: the lone `<key>.ok` must go, and it must be counted as
+    /// nothing, because no bytes were reclaimed.
+    #[test]
+    fn a_sentinel_with_no_layer_is_removed_and_charged_nothing() {
+        let (cache, key) = orphaned_layer("lone", 0);
+        let lc = cache.join("L");
+        std::fs::remove_dir_all(lc.join(&key)).expect("drop the layer dir");
+        assert!(
+            lc.join(format!("{key}.ok")).exists(),
+            "fixture: the sentinel outlives the directory"
+        );
+
+        let swept = sweep_orphan_layers_charged(&cache, None);
+        assert_eq!(swept.removed, 0, "there was no directory to remove");
+        assert_eq!(swept.freed, 0, "so nothing can have been freed");
+        assert!(swept.stuck.is_empty(), "and nothing is stuck");
+        assert!(
+            !lc.join(format!("{key}.ok")).exists(),
+            "the orphaned sentinel must still be taken"
+        );
+        let _ = remove_tree_forced(&cache);
+    }
+
+    /// THE BLAST RADIUS, pinned. The loop was restructured to read every key before deleting any of
+    /// them, and a reference set that is consulted one entry later than it used to be is exactly the
+    /// kind of change that quietly widens what a sweep takes. A layer named by a `.layers` manifest
+    /// is live, shared, and must survive untouched - sentinel included.
+    #[test]
+    fn a_referenced_layer_is_left_alone() {
+        let (cache, key) = orphaned_layer("ref", 2048);
+        let lc = cache.join("L");
+        // The manifest's first line is the base ref; every line after it is a layer key.
+        std::fs::write(
+            cache.join("app_latest-abc.layers"),
+            format!("alpine:3.19\n{key}\n"),
+        )
+        .expect("write manifest");
+
+        let swept = sweep_orphan_layers_charged(&cache, None);
+        assert_eq!(swept.removed, 0, "a referenced layer is not an orphan");
+        assert_eq!(swept.freed, 0, "and nothing of it may be charged");
+        assert!(
+            swept.stuck.is_empty(),
+            "nothing was attempted, so nothing stuck"
+        );
+        assert!(lc.join(&key).is_dir(), "the layer must still be there");
+        assert!(
+            layer_cached(&lc, &key),
+            "and it must still read as a cache hit"
+        );
+        let _ = remove_tree_forced(&cache);
+    }
+
+    /// A PLANTED `...ok` MUST NOT STEER THE SWEEP, and this repository has already paid for that
+    /// exact shape once: a file literally named `...ok` has `Path::file_stem() == ".."`, which an
+    /// unchecked `join` turns into the cache's PARENT. The guard here is the key test itself -
+    /// `strip_suffix(".ok")` leaves `..`, which is two characters and not thirty-two hex - and a
+    /// guard nobody exercises is a guard nobody can trust.
+    #[test]
+    fn a_planted_dotdot_sentinel_steers_nothing() {
+        let (cache, key) = orphaned_layer("dotdot", 64);
+        let lc = cache.join("L");
+        // A sibling of the cache that the `..` stem would reach if the key check ever went away.
+        let bystander = cache
+            .join("..")
+            .join(format!("kern-sweep-bystander-{}", std::process::id()));
+        std::fs::create_dir_all(&bystander).expect("mkdir bystander");
+        std::fs::write(bystander.join("keep"), b"x").expect("write bystander");
+        std::fs::write(lc.join("...ok"), b"evil:latest").expect("plant");
+
+        let swept = sweep_orphan_layers_charged(&cache, None);
+        assert_eq!(swept.removed, 1, "only the real orphan is reclaimed");
+        assert!(
+            lc.join("...ok").exists(),
+            "the planted sentinel is not a `<32hex>` key, so the sweep must leave it alone"
+        );
+        assert!(
+            bystander.join("keep").exists(),
+            "and nothing outside the layer store may be touched"
+        );
+        assert!(!lc.join(&key).exists(), "the genuine orphan still goes");
+        let _ = remove_tree_forced(&bystander);
+        let _ = remove_tree_forced(&cache);
+    }
+
+    /// A SYMLINK AT `L/<key>` IS UNLINKED, NEVER FOLLOWED. `is_dir()` follows links, so a link to a
+    /// directory outside the cache passes the sweep's own test for "this is a layer"; what stops it
+    /// from becoming a recursive delete of someone's home directory is that the remover underneath
+    /// stats with `symlink_metadata` and unlinks a non-directory instead of descending it. That is a
+    /// property of `remove_tree_forced` rather than of this loop, which is exactly why it is pinned
+    /// from here: this is the caller that can hand it such a path.
+    #[test]
+    fn a_symlinked_layer_loses_only_the_link() {
+        let (cache, key) = orphaned_layer("symlink", 32);
+        let lc = cache.join("L");
+        std::fs::remove_dir_all(lc.join(&key)).expect("drop the real layer");
+        let outside = cache
+            .join("..")
+            .join(format!("kern-sweep-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::fs::write(outside.join("precious"), b"x").expect("write precious");
+        std::os::unix::fs::symlink(&outside, lc.join(&key)).expect("plant the symlink");
+        assert!(
+            lc.join(&key).is_dir(),
+            "fixture: the link reads as a directory, which is what makes it dangerous"
+        );
+
+        let _ = sweep_orphan_layers_charged(&cache, None);
+        assert!(
+            outside.join("precious").exists(),
+            "the target of the link must be untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(lc.join(&key)).is_err(),
+            "and the link itself must be gone"
+        );
+        let _ = remove_tree_forced(&outside);
+        let _ = remove_tree_forced(&cache);
+    }
+
+    /// The sentence a stuck sweep prints, pinned where it is BUILT rather than where it is printed.
+    /// The real cause of a stuck layer is a subuid-owned file, which an unprivileged test cannot
+    /// create, so the filesystem half of that path is not reproducible here - the wording is, and it
+    /// is the half a reader depends on: a note that omits the key leaves them grepping a cache for
+    /// the one directory that blocked it.
+    #[test]
+    fn the_stuck_note_names_the_count_the_bytes_the_key_and_the_reason() {
+        let quiet = LayerSweep {
+            removed: 3,
+            freed: 4096,
+            stuck: Vec::new(),
+        };
+        assert!(
+            quiet.stuck_note("build layer").is_none(),
+            "an ordinary sweep says nothing extra"
+        );
+
+        let swept = LayerSweep {
+            removed: 1,
+            freed: 1024,
+            stuck: vec![
+                StuckLayer {
+                    key: String::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    bytes: 2 * 1024 * 1024,
+                    why: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Permission denied at /c/L/aaaa/home/app is owned by uid 100999, not you",
+                    ),
+                },
+                StuckLayer {
+                    key: String::from("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                    bytes: 1024 * 1024,
+                    why: std::io::Error::other("whatever"),
+                },
+            ],
+        };
+        assert_eq!(swept.stuck_bytes(), 3 * 1024 * 1024, "both are counted");
+        let note = swept
+            .stuck_note("build layer")
+            .expect("a sweep with stuck layers has something to say");
+        assert!(
+            note.contains("2 orphaned build layers could not be removed"),
+            "the count and the plural: {note}"
+        );
+        // `human_bytes` renders exactly 3 MiB as `3M`, with no decimal: asserted against what it
+        // actually prints, not against what the shape of the number suggested.
+        assert!(note.contains("3M still on disk"), "the bytes: {note}");
+        assert!(
+            note.contains("L/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "the key, as a path the reader can look at: {note}"
+        );
+        assert!(
+            note.contains("uid 100999"),
+            "and the reason, unabridged: {note}"
+        );
+    }
+}

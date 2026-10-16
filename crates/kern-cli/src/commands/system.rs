@@ -588,16 +588,30 @@ pub fn gc(images: bool) -> Result<(), Error> {
     // Sweep orphaned build layers: a `kern build` that changes a RUN/COPY leaves its old layer dirs
     // in `L/`, referenced by no image. Delete any `L/<key>` (+ `.ok`) not named in a `<tag>.layers`
     // manifest - bounds the layer cache without nuking the shared, still-referenced layers.
-    let (n, freed) = sweep_orphan_layers(&cache_dir());
-    if n > 0 {
+    let swept = sweep_orphan_layers(&cache_dir());
+    if swept.removed > 0 {
         let p = crate::ui::Palette::detect();
         println!(
-            "{}swept{} {n} orphaned build layer{}, freed {}",
+            "{}swept{} {} orphaned build layer{}, freed {}",
             p.g,
             p.z,
-            if n == 1 { "" } else { "s" },
-            human_bytes(freed)
+            swept.removed,
+            if swept.removed == 1 { "" } else { "s" },
+            human_bytes(swept.freed)
         );
+    }
+    // WHAT COULD NOT BE RECLAIMED IS SAID OUT LOUD, with the bytes and the reason. Before this the
+    // sweep dropped a failed removal silently, so `gc` reported only what had worked and the rest
+    // stayed on disk with nothing to point at it - the same shape as `gc --images` printing success
+    // over an untouched cache, which is a defect this file already carries a comment about.
+    //
+    // A NOTE AND NOT AN ERROR, which is the one difference from that case: `gc --images` clears the
+    // whole cache, so a failure there means nothing happened at all, while this sweep removed every
+    // layer it could and is reporting the remainder. The exit code stays 0 because the command did
+    // its job; the bytes are named so nobody has to go looking for them. Their sentinels are gone,
+    // so none of them can be read as a build-cache hit.
+    if let Some(note) = swept.stuck_note("build layer") {
+        eprintln!("{note}");
     }
     // Reclaim orphaned box scratch too (the piece `recover` used to own alone) so `gc` is the single
     // full local cleanup and crashed-box overlay dirs don't accumulate unnoticed.

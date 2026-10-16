@@ -723,9 +723,73 @@ pub(crate) fn sweep_unreachable_images(cache: &std::path::Path) -> (usize, u64) 
     (n, freed)
 }
 
-/// Delete build-layer dirs in `L/` not referenced by any `<tag>.layers` manifest. Returns
-/// `(count, bytes_freed)`. Only touches `L/<32hex>` entries, never a pulled/built image itself.
-pub(crate) fn sweep_orphan_layers(cache: &std::path::Path) -> (usize, u64) {
+/// One layer whose directory outlived the sweep that tried to remove it.
+///
+/// Its sentinel is gone either way (the sweep removes that FIRST), so a stuck layer is debris on
+/// disk and can never be a build-cache hit. What is left is bytes nobody can reclaim from here, and
+/// the reason, which is almost always a subuid-owned file an unprivileged user cannot unlink.
+pub(crate) struct StuckLayer {
+    /// The `<32hex>` layer key, so the entry can be named and found.
+    pub(crate) key: String,
+    /// Size measured BEFORE the attempt: bytes still on disk.
+    pub(crate) bytes: u64,
+    /// The first failure, already annotated by [`force_remove_dir_all`] with the path and its owner.
+    pub(crate) why: std::io::Error,
+}
+
+/// What a layer sweep did: what it removed, what that was worth to the caller, and what it could not
+/// remove.
+///
+/// IT RETURNS THE FAILURES INSTEAD OF DROPPING THEM. The pair this replaced was `(count, bytes)`,
+/// which has no room for "and these three are still there", so the loop below had no choice but to
+/// discard a failed removal in silence. `force_remove_dir_all`, 130 lines down this same file,
+/// already carries the rule in its own doc comment: *a caller that genuinely does not care can still
+/// ignore the result, but it has to say so*.
+#[derive(Default)]
+pub(crate) struct LayerSweep {
+    /// Layer directories actually gone from disk.
+    pub(crate) removed: usize,
+    /// Bytes reclaimed, counted per the caller's `charge` filter.
+    pub(crate) freed: u64,
+    /// Layers whose directory survived. Empty on every ordinary sweep, so it allocates nothing.
+    pub(crate) stuck: Vec<StuckLayer>,
+}
+
+impl LayerSweep {
+    /// Bytes still on disk under the layers that could not be removed.
+    pub(crate) fn stuck_bytes(&self) -> u64 {
+        self.stuck
+            .iter()
+            .fold(0u64, |a, s| a.saturating_add(s.bytes))
+    }
+
+    /// The sentence a caller prints when a sweep could not reclaim everything, or `None` when it
+    /// could - which is every ordinary sweep.
+    ///
+    /// ONE SPELLING, TWO CALLERS. `gc` and `image_prune` report the same fact about the same sweep,
+    /// and two copies of a sentence are two sentences that drift: this repository has paid for that
+    /// shape before, in a census that carried its own copy of a sidecar list. It also makes the
+    /// wording testable without a filesystem that can produce an unremovable tree, which an
+    /// unprivileged test cannot create - the real cause is a subuid-owned file.
+    ///
+    /// The KEY is in the sentence, not only the errno: a reader told "Permission denied" has to find
+    /// which of the cache's layers it was, and `L/<key>` is a path they can look at.
+    pub(crate) fn stuck_note(&self, what: &str) -> Option<String> {
+        let first = self.stuck.first()?;
+        Some(format!(
+            "kern: note: {} orphaned {what}{} could not be removed, {} still on disk. First: L/{}: {}",
+            self.stuck.len(),
+            if self.stuck.len() == 1 { "" } else { "s" },
+            human_bytes(self.stuck_bytes()),
+            first.key,
+            first.why
+        ))
+    }
+}
+
+/// Delete build-layer dirs in `L/` not referenced by any `<tag>.layers` manifest. Only touches
+/// `L/<32hex>` entries, never a pulled/built image itself.
+pub(crate) fn sweep_orphan_layers(cache: &std::path::Path) -> LayerSweep {
     sweep_orphan_layers_charged(cache, None)
 }
 
@@ -747,7 +811,7 @@ pub(crate) fn sweep_orphan_layers(cache: &std::path::Path) -> (usize, u64) {
 pub(crate) fn sweep_orphan_layers_charged(
     cache: &std::path::Path,
     charge: Option<&std::collections::HashSet<String>>,
-) -> (usize, u64) {
+) -> LayerSweep {
     // The cache is a PARAMETER, not `cache_dir()`. `remove_image` already takes one so it can be
     // driven against a temp tree by a test, and this call ignored it and swept the real user cache -
     // so a unit test deleting from a fabricated cache reached into the developer's layer store.
@@ -766,18 +830,27 @@ pub(crate) fn sweep_orphan_layers_charged(
                             referenced.insert(k.to_string());
                         }
                     }
-                    Err(_) => return (0, 0), // incomplete reference set → don't risk deleting live layers
+                    // Incomplete reference set → don't risk deleting live layers. Nothing was
+                    // touched, so nothing is stuck either.
+                    Err(_) => return LayerSweep::default(),
                 }
             }
         }
     }
-    let (mut count, mut freed) = (0usize, 0u64);
     let Ok(rd) = std::fs::read_dir(&lc) else {
-        return (0, 0);
+        return LayerSweep::default();
     };
+    // THE KEYS ARE READ BEFORE ANYTHING IS DELETED, and that is not tidiness. POSIX leaves `readdir`
+    // unspecified when the directory being walked is modified during the walk, and the loop that
+    // used to live here unlinked entries from the very directory it was streaming. A removal can
+    // therefore make the stream skip a LATER entry, and the two entries of one layer (`<key>` and
+    // `<key>.ok`) are independent entries: skipping the second is how a sentinel outlives the
+    // directory it stands for. Reading the list first costs one set on a cold path and the question
+    // stops existing. Both entries fold to one key, so each layer is handled exactly once.
+    let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        // Only reap `<32hex>` layer dirs (and their `.ok`); a `.ok` is handled with its dir.
+        // Only reap `<32hex>` layer dirs and their `.ok`; anything else in `L/` is not ours to judge.
         let key = name.strip_suffix(".ok").unwrap_or(&name);
         if key.len() != 32
             || !key.bytes().all(|b| b.is_ascii_hexdigit())
@@ -785,22 +858,63 @@ pub(crate) fn sweep_orphan_layers_charged(
         {
             continue;
         }
-        if e.path().is_dir() {
-            // Sized BEFORE the delete and charged only if the delete succeeded: a directory that
-            // could not be removed is still on disk, and counting it is how a "freed" number comes
-            // to describe bytes that are still there.
-            let sz = dir_size(&e.path());
-            if std::fs::remove_dir_all(e.path()).is_ok() {
-                count += 1;
-                if charge.is_none_or(|keys| keys.contains(key)) {
-                    freed += sz;
+        keys.insert(key.to_string());
+    }
+    let mut swept = LayerSweep::default();
+    for key in keys {
+        // ⛔ THE SENTINEL GOES FIRST, AND THE ORDER IS THE WHOLE FIX. `layer_cached` reads `<key>.ok`
+        // plus `<key>/` being a directory, so a layer is a build-cache HIT while both exist. Removing
+        // the directory first and the sentinel after leaves a window - and on the one host shape that
+        // matters it is not a window but the normal outcome: a layer carrying a file owned by a
+        // mapped subuid cannot be fully unlinked by this user, so the removal takes what it can and
+        // leaves the rest. The directory survives, PARTIALLY EMPTIED, with its sentinel intact, and
+        // the next build reads that as a complete layer. MEASURED from outside against v0.32.0: a
+        // layer from `RUN useradd -m -u 10001 app` kept `home/app` and `sys/` while `etc/passwd` was
+        // gone, `compose build` printed `built`, and the box died with "user 'app' has no account in
+        // the image's /etc/passwd" - an error naming a subsystem that was not at fault.
+        //
+        // Sentinel first makes that unreachable by construction, for every exit path including a
+        // crash between the two statements: what is left is a directory with no sentinel, which is a
+        // MISS, and a miss only ever costs a rebuild. This is the discipline `drop_image_artifacts`
+        // already applies to images, where `.ok` and `.image` go before the payload.
+        let _ = std::fs::remove_file(lc.join(format!("{key}.ok")));
+        let dir = lc.join(&key);
+        if !dir.is_dir() {
+            // Either an orphaned sentinel whose layer is already gone - the file above was the whole
+            // entry - or a `<32hex>` that is not a directory at all. Nothing kern writes takes that
+            // second shape, and the loop this replaced removed it anyway through its `else` arm; it
+            // is still removed, so `gc` reclaims exactly what it used to and the change of shape
+            // cannot quietly narrow what a sweep reaches.
+            let _ = std::fs::remove_file(&dir);
+            continue;
+        }
+        // Sized BEFORE the attempt and charged only when the attempt succeeded: a directory that
+        // could not be removed is still on disk, and counting it is how a "freed" number comes to
+        // describe bytes that are still there.
+        let sz = dir_size(&dir);
+        // `force_remove_dir_all`, NOT `std::fs::remove_dir_all`, and for the reason that function's
+        // own doc comment records: a layer is unpacked with the image's own ownership, so it holds
+        // directories this process does not own and cannot chmod, and unlinking inside one needs
+        // write permission ON IT. Six other removers in this tree already take that path; this one
+        // did not, which is why a layer the image path would have reclaimed was left behind here.
+        match force_remove_dir_all(&dir) {
+            Ok(()) => {
+                swept.removed += 1;
+                if charge.is_none_or(|keys| keys.contains(key.as_str())) {
+                    swept.freed = swept.freed.saturating_add(sz);
                 }
             }
-        } else {
-            let _ = std::fs::remove_file(e.path()); // an orphaned `.ok`
+            // REPORTED, NOT DISCARDED. The previous shape was `if remove(..).is_ok() { count += 1 }`
+            // with no other arm, so an unremovable layer was invisible: not freed, not counted, not
+            // named, and still on disk. The caller decides what to say; it can no longer fail to know.
+            Err(why) => swept.stuck.push(StuckLayer {
+                key,
+                bytes: sz,
+                why,
+            }),
         }
     }
-    (count, freed)
+    swept
 }
 
 /// On-disk `(size_bytes, dangling)` of cached image `<stem>`, computed in ONE pass - a flat pulled
@@ -1019,8 +1133,13 @@ pub(crate) fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
     // Reclaim layers this image was the last to reference (the sweep fails closed, so a shared layer is
     // never dropped while another image's manifest still names it). The sweep still takes every
     // orphan it finds; only the ones THIS image named are charged to the number the caller prints.
-    let (_, layer_freed) = sweep_orphan_layers_charged(cache, Some(&mine));
-    Some(freed + layer_freed)
+    // THE STUCK LAYERS ARE NOT REPORTED HERE, deliberately. `rmi`'s sentence is about the image the
+    // caller named; debris the sweep could not reclaim belongs to the cache's health, which is what
+    // `gc` and `image_prune` report and what the paragraph above already says about the arithmetic.
+    // It is ignored by NAME rather than by a `_`, so the next reader sees a decision and not an
+    // oversight.
+    let swept = sweep_orphan_layers_charged(cache, Some(&mine));
+    Some(freed + swept.freed)
 }
 
 /// On-disk size of cached image `<stem>` - the size half of [`image_stat`]. Used by the build-history
@@ -1731,16 +1850,30 @@ pub(crate) fn content_hash(
 /// A completed layer's sentinel exists (`<key>.ok`) → it's a cache hit.
 pub(crate) fn layer_cached(lc: &std::path::Path, key: &str) -> bool {
     // BOTH, and the directory is not redundant. The sentinel says "a layer with this key was
-    // completed"; the directory IS the layer. They can disagree - anything that removes cache
-    // content without removing the marker (a partial `rm -rf` that hits a file owned by a mapped
-    // subuid and stops, a full disk, an interrupted cleanup) leaves the marker standing over
-    // nothing. The build then treated it as a hit, pushed a path that is not there onto the overlay
-    // chain, and died with `mount(overlay) failed: No such file or directory` - an errno that names
-    // neither the cache nor the missing layer, several steps away from the cause. Measured: a
-    // half-completed cache wipe cost an hour of debugging aimed at the wrong subsystem.
+    // completed"; the directory IS the layer. They can disagree - anything that removes the
+    // directory without removing the marker leaves the marker standing over nothing. The build then
+    // treated it as a hit, pushed a path that is not there onto the overlay chain, and died with
+    // `mount(overlay) failed: No such file or directory` - an errno that names neither the cache nor
+    // the missing layer, several steps away from the cause. Measured: a half-completed cache wipe
+    // cost an hour of debugging aimed at the wrong subsystem. Checking both turns that into an
+    // ordinary cache MISS: the layer is rebuilt and nobody notices.
     //
-    // Checking both turns that into an ordinary cache MISS: the layer is rebuilt and nobody notices.
-    // A miss is always safe; a false hit never is.
+    // ⛔ AND THE CASE THIS TEST CANNOT SEE IS A PARTIALLY EMPTIED DIRECTORY, which is why the fix
+    // for it is not here. This comment used to name the right cause and the wrong consequence: it
+    // said a partial `rm -rf` stopped by a subuid-owned file "leaves the marker standing over
+    // nothing". It does not. Such a removal unlinks everything it CAN and leaves exactly what it
+    // cannot, so the directory is still a directory, `is_dir()` is still true, the sentinel is still
+    // there, and the hit is false. MEASURED from outside against v0.32.0 on a layer from
+    // `RUN useradd -m -u 10001 app`: `home/app` and `sys/` survived, `etc/passwd` did not,
+    // `compose build` printed `built`, and the box failed for a reason that named `/etc/passwd`.
+    //
+    // No cheap test distinguishes a partial layer from a whole one - that is a walk of the tree on
+    // every cache hit, on the hottest path a build has - so the invariant is imposed where the
+    // damage is done instead: `sweep_orphan_layers_charged` removes the sentinel BEFORE it touches
+    // the directory, so every removal kern performs, complete or not, interrupted or not, leaves a
+    // directory with no sentinel. That is a miss, and a miss is always safe; a false hit never is.
+    // What remains outside that guarantee is someone else's `rm -rf` inside kern's own 0700 cache,
+    // which is not a state this function can be asked to detect.
     lc.join(format!("{key}.ok")).exists() && lc.join(key).is_dir()
 }
 

@@ -19,6 +19,27 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
+## Unreleased
+
+**A build could reuse a layer that had been half-deleted, and say `built`.** `kern gc` reclaims build
+layers no image references, and it did that with `remove_dir_all`, which stops at the first directory
+it has no write permission on: a layer carrying a subuid-owned file, or any read-only directory, was
+left on disk, uncounted and unnamed, while the pass could still take its `.ok` sentinel. Where the
+sentinel survived instead, the build cache read a partially emptied directory as a complete layer.
+Measured from outside against v0.32.0: a layer from `RUN useradd -m -u 10001 app` kept `home/app`
+while `etc/passwd` was gone, the next `compose build` printed `built`, and the box failed with "user
+'app' has no account in the image's /etc/passwd" - an error naming a subsystem that was not at fault.
+
+The sweep now removes the sentinel BEFORE it touches the directory, so any removal that cannot finish
+leaves a layer with no sentinel, which is a cache MISS and costs a rebuild. It removes the directory
+with the same forced, id-mapped remover `rmi` and `volume rm` already use, so a layer they would have
+reclaimed is no longer left behind here. Measured end to end on a cache of 20 such layers: before,
+`gc` swept 0 and left 20 directories; after, it swept 20 and left none.
+
+**`gc` and the `kern top` Images tab say what they could not reclaim**, with the bytes still on disk
+and the layer key, where a failed removal used to be dropped in silence. It is a note and not an
+error: the sweep removed everything it could, and the exit code still reports that.
+
 ## kern-sandbox 0.2.48 - 2026-10-13
 
 **It carries the kern v0.32.0 binary**, so `--egress-allow` on a sandbox refuses a plain-HTTP head
