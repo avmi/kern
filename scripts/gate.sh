@@ -87,7 +87,8 @@ step "cargo test (kern-win)" \
     env -u KERN_BIN cargo test --manifest-path windows/kern-win/Cargo.toml
 echo "docs"
 for g in docker-vocabulary dockerfiles flat-continuation gen-seccomp-allowlist injection-declared \
-         md-links no-ai-slop registry-classified stale-numbers progress-is-tty-gated gates-selftest; do
+         md-links no-ai-slop registry-classified retired-claims stale-numbers progress-is-tty-gated \
+         gates-selftest; do
     step "$g" python3 "scripts/$g.py"
 done
 # The compose corpus, and it is LAST among the doc gates because it is the slowest and the only one

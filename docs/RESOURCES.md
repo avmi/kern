@@ -8,7 +8,7 @@ Every shipping cap is a real cgroup v2 or kernel control, and devices are deny-b
 
 | Resource | Flag / profile | What the box gets | Enforcement |
 |---|---|---|---|
-| **CPU** | `--cpus` · `--cpuset-cpus` · `--nice` · `vcpu:` | Fractional CPU-time quota, core pinning, priority | cgroup `cpu.max` / `cpuset`, hard |
+| **CPU** | `--cpus` · `--cpuset-cpus` · `--nice` · `vcpu:` | Fractional CPU-time quota, core pinning, priority | cgroup `cpu.max` / `cpuset`: a hard quota where the controller is delegated, and NOT proven by `--require-limits`, which governs memory and pids (see below) |
 | **Memory** | `--memory` · `--memory-swap-max` · `--shm-size` | Hard RAM ceiling, swap allowance, `/dev/shm` size | cgroup `memory.max`, hard¹ |
 | **Disk** | `vdisk:` · `--size` (named volumes) | Size-capped scratch at `/vdisk/<name>` | rootless: a **RAM-backed tmpfs**, charged to the box's memory cap; privileged: ext4-on-loop quota |
 | **Devices** | `vgpio:` | *Only* the named GPIO/I²C/SPI/LED nodes | fresh `/dev` + fd-pinned bind + capability deny-list |

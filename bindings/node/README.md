@@ -4,7 +4,8 @@
 
 # Kern Sandbox
 
-**Your model writes the code. This runs it where it can't touch your machine.**
+**Your model writes the code. This runs it where it can't reach your files unless you hand them
+over.**
 
 <sub>**Works with** Claude Code · Cursor · Claude Desktop · LM Studio · LangChain · pi</sub>
 

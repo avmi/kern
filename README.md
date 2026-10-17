@@ -36,8 +36,8 @@ agent's code runs in, called from Python, Node or any MCP client. kern calls a c
 
 - **Real OCI images**: `pull`, `build`, `commit`, `push`, `save`/`load`. A box starts in single-digit
   milliseconds.
-- **A sandbox for code your model wrote.** It runs where it can't touch your machine, with no
-  network unless you ask.
+- **A sandbox for code your model wrote.** It runs where it can't reach your files unless you hand
+  them over, with no network unless you ask.
 - **Rootless, always.** Six namespaces, a read-only or overlay root, a seccomp allowlist, cgroup v2
   limits.
 - **Your `docker-compose.yml`, unchanged**, or kern's own `stack.toml`.

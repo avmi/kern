@@ -104,9 +104,10 @@ supervision.
 
 ## How do my SSH keys and cloud credentials stay out of the sandbox?
 
-They are never in it. Mounts over `~/.ssh`, `~/.aws`, `~/.kube`, `~/.gnupg` and the other credential
-directories are refused, with no opt-out; the box does not inherit your environment, only what you pass
-with `env=`; and there is no network unless you open it. The two threats this separates, a compromised
+Nothing reaches the box by mount or by inheritance. Mounts over `~/.ssh`, `~/.aws`, `~/.kube`,
+`~/.gnupg` and the other credential directories are refused, with no opt-out, and the box does not
+inherit your environment. What DOES reach it is what you pass with `env=`, so a credential handed over
+that way is in the sandbox because you put it there; and there is no network unless you open it. The two threats this separates, a compromised
 dependency and a prompt-injected agent, are in
 [SECURITY.md](../SECURITY.md#credentials-and-network-in-the-sandbox-sdk).
 
