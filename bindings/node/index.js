@@ -97,6 +97,24 @@ const CAP_FILL_RATE = 8e9;
  * Python's `_CAP_HEADROOM_FRAC`. */
 const CAP_HEADROOM_FRAC = 0.5;
 
+/** How many times the last measurement's own cost the poller waits while there is room to spare - the
+ * self-limit. Mirrors Python's `_CAP_COST_MULT`. */
+const CAP_COST_MULT = 10;
+
+/** Below this fraction of the cap still unspent, the self-limit YIELDS to the cap and the multiplier
+ * drops to 1: one walk per walk's duration, a 50% duty cycle, for as long as the box is inside the
+ * last quarter of its budget.
+ *
+ * ⛔ BECAUSE THE SELF-LIMIT WAS SILENTLY THE BOUND, AND IT IS A FUNCTION OF THE DISK. An outside
+ * review falsified the claim that the overshoot is bounded by the cap, and the measurement agreed:
+ * with the headroom held at 50 MiB and only the file COUNT varied, `cost * 10` takes over at about a
+ * thousand files and then sets the interval alone - 1.20x at 0 files, 1.28x at 1,000, 18.54x at
+ * 10,000, 23.98x at 50,000. The test that passed used an EMPTY workspace, the one shape that flatters
+ * this policy. Yielding does not make the bound a function of the cap again: an interval can never be
+ * shorter than one walk, so on a large tree the floor is still `walk cost x write rate`, and only a
+ * measurement that is not O(files) closes that. Mirrors Python's `_CAP_NEAR_FRAC`. */
+const CAP_NEAR_FRAC = 0.25;
+
 /**
  * Milliseconds until the next in-call workspace measurement.
  *
@@ -119,10 +137,14 @@ const CAP_HEADROOM_FRAC = 0.5;
  * busy loop. BYTE-FOR-BYTE THE SAME ARITHMETIC AS PYTHON'S `_cap_next_delay`, in milliseconds, and both
  * bindings assert the same table.
  */
-function capNextDelayMs(headroom, observedRate, costMs) {
+function capNextDelayMs(headroom, observedRate, costMs, limit) {
   const plan = Math.max(CAP_FILL_RATE, observedRate);
   const wantMs = ((headroom * CAP_HEADROOM_FRAC) / plan) * 1000;
-  return Math.max(Math.max(CAP_POLL_MIN_MS, costMs * 10), Math.min(wantMs, CAP_POLL_MS));
+  // THE SELF-LIMIT YIELDS IN THE LAST QUARTER, because it was the bound and nobody had measured it
+  // being the bound: see `CAP_NEAR_FRAC` for the table that falsified the claim.
+  const near = limit > 0 && headroom <= limit * CAP_NEAR_FRAC;
+  const mult = near ? 1 : CAP_COST_MULT;
+  return Math.max(Math.max(CAP_POLL_MIN_MS, costMs * mult), Math.min(wantMs, CAP_POLL_MS));
 }
 
 /** What this process needs on a directory to walk it: read (list the names) and search (stat them).
@@ -276,10 +298,16 @@ function warnRegranted(names) {
  * caller passed a list, and otherwise this THROWS - because counting it as zero is how a cooperative
  * cap is defeated for good. Mirrors Python's `_workspace_usage`.
  */
-function workspaceUsage(root, blind = null, regranted = null) {
+function workspaceUsage(root, blind = null, regranted = null, biggest = null) {
   let total = 0;
   const seen = new Set();
   const unreadable = [];
+  // The biggest REGULAR file, and every directory's own mtime: what a caller needs to re-check the
+  // tree WITHOUT walking it again. A write does not move a directory's mtime; creating or removing an
+  // entry does, so one `stat` per DIRECTORY spots a file never seen before for 1 syscall on a flat
+  // workspace instead of 10,000. Free here - the walk already holds every `st`. Mirrors Python.
+  let top = [null, -1];
+  const dirs = new Map();
   const retried = new Set();
   const stack = [root];
   // A DIRECTORY THIS PROCESS CANNOT READ is not an empty one. With a non-root `user` the box user can
@@ -339,13 +367,26 @@ function workspaceUsage(root, blind = null, regranted = null) {
       unreadable.push(current);
       continue;
     }
+    if (biggest) {
+      try {
+        dirs.set(current, fs.statSync(current, { bigint: true }).mtimeNs.toString());
+      } catch {
+        /* it raced us; the next full walk takes it */
+      }
+    }
     for (const [full, st] of stats) {
       if (st.isDirectory()) stack.push(full); // from the lstat already taken
       const key = `${st.dev}:${st.ino}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      total += (st.blocks || 0) * 512;
+      const chunk = (st.blocks || 0) * 512;
+      total += chunk;
+      if (biggest && st.isFile() && chunk > top[1]) top = [full, chunk];
     }
+  }
+  if (biggest) {
+    biggest.length = 0;
+    biggest.push(top, dirs);
   }
   if (unreadable.length && blind) {
     blind.push(...unreadable); // the caller asked to be handed them; Python does the same
@@ -4630,13 +4671,14 @@ class Sandbox {
     // real headroom instead of starting from a guess about the workspace's size.
     let capUsed0 = null;
     let capCost0 = 0;
+    const capSeed = [];
     if (this.workspaceMaxBytes !== null && this._ws) {
       const blind = [];
       const regranted = [];
       const capT0 = process.hrtime.bigint();
       let used;
       try {
-        used = workspaceUsage(this._ws, this._shared ? blind : null, regranted);
+        used = workspaceUsage(this._ws, this._shared ? blind : null, regranted, capSeed);
       } catch (e) {
         // A SESSION WITH NO BOX USER TO ASK: there is no helper that could size what this process
         // cannot read, so the only honest answers are "refuse" and "admit the call on a number that is
@@ -4825,10 +4867,12 @@ class Sandbox {
             "workspace_full",
             `the workspace reached ${capOverrun} bytes, over the ${capLimit}-byte workspaceMaxBytes, ` +
               "so the box was stopped mid-call. The cap is measured while the call runs, so it bounds " +
-              "ONE call and not only what accumulates across them; the overshoot is whatever the box " +
-              `wrote between two measurements. The box writes to a host directory (${this._ws}), so ` +
-              "this is still not a kernel boundary: put the workspace on a filesystem whose size you " +
-              "chose and the kernel answers ENOSPC instead",
+              "ONE call and not only what accumulates across them. HOW FAR PAST IT A BOX GETS depends " +
+              "on what the workspace costs to MEASURE: the interval between two looks is scaled to the " +
+              "headroom, and can never be shorter than one walk of the tree - measured on a fast disk, " +
+              "a workspace of a few files is crossed by ~1.2x and one of 50,000 files by ~10x. The box " +
+              `writes to a host directory (${this._ws}), so this is still not a kernel boundary: put ` +
+              "the workspace on a filesystem whose size you chose and the kernel answers ENOSPC instead",
           );
         }
         const execFail = execFailureBinary(stderr);
@@ -4963,6 +5007,22 @@ class Sandbox {
       // The previous sample, so the poller can see the RATE the box is writing at. It starts at the
       // pre-call walk, the one measurement taken before the box existed.
       let capPrev = [process.hrtime.bigint(), capUsed0];
+      // ⛔ MEASURING COSTS O(FILES), AND THAT WAS THE REAL BOUND ON THE OVERSHOOT. An outside review
+      // falsified the claim that the cap bounds it, and instrumenting the Python poller showed why: on
+      // a 10,000-file workspace the walk costs 15 ms, so the first in-call interval was `10 x cost` and
+      // there was exactly ONE look per call - it arrived at 191 ms having already measured 20x the
+      // headroom. No policy over the WAITING fixes that, because the cost of LOOKING sets it.
+      //
+      // So the tree is walked on the self-limited cadence and, in between, a cheap probe re-checks two
+      // things: every directory's mtime (a NEW file, which is the shape a runaway has) and the biggest
+      // file's blocks (growth). MEASURED: 12 us against a 3.62 ms walk, 314x. Seeded from the pre-call
+      // walk, because the first in-call walk is the one that arrives too late. Mirrors Python.
+      let capTotal = capUsed0;
+      let capCost = capCost0;
+      let capWatch = capSeed.length && capSeed[0][0] !== null ? capSeed[0] : null;
+      let capDirs = capSeed.length > 1 ? new Map(capSeed[1]) : new Map();
+      let capNextFull =
+        Number(process.hrtime.bigint() / 1000000n) + Math.max(CAP_POLL_MIN_MS, capCost0 * CAP_COST_MULT);
       const armCapPoll = (delayMs) => {
         capTimer = setTimeout(() => {
           capTimer = null;
@@ -4975,9 +5035,45 @@ class Sandbox {
           // binding and true in Python, which is the divergence that matters, because the backoff is
           // the only thing bounding what the poller costs on a workspace with many files.
           const t0 = process.hrtime.bigint();
+          const nowMs = Number(t0 / 1000000n);
+          let est = null;
+          if (nowMs < capNextFull) {
+            let fresh = false;
+            for (const [d, mt] of capDirs) {
+              try {
+                if (fs.statSync(d, { bigint: true }).mtimeNs.toString() !== mt) {
+                  fresh = true;
+                  break;
+                }
+              } catch {
+                fresh = true; // gone or closed: the walk decides
+                break;
+              }
+            }
+            if (!fresh && capWatch !== null) {
+              try {
+                const st = fs.lstatSync(capWatch[0]);
+                est = capTotal - capWatch[1] + (st.blocks || 0) * 512;
+              } catch {
+                capWatch = null; // gone: wait for the walk rather than guess
+              }
+            }
+          }
+          // ⛔ THE PROBE TRIGGERS, THE WALK DECIDES. The estimate carries a total as old as the last
+          // walk, so a box that TRUNCATED another file and kept writing would look over while being
+          // under - and a false `workspace_full` on a healthy box is worse than a late one.
+          if (est !== null && est <= capLimit && nowMs < capNextFull) {
+            const nowB = process.hrtime.bigint();
+            const elapsedS = Number((nowB - capPrev[0]) / 1000n) / 1e6;
+            const rate = elapsedS > 0 ? (est - capPrev[1]) / elapsedS : 0;
+            capPrev = [nowB, est];
+            armCapPoll(capNextDelayMs(capLimit - est, rate, 0, capLimit));
+            return;
+          }
           let used;
+          const top = [];
           try {
-            used = workspaceUsage(this._ws, null, null);
+            used = workspaceUsage(this._ws, null, null, top);
           } catch {
             // CANNOT MEASURE RIGHT NOW: keep waiting, never kill on unknown - and pay for the attempt
             // at the same tenth-of-the-call rate a successful one does. Re-arming at the flat floor is
@@ -4998,18 +5094,26 @@ class Sandbox {
             return;
           }
           const now = process.hrtime.bigint();
+          capTotal = used;
+          capCost = tookMs;
+          capWatch = top.length && top[0][0] !== null ? top[0] : null;
+          capDirs = top.length > 1 ? new Map(top[1]) : new Map();
+          capNextFull = Number(now / 1000000n) + Math.max(CAP_POLL_MIN_MS, capCost * CAP_COST_MULT);
           const [prevT, prevUsed] = capPrev;
           const elapsedS = Number((now - prevT) / 1000n) / 1e6;
           const rate = elapsedS > 0 ? (used - prevUsed) / elapsedS : 0;
           capPrev = [now, used];
-          armCapPoll(capNextDelayMs(capLimit - used, rate, tookMs));
+          // ⛔ PLANNED AGAINST THE PROBE'S COST, NEVER THE WALK'S: the next thing the tick does is a
+          // probe. Passing the walk's cost here is what made the self-limit the bound. The self-limit
+          // still bounds what the WALKS cost - it lives in `capNextFull` alone now.
+          armCapPoll(capNextDelayMs(capLimit - used, rate, 0, capLimit));
         }, delayMs);
       };
       // THE FIRST INTERVAL IS SCALED TO THE CAP, not taken at the ceiling. With no rate measured yet the
       // policy's own floor assumes a disk faster than any here, which fails SAFE: it looks too early
       // rather than too late.
       if (capLimit !== null && this._ws && capUsed0 !== null)
-        armCapPoll(capNextDelayMs(capLimit - capUsed0, 0, capCost0));
+        armCapPoll(capNextDelayMs(capLimit - capUsed0, 0, 0, capLimit));
 
       timer = setTimeout(() => stopBox(), timeoutS * 1000);
     });
@@ -5233,8 +5337,11 @@ class Sandbox {
           fd = fs.openSync(`/proc/self/fd/${parent}/${parts[parts.length - 1]}`, flags, 0o644);
         } catch (e) {
           // `write` and not a test on `verb`: the verb here is "snapshot to" or "restore from", and
-          // the fact is the flag this function already took.
-          throw pathRefusal(verb, rel, e, write);
+          // the fact is the flag this function already took. The full path goes with it because this
+          // open is the FINAL component, so a mode-0 file reaches exactly here: without the path the
+          // refusal called it "a directory on that path", which is the defect an outside review found
+          // on `readFile` and which lived at every call site that could not be asked.
+          throw pathRefusal(verb, rel, e, write, path.join(ws, ...parts));
         }
       } finally {
         if (parent !== root) fs.closeSync(parent);
@@ -5371,7 +5478,10 @@ class Sandbox {
         /* the descent closed what it owned; this is the base it never touches */
       }
       if (e instanceof SandboxError) throw e;
-      throw pathRefusal("write", rel, e, true);
+      // `full` is the TARGET and the failure here is on a directory COMPONENT of it: `access(2)`
+      // refuses to name a directory as a file, so passing it cannot mislabel this, and it means no
+      // reader has to work out which call sites can be asked and which cannot.
+      throw pathRefusal("write", rel, e, true, full);
     }
   }
 
@@ -5881,7 +5991,7 @@ class Sandbox {
               if (e.code === "EEXIST") {
                 /* already there, which is what this branch wants */
               } else if (isClosedErr(e)) {
-                throw pathRefusal("restore", m.name, e, true);
+                throw pathRefusal("restore", m.name, e, true, path.join(this._ws, ...parts));
               } else {
                 throw e;
               }
@@ -5898,7 +6008,7 @@ class Sandbox {
           try {
             fd = fs.openSync(`/proc/self/fd/${parent}/${leaf}`, flags, createMode);
           } catch (e) {
-            throw pathRefusal("restore", m.name, e, true);
+            throw pathRefusal("restore", m.name, e, true, path.join(this._ws, ...parts));
           }
           try {
             if (!fs.fstatSync(fd).isFile())
@@ -7677,6 +7787,8 @@ module.exports = {
   _CAP_POLL_MIN_MS: CAP_POLL_MIN_MS,
   _CAP_FILL_RATE: CAP_FILL_RATE,
   _CAP_HEADROOM_FRAC: CAP_HEADROOM_FRAC,
+  _CAP_NEAR_FRAC: CAP_NEAR_FRAC,
+  _CAP_COST_MULT: CAP_COST_MULT,
   // The bytecode cache's internals, exported for its tests only: the mount flag and the atomic
   // publish are security properties, and a test that cannot reach them cannot assert them.
   _PYC_MOUNT: PYC_MOUNT,

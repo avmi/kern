@@ -4095,24 +4095,24 @@ test("the cap poll interval is scaled to the headroom, not to the clock", () => 
   const cap = 50 << 20;
 
   // A QUIET BOX WITH A SMALL CAP IS STILL WATCHED CLOSELY. This is the assertion the 67x version fails.
-  const idle = next(cap, 0, 0);
+  const idle = next(cap, 0, 0, cap);
   assert.ok(idle < CEIL / 10, `a zero observed rate bought the ceiling again: ${idle}`);
   assert.ok(Math.abs(idle - ((cap * FRAC) / RATE) * 1000) < 1e-9, `${idle}`);
 
   // The ceiling still applies when the headroom is large enough to be worth a full second.
-  assert.strictEqual(next(100 * 2 ** 30, 0, 0), CEIL);
+  assert.strictEqual(next(100 * 2 ** 30, 0, 0, 100 * 2 ** 30), CEIL);
 
   // A box writing FASTER than the planning floor pulls the next look in; one writing slower cannot push
   // it out. The rate is a floor, not a measurement.
-  assert.ok(next(cap, 20e9, 0) < idle, "a faster box must be looked at sooner");
-  assert.strictEqual(next(cap, 1, 0), idle, "a slow box must not relax the interval");
+  assert.ok(next(cap, 20e9, 0, cap) < idle, "a faster box must be looked at sooner");
+  assert.strictEqual(next(cap, 1, 0, cap), idle, "a slow box must not relax the interval");
 
   // THE SELF-LIMIT WINS OVER THE ARITHMETIC, which is the half that keeps a 500k-file workspace from
   // spending more of the call in the poller than in the workload. 400 ms of walk buys a 4 s wait.
-  assert.strictEqual(next(cap, 20e9, 400), 4000, "cost * 10 must dominate");
+  assert.strictEqual(next(cap, 20e9, 400, cap), 4000, "cost * 10 must dominate");
 
   // And a headroom of a few bytes asks for a busy loop, which the floor refuses.
-  assert.strictEqual(next(1, 20e9, 0), FLOOR);
+  assert.strictEqual(next(1, 20e9, 0, cap), FLOOR);
 
   // THE TWO BINDINGS ARE ONE CONTRACT, so the table is pinned in the units the other one uses too:
   // Python's `_cap_next_delay` returns SECONDS and is asserted against the same five rows.
@@ -4120,6 +4120,24 @@ test("the cap poll interval is scaled to the headroom, not to the clock", () => 
   assert.strictEqual(FLOOR / 1000, 0.001);
   assert.strictEqual(RATE, 8e9);
   assert.strictEqual(FRAC, 0.5);
+
+  // ⛔ AND THE SELF-LIMIT MUST YIELD IN THE LAST QUARTER, which an outside review falsified this test
+  // for. `costMs * 10` sits in the outer `max`, so on a workspace that is expensive to measure it set
+  // the interval alone and the overshoot went back to being a function of the DISK: MEASURED with the
+  // headroom held at 50 MiB and only the file count varied, 1.20x at 0 files, 18.54x at 10,000,
+  // 23.98x at 50,000. Every assertion above passes `cap` as both headroom and limit - a FULL budget,
+  // the one shape where the self-limit is the right answer - so none of them could see it.
+  const { _CAP_NEAR_FRAC: NEAR, _CAP_COST_MULT: MULT } = kern;
+  const walk = 14.35;
+  const plenty = next(cap, 0, walk, cap);
+  assert.strictEqual(plenty, walk * MULT, `with room to spare, 10x: ${plenty}`);
+  const close = next(Math.floor(cap * 0.1), 0, walk, cap);
+  assert.strictEqual(close, walk, `in the last quarter the multiplier is 1: ${close}`);
+  assert.ok(close < plenty / 5, "yielding must buy most of the order of magnitude back");
+  assert.strictEqual(next(Math.floor(cap * NEAR) - 1, 0, walk, cap), walk);
+  assert.strictEqual(next(Math.floor(cap * NEAR) + 1, 0, walk, cap), walk * MULT);
+  // A limit of zero must not yield or divide: the timer is not armed then.
+  assert.strictEqual(next(cap, 0, walk, 0), walk * MULT);
 
   // POSITIVE CONTROL on the claim itself: the OLD policy, inlined, is where those numbers came from.
   const oldPolicy = (headroom, rate, costMs) => Math.max(CEIL, costMs * 10);
@@ -4186,4 +4204,50 @@ test("a mode-0 file is refused as a file and as ours", () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("every pathRefusal call site hands over the path", () => {
+  // An outside review found `readFile` naming a mode-0 FILE as "a directory on that path". The same
+  // message was reachable through `writeFile`, `restore` and the snapshot/restore open, because none
+  // of those call sites handed over the path. Asserting one fixed site would not stop the next one, so
+  // this reads the module's own source and counts the arguments.
+  //
+  // THE ONE EXEMPTION IS NAMED: `helperRefusal` turns a helper box's exit code into a refusal and
+  // FABRICATES the Error to do it, so there is no path on disk for `access(2)` to ask about.
+  const src = fs.readFileSync(require.resolve("../index.js"), "utf8");
+  const bare = [];
+  const lines = src.split("\n");
+  lines.forEach((line, i) => {
+    if (!/\bpathRefusal\(/.test(line)) return;
+    if (/^function pathRefusal\(/.test(line.trim())) return; // the definition
+    if (/new Error\("ELOOP"\)/.test(line)) return; // the fabricated one, named above
+    // Four commas at the top level means five arguments: verb, rel, err, writing, full.
+    let depth = 0;
+    let commas = 0;
+    const call = line.slice(line.indexOf("pathRefusal(") + "pathRefusal(".length);
+    for (const ch of call) {
+      if (ch === "(" || ch === "[" || ch === "{") depth++;
+      else if (ch === ")" && depth === 0) break;
+      else if (ch === ")" || ch === "]" || ch === "}") depth--;
+      else if (ch === "," && depth === 0) commas++;
+    }
+    if (commas < 4) bare.push(i + 1);
+  });
+  assert.deepStrictEqual(
+    bare,
+    [],
+    `pathRefusal call(s) with no path cannot name their subject and will say "a directory on that ` +
+      `path" for a mode-0 file: line(s) ${bare.join(", ")}`,
+  );
+  // The assertion must be capable of failing: a four-argument call is what it is looking for.
+  const probe = 'throw pathRefusal("read", rel, e, false);';
+  let d = 0;
+  let c = 0;
+  for (const ch of probe.slice(probe.indexOf("pathRefusal(") + 12)) {
+    if ("([{".includes(ch)) d++;
+    else if (ch === ")" && d === 0) break;
+    else if (")]}".includes(ch)) d--;
+    else if (ch === "," && d === 0) c++;
+  }
+  assert.strictEqual(c, 3, "the counter must see three commas in a four-argument call");
 });
