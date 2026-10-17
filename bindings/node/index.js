@@ -113,6 +113,14 @@ const CAP_COST_MULT = 10;
  * this policy. Yielding does not make the bound a function of the cap again: an interval can never be
  * shorter than one walk, so on a large tree the floor is still `walk cost x write rate`, and only a
  * measurement that is not O(files) closes that. Mirrors Python's `_CAP_NEAR_FRAC`. */
+/** How many of the biggest regular files the cheap probe re-checks. ONE was not enough and a second
+ * review round said so: a box growing several OTHER files was invisible to the probe until the next
+ * full walk. Eight `stat` calls are ~10 us against a 15 ms walk on a 10,000-file tree.
+ *
+ * ⛔ It does not close the class, it moves the line: a box inflating ten thousand small files is still
+ * only caught by the full walk, which is the backstop. Mirrors Python's `_CAP_WATCH_K`. */
+const CAP_WATCH_K = 8;
+
 const CAP_NEAR_FRAC = 0.25;
 
 /**
@@ -306,7 +314,7 @@ function workspaceUsage(root, blind = null, regranted = null, biggest = null) {
   // tree WITHOUT walking it again. A write does not move a directory's mtime; creating or removing an
   // entry does, so one `stat` per DIRECTORY spots a file never seen before for 1 syscall on a flat
   // workspace instead of 10,000. Free here - the walk already holds every `st`. Mirrors Python.
-  let top = [null, -1];
+  const top = [];
   const dirs = new Map();
   const retried = new Set();
   const stack = [root];
@@ -369,7 +377,8 @@ function workspaceUsage(root, blind = null, regranted = null, biggest = null) {
     }
     if (biggest) {
       try {
-        dirs.set(current, fs.statSync(current, { bigint: true }).mtimeNs.toString());
+        const d = fs.statSync(current, { bigint: true });
+        dirs.set(current, `${d.mtimeNs}:${d.size}:${d.nlink}`);
       } catch {
         /* it raced us; the next full walk takes it */
       }
@@ -381,7 +390,17 @@ function workspaceUsage(root, blind = null, regranted = null, biggest = null) {
       seen.add(key);
       const chunk = (st.blocks || 0) * 512;
       total += chunk;
-      if (biggest && st.isFile() && chunk > top[1]) top = [full, chunk];
+        if (biggest && st.isFile()) {
+          // The K biggest, descending. The sort only runs for a file that QUALIFIES, so a tree of
+          // equal-sized files pays for it exactly K times.
+          if (top.length < CAP_WATCH_K) {
+            top.push([full, chunk]);
+            top.sort((a, b) => b[1] - a[1]);
+          } else if (chunk > top[top.length - 1][1]) {
+            top[top.length - 1] = [full, chunk];
+            top.sort((a, b) => b[1] - a[1]);
+          }
+        }
     }
   }
   if (biggest) {
@@ -5019,7 +5038,7 @@ class Sandbox {
       // walk, because the first in-call walk is the one that arrives too late. Mirrors Python.
       let capTotal = capUsed0;
       let capCost = capCost0;
-      let capWatch = capSeed.length && capSeed[0][0] !== null ? capSeed[0] : null;
+      let capWatch = capSeed.length ? [...capSeed[0]] : [];
       let capDirs = capSeed.length > 1 ? new Map(capSeed[1]) : new Map();
       let capNextFull =
         Number(process.hrtime.bigint() / 1000000n) + Math.max(CAP_POLL_MIN_MS, capCost0 * CAP_COST_MULT);
@@ -5039,9 +5058,10 @@ class Sandbox {
           let est = null;
           if (nowMs < capNextFull) {
             let fresh = false;
-            for (const [d, mt] of capDirs) {
+            for (const [d, sig] of capDirs) {
               try {
-                if (fs.statSync(d, { bigint: true }).mtimeNs.toString() !== mt) {
+                const ds = fs.statSync(d, { bigint: true });
+                if (`${ds.mtimeNs}:${ds.size}:${ds.nlink}` !== sig) {
                   fresh = true;
                   break;
                 }
@@ -5050,13 +5070,18 @@ class Sandbox {
                 break;
               }
             }
-            if (!fresh && capWatch !== null) {
-              try {
-                const st = fs.lstatSync(capWatch[0]);
-                est = capTotal - capWatch[1] + (st.blocks || 0) * 512;
-              } catch {
-                capWatch = null; // gone: wait for the walk rather than guess
+            if (!fresh && capWatch.length) {
+              let delta = 0;
+              let whole = true;
+              for (const [p, was] of capWatch) {
+                try {
+                  delta += (fs.lstatSync(p).blocks || 0) * 512 - was;
+                } catch {
+                  whole = false; // one is gone: the walk decides, not an estimate
+                  break;
+                }
               }
+              if (whole) est = capTotal + delta;
             }
           }
           // ⛔ THE PROBE TRIGGERS, THE WALK DECIDES. The estimate carries a total as old as the last
@@ -5096,7 +5121,7 @@ class Sandbox {
           const now = process.hrtime.bigint();
           capTotal = used;
           capCost = tookMs;
-          capWatch = top.length && top[0][0] !== null ? top[0] : null;
+          capWatch = top.length ? [...top[0]] : [];
           capDirs = top.length > 1 ? new Map(top[1]) : new Map();
           capNextFull = Number(now / 1000000n) + Math.max(CAP_POLL_MIN_MS, capCost * CAP_COST_MULT);
           const [prevT, prevUsed] = capPrev;

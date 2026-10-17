@@ -138,11 +138,18 @@ def _workspace_usage(
     unreadable: "list[str]" = []
     # The biggest REGULAR file, for a caller that wants to re-check the one entry most likely to be
     # growing without walking the tree again. Free here: the walk already has every `st`.
-    top: "tuple[str | None, int]" = (None, -1)
-    # And every directory's own mtime. A write does not change it; CREATING or removing an entry does,
-    # which is how a caller spots a file it has never seen for the price of one `stat` per DIRECTORY
-    # instead of one per file. That is the difference between 1 stat and 10,000 on a flat workspace.
-    dirs: "dict[str, int]" = {}
+    top: "list[tuple[str, int]]" = []
+    # And every directory's FINGERPRINT: mtime, size and link count, all three from the one `stat` the
+    # probe already pays for. A write does not change any of them; CREATING or removing an entry moves
+    # the mtime, and on the filesystems that grow a directory it moves the size too.
+    #
+    # ⛔ THREE FIELDS AND NOT JUST THE MTIME, because mtime alone can miss a create and a second review
+    # round named the mounts where it does: `lazytime` defers the visible timestamp, and a coarse
+    # filesystem (FAT, some network mounts, 1-2 second ticks) leaves two creates inside one tick
+    # indistinguishable. Size and nlink are independent of the clock, so a create that the timestamp
+    # hides can still be caught. It does not CLOSE that class - a coarse mount with a fixed-size
+    # directory can still hide one - and the full walk remains the backstop for it.
+    dirs: "dict[str, tuple[int, int, int]]" = {}
     try:
         base_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError as e:
@@ -234,7 +241,8 @@ def _workspace_usage(
                     continue
                 if biggest is not None:
                     try:
-                        dirs[current] = os.fstat(fd).st_mtime_ns
+                        dst = os.fstat(fd)
+                        dirs[current] = (dst.st_mtime_ns, dst.st_size, dst.st_nlink)
                     except OSError:
                         pass  # it raced us; the next full walk takes it
                 subdirs = []
@@ -249,8 +257,15 @@ def _workspace_usage(
                     seen.add(key)
                     chunk = getattr(st, "st_blocks", 0) * 512
                     total += chunk
-                    if biggest is not None and stat.S_ISREG(st.st_mode) and chunk > top[1]:
-                        top = (os.path.join(current, name), chunk)
+                    if biggest is not None and stat.S_ISREG(st.st_mode):
+                        # The K biggest, kept in descending order. The sort only runs for a file that
+                        # QUALIFIES, so a tree of equal-sized files pays for it exactly K times.
+                        if len(top) < _CAP_WATCH_K:
+                            top.append((os.path.join(current, name), chunk))
+                            top.sort(key=lambda t: -t[1])
+                        elif chunk > top[-1][1]:
+                            top[-1] = (os.path.join(current, name), chunk)
+                            top.sort(key=lambda t: -t[1])
                 if subdirs:
                     if fd != base_fd:
                         stack.append((None, fd))
@@ -265,7 +280,7 @@ def _workspace_usage(
                 os.close(fd)
         os.close(base_fd)
     if biggest is not None:
-        biggest[:] = [top if top[0] is not None else (None, -1), dirs]
+        biggest[:] = [top, dirs]
     if unreadable:
         if blind is None:
             raise SandboxError(
@@ -2917,6 +2932,15 @@ _CAP_HEADROOM_FRAC = 0.5
 #: cannot spend more of the call than the workload does.
 _CAP_COST_MULT = 10.0
 
+#: How many of the biggest regular files the cheap probe re-checks. ONE was not enough and a second
+#: review round said so: the probe watched the single biggest file, so a box growing several OTHER
+#: files was invisible to it until the next full walk. Eight `stat` calls are ~10 us against a walk
+#: that costs 15 ms on a 10,000-file tree, so the K is bounded by taste rather than by cost.
+#:
+#: ⛔ IT DOES NOT CLOSE THE CLASS, it moves the line. A box inflating ten thousand small files is
+#: still only caught by the full walk, which is the backstop and is no weaker than what came before.
+_CAP_WATCH_K = 8
+
 #: Below this fraction of the cap still unspent, the self-limit YIELDS to the cap and the multiplier
 #: drops to 1 - one walk per walk's duration, a 50% duty cycle, for as long as the box is inside the
 #: last quarter of its budget.
@@ -5459,10 +5483,10 @@ class Sandbox:
             # has nothing to re-check until the first in-call walk, and that walk is the one that
             # arrives too late: instrumented, there was exactly ONE look per call, at 191 ms, having
             # already measured 20x the headroom.
-            cap_watch: "tuple[str, int] | None" = (
-                cap_seed[0] if cap_seed and cap_seed[0][0] is not None else None
+            cap_watch: "list[tuple[str, int]]" = list(cap_seed[0]) if cap_seed else []
+            cap_dirs: "dict[str, tuple[int, int, int]]" = (
+                dict(cap_seed[1]) if len(cap_seed) > 1 else {}
             )
-            cap_dirs: "dict[str, int]" = dict(cap_seed[1]) if len(cap_seed) > 1 else {}
             cap_next_full = time.monotonic() + max(_CAP_POLL_MIN_S, cap_cost0 * _CAP_COST_MULT)
 
             def _cap_tick() -> "float | None":
@@ -5479,20 +5503,26 @@ class Sandbox:
                     # per DIRECTORY says "something arrived" for the price of 1 syscall on a flat
                     # workspace instead of 10,000. MEASURED: 12 us against a 3.62 ms walk, 314x.
                     fresh = False
-                    for d, mt in cap_dirs.items():
+                    for d, sig in cap_dirs.items():
                         try:
-                            if os.stat(d).st_mtime_ns != mt:
+                            dst = os.stat(d)
+                            if (dst.st_mtime_ns, dst.st_size, dst.st_nlink) != sig:
                                 fresh = True
                                 break
                         except OSError:
                             fresh = True  # gone or closed: the walk decides
                             break
-                    if not fresh and cap_watch is not None:
-                        try:
-                            st = os.stat(cap_watch[0], follow_symlinks=False)
-                            est = cap_total - cap_watch[1] + getattr(st, "st_blocks", 0) * 512
-                        except OSError:
-                            cap_watch = None  # gone: wait for the walk rather than guess
+                    if not fresh and cap_watch:
+                        delta = 0
+                        for path_w, was in cap_watch:
+                            try:
+                                now_b = os.stat(path_w, follow_symlinks=False)
+                            except OSError:
+                                delta = None  # one is gone: the walk decides, not an estimate
+                                break
+                            delta += getattr(now_b, "st_blocks", 0) * 512 - was
+                        if delta is not None:
+                            est = cap_total + delta
                 # ⛔ THE PROBE TRIGGERS, THE WALK DECIDES. The estimate carries a total that is as old
                 # as the last walk, so a box that DELETED a large file and kept writing would look
                 # over the cap while being under it - and a false `workspace_full` on a healthy box is
@@ -5514,7 +5544,7 @@ class Sandbox:
                         return max(_CAP_POLL_S, (time.monotonic() - t0) * 10.0)
                     now = time.monotonic()
                     cap_total, cap_cost = used, now - t0
-                    cap_watch = top[0] if top and top[0][0] is not None else None
+                    cap_watch = list(top[0]) if top else []
                     cap_dirs = dict(top[1]) if len(top) > 1 else {}
                     cap_next_full = now + max(_CAP_POLL_MIN_S, cap_cost * _CAP_COST_MULT)
                 else:

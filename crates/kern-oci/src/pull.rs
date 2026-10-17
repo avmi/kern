@@ -812,10 +812,25 @@ fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
     // or a truncated response, and it is one the reader can act on, because the text is in front of
     // them. Codes are uppercased for comparison because the spec's are uppercase and registries have
     // been seen lowercasing them.
-    let codes: Vec<String> = all_str_values(manifest, "code")
-        .into_iter()
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
+    // ⛔ AND THE HUNT IS RESTRICTED TO `errors[]`, not run over the whole document. A second review
+    // round caught this: `all_str_values(manifest, "code")` finds the key ANYWHERE, so a body that
+    // embeds `"code":"DENIED"` in some unrelated object - an annotation, a nested policy, a vendor
+    // extension - still took the auth arm, which is the same defect one level down from the substring
+    // scan it replaced. The spec puts the cause in `errors[].code` and nowhere else, so the array is
+    // located first and each of its objects is read on its own.
+    //
+    // No `errors` array means no declared cause, and `codes` is then empty: every `declared(...)` test
+    // answers false and the last arm quotes what arrived, which is the honest end for a document that
+    // is not an error document.
+    let codes: Vec<String> = array_after(manifest, "errors")
+        .map(|arr| {
+            split_objects(arr)
+                .into_iter()
+                .filter_map(|o| first_str(o, "code"))
+                .map(|c| c.to_ascii_uppercase())
+                .collect()
+        })
+        .unwrap_or_default();
     let declared = |want: &str| codes.iter().any(|c| c == want);
 
     // RATE LIMIT first, because it is the one a working setup hits and the one the old wording sent
@@ -3965,6 +3980,20 @@ mod tests {
         // it, and these are the shapes that produce it. A proxy's HTML, a `message` that quotes a
         // policy, a repository whose NAME carries the word - none of them is the registry saying
         // "unauthorized", and `errors[].code` is the field that would have.
+        // A SECOND ROUND CAUGHT THE HUNT ITSELF: `code` found ANYWHERE in the document was enough, so
+        // a body that carries the key in an unrelated object took the auth arm - the same defect one
+        // level below the substring scan. The cause lives in `errors[].code` and nowhere else.
+        for elsewhere in [
+            "{\"annotations\":{\"code\":\"DENIED\"},\"schemaVersion\":2}",
+            "{\"policy\":[{\"code\":\"UNAUTHORIZED\",\"note\":\"vendor extension\"}]}",
+            "{\"config\":{\"Labels\":{\"code\":\"denied\"}}}",
+        ] {
+            let e = manifest_error(elsewhere, "ghcr.io", "org/app").to_string();
+            assert!(
+                !e.contains("it may be private"),
+                "a `code` outside `errors[]` is not the registry declaring a cause: {e}"
+            );
+        }
         for innocent in [
             "<html><body>403 Forbidden: access denied by policy</body></html>",
             "{\"schemaVersion\":2,\"annotations\":{\"note\":\"unauthorized use prohibited\"}}",

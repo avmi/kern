@@ -996,6 +996,22 @@ pub fn inside_user_manager_tree() -> bool {
     // `cgroup_procs_writable` and not [`placement_into_is_permitted`] only to avoid reading
     // `/proc/self/cgroup` a second time: the root this found is an ANCESTOR of `cur` by construction,
     // so `common_cgroup_ancestor(cur, root)` is `root` itself and the two calls are the same question.
+    //
+    // ⛔ `access(2)` AND `write(2)` CAN DISAGREE IN THIS SUBSYSTEM, and an outside review was right to
+    // ask whether that breaks this. MEASURED here: a cgroup with a child and controllers in its
+    // `subtree_control` answers `access(W_OK)` YES on its own `cgroup.procs` and REFUSES the write -
+    // cgroup v2's "no internal processes" rule - while the same write into a childless leaf succeeds.
+    // The divergence is real and reproducible.
+    //
+    // It does not reach this predicate, and the reason is which file each rule is about. On the common
+    // ANCESTOR the kernel checks a PERMISSION, which is what `access` answers, and no pid is ever
+    // written there. The pid goes into the box's own leaf, which kern creates and which has no
+    // children, so the structural rule cannot fire on it - that is the arm that succeeded in the
+    // measurement. What remains is the gap between the REAL uid `access` uses and the credentials the
+    // kernel checks at write time, which needs a caller that has dropped its effective uid; kern is
+    // not setuid, and `as_root` branches on the real uid for the same reason. A failed placement is
+    // reported as `Unbounded` and warned about when the box carries explicit caps, so what is left of
+    // this is visible rather than silent.
     inside_user_manager_tree_at(&cur)
 }
 
