@@ -13,7 +13,15 @@ on:
     # main and the runner's host shape is the one thing a local gate cannot reproduce (no
     # `cgroup.procs` to write, the musl and gnu lints, the arm64 cross build). Remove this line in
     # the push that merges it.
-    branches: [main, dev]
+    #
+    # `fieldbugs2_2026-10-15_1125` carries the seven field-reported defects of v0.32.0 and
+    # kern-sandbox 0.2.48, and it is here because MEASURED: the branch was pushed with every local
+    # gate green and the GitHub API reported 0 workflow runs against it, so nothing had tested it.
+    # The runner's host shape is also the half this work most needs checked - the exec fix turns on
+    # whether `cgroup.procs` is writable where the runner cannot write it, and the SDK fix turns on
+    # what a walk of a large workspace costs on a disk nobody here has. Remove this line in the push
+    # that merges it.
+    branches: [main, dev, fieldbugs2_2026-10-15_1125]
   pull_request:
   workflow_dispatch: {}
 
