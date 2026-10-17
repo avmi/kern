@@ -36,7 +36,7 @@ jobs:
       - name: clippy
         # `-D warnings` TWICE ON PURPOSE. The job sets `RUSTFLAGS: -D warnings` twenty lines above,
         # and that IS what makes a clippy lint fatal here: measured, a planted `env::set_var` exits
-        # 101 with it and 0 without. But an independent test read this line on its own, ran it
+        # 101 with it and 0 without. But a later pass read this line on its own, ran it
         # without the job's environment, saw a warning and exit 0, and reported the perimeter as
         # unenforced. He was wrong about this repository and right about the shape: a rule whose
         # teeth are in a variable declared elsewhere is one `env:` edit away from being decoration,
@@ -65,7 +65,7 @@ jobs:
         # AND A SKIP HERE IS INVISIBLE, which is why the suite is told to REQUIRE its fixtures on this
         # runner. `cargo test` hides the stderr of a test that passes, so a file whose fixtures are
         # missing skips most of itself and still reports 133/133, and nobody reads a log to find out.
-        # An independent test measured exactly that on his own machine: 96 of 133 skipped for a
+        # A later pass measured exactly that on his own machine: 96 of 133 skipped for a
         # missing busybox, green. MEASURED here rather than assumed: this runner ships
         # `busybox-static` (the webstack job's apt output says it REMOVES it to install `busybox`), so
         # `/bin/busybox` is present and this variable asserts a property that already holds. The day a
@@ -76,7 +76,7 @@ jobs:
         # The two prose gates. They existed before this step and ran only when someone remembered
         # them, which is the same as not running: the three figures that drifted over the launch
         # weekend (3.6 vs 3.4 ms, five vs nine ENOSYS syscalls, ~186 vs 154-160 MB) were all caught
-        # by hand or, in one case, by an outside independent test repeating our own wrong number back to us.
+        # by hand or, in one case, by a later pass repeating our own wrong number back to us.
         # Pure stdlib Python, both under a second, both at zero on the corpus when this was added.
         run: |
           python3 scripts/no-ai-slop.py
@@ -98,7 +98,7 @@ jobs:
           # AND THE BLOCKS THEMSELVES, because a reader pastes them. The LangChain block used
           # `create_agent(model, ...)` with neither name imported nor assigned, under an install
           # line that pulls `langchain-core` only, so the import would not have existed either. An
-          # external reviewer found it by pasting all thirteen, which is what a launch audience
+          # later passer found it by pasting all thirteen, which is what a launch audience
           # does and what nobody here had done. Static (undefined names, in reading order with an
           # accumulating scope) so it needs no binary, no network and no image pull: milliseconds.
           python3 scripts/readme-blocks-complete.py
@@ -125,7 +125,7 @@ jobs:
           # that writes XDG_DATA_HOME moves every sibling's volumes_dir() while its body runs. The
           # RULE is enforced at runtime, by an assertion inside crate::global_env/set_global_env: it
           # found 27 such tests where a static version of the same rule found 3, and an external
-          # independent test walked through that static version eight times out of eight. This gate only
+          # later pass walked through that static version eight times out of eight. This gate only
           # checks that nothing goes around the chokepoints, which is a per-line question.
           python3 scripts/test-env-lock.py
           python3 scripts/progress-is-tty-gated.py
@@ -265,7 +265,7 @@ jobs:
     # Until this job existed, `integrations/pi` appeared in NO workflow. Its three suites and 187
     # assertions ran only when somebody remembered to, which is how `grep` shipped broken in 0.1.1:
     # it was built against the guest workspace while pi's bundled ripgrep runs on the host, so it
-    # failed on every call and every host, and nothing was watching. An external audit of the
+    # failed on every call and every host, and nothing was watching. A later pass of the
     # published package did not find it either, because it read the README's table for where each
     # tool runs instead of calling one.
     #

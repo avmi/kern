@@ -199,7 +199,7 @@ def _render(result: ExecutionResult, limit: int) -> str:
             blocks.append("[an image was produced; it cannot be shown in a text result]")
 
     # `code_stderr`, NOT `stderr`: kern and the workload share one stderr, so the raw field carries
-    # kern's own `note:`/`warning:` lines about overlayfs or an undelegated cgroup. An external audit
+    # kern's own `note:`/`warning:` lines about overlayfs or an undelegated cgroup. A later pass
     # found them inside this tool's result, where they spend the model's context on the runtime's
     # housekeeping and can be misread as the program's own errors. The operator still sees them on
     # `result.stderr`; the model reads what the code wrote.
@@ -819,7 +819,7 @@ def kern_execution_policy(**kwargs):
 # `max_output_bytes` and friends are inherited from langchain's own policy base: renaming them would
 # stop this being a drop-in peer of `DockerExecutionPolicy`, which is the entire point of the class.
 # `Sandbox` spells the same ideas `timeout_s` and `memory_mb`, because that is this package's own
-# surface. An external audit hit the seam the obvious way, passing `timeout_s=` and getting
+# surface. A later pass hit the seam the obvious way, passing `timeout_s=` and getting
 # `TypeError: unexpected keyword argument`.
 #
 # So both spellings are accepted and the dataclass keeps langchain's names. The alias is translated,
@@ -875,7 +875,7 @@ _SANDBOX_ALIASES = {
     # `bool(v)` with NO `None` passthrough, unlike `memory_mb` and `pids` above. On those, `None`
     # means "uncapped" on BOTH sides and is a value a caller writes on purpose. `Sandbox.network` is
     # `bool = False`: `None` is not one of its values, so passing it through would set a field declared
-    # `bool` to `None`. An independent test flagged this as the same class as the `cap_drop` bug and ranked it
+    # `bool` to `None`. A later pass flagged this as the same class as the `cap_drop` bug and ranked it
     # first, on the assumption that langchain's `network_enabled` might default to True. Measured, it
     # does not: the field is ours, defaults False, and is read as `"host" if network_enabled else
     # "none"`, so `None` was falsy and produced `--net none`. The defect was a type lie, not an open

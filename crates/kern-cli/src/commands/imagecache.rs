@@ -163,7 +163,7 @@ pub(crate) fn resolve_image_command(
 /// The sidecar's FORMAT version, stamped on write and required on read.
 ///
 /// WHY IT EXISTS, measured. `StartInterval` was added to the parser and to this sidecar on 14/09, and
-/// an independent test found the fix reaching a freshly pulled image and NOT an image already in the
+/// a later pass found the fix reaching a freshly pulled image and NOT an image already in the
 /// cache: same binary, same digest, 302 s against 6 s, the only difference being a sidecar written by
 /// a kern that did not know the field. A missing line is indistinguishable from an image that declares
 /// nothing, so the absence cannot be repaired by reading it harder. `kern compose pull` does not help
@@ -176,7 +176,7 @@ pub(crate) fn resolve_image_command(
 /// sent it down the repair path - and that path clears the image dir first. An image whose layers
 /// hold subuid-owned files (postgres, mysql, redis, nginx) cannot have that directory removed by the
 /// user that pulled it: `remove_dir_all` returns EPERM, and the entry was then unusable until
-/// `--pull always`. Measured by an independent test on a 66-image, 22 GB cache. The rootfs was never
+/// `--pull always`. Measured by a later pass on a 66-image, 22 GB cache. The rootfs was never
 /// the stale part.
 pub(crate) const IMAGE_CFG_FMT: u32 = 2;
 
@@ -280,7 +280,7 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
             // ⛔ EVERY KEY `write_image_config` WRITES MUST BE LISTED HERE. `hcstartint` was written
             // and not listed, so it fell through to `_ => {}` and the inner arm that parses it was
             // unreachable: a cached image's `StartInterval` was read back as absent while the same
-            // image pulled fresh honoured it. Measured by an independent test as 300 s against 6 s with an
+            // image pulled fresh honoured it. Measured by a later pass as 300 s against 6 s with an
             // IDENTICAL sidecar on disk, which is what pointed at the reader instead of the writer.
             "hcinterval" | "hctimeout" | "hcstart" | "hcstartint" | "hcretries" => {
                 // A number line WITHOUT a `hctest` line describes a check that has no command, which
@@ -666,7 +666,7 @@ pub(crate) fn sweep_retired_images() -> usize {
 ///
 /// WHAT MAKES ONE. The cache key is `sanitize_ref(<ref>)`, and that function has changed: an entry
 /// written by an older kern sits under a key today's kern never computes, so nothing resolves it,
-/// nothing refreshes it and no sweep collects it. MEASURED by an independent test: `alpine` under
+/// nothing refreshes it and no sweep collects it. MEASURED by a later pass: `alpine` under
 /// two keys, one from July and one from September, listed by `kern images` as two `alpine:latest`
 /// (56 days ago beside 4 hours ago) with only the second reachable.
 ///
@@ -1584,7 +1584,7 @@ pub(crate) fn pull_to_cache(
         // that kern is re-fetching to repair it, which is not an expected state and is the thing
         // `pentest/pentest-cache-edge.sh` asserts kern says: gating them on a terminal made a
         // corrupted entry re-fetch in silence under an SDK, which is exactly where nobody is
-        // watching a terminal. Caught by that suite, not by review.
+        // watching a terminal. Caught by that suite, not by a later pass.
         if !sentinel.exists() {
             kern_common::progress!("→ image '{image}' not cached - pulling once (reused after)");
         } else if !rootfs_usable {

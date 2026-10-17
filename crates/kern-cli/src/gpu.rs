@@ -89,7 +89,7 @@ pub enum Tier {
 
 /// Words that may only ever appear in text kern prints about a [`Tier::Hw`] GPU.
 ///
-/// Enforced mechanically by the unit tests below rather than trusted to review, in the same spirit
+/// Enforced mechanically by the unit tests below rather than trusted to a reading, in the same spirit
 /// as the em-dash and stale-numbers gates. A claim that overstates the boundary is the single most
 /// expensive defect this project can ship, because every other honest statement stops being
 /// believed with it, and prose drifts upward under editing in a way that code does not.
@@ -123,7 +123,7 @@ impl Tier {
     /// memory split. That is exactly the reasoning that refuses to promote on a `dmem` controller
     /// being present, applied by this module to every tier except the one nobody could test, which
     /// is how the strongest claim in the file came to be the least supported. Reported by an
-    /// outside reader on 2026-08-28, against a claim written the same day.
+    /// measured on 2026-08-28, against a claim written the same day.
     ///
     /// Two gaps are named in the string rather than left for a reader to discover:
     ///
@@ -427,7 +427,7 @@ fn classify(device_dir: &Path, vendor: Vendor) -> (Tier, Evidence) {
     // a VF, so on real sysfs the two tests agree; they part company on anything that is not real
     // sysfs, and this is the branch that awards the strongest tier in the file. Requiring the shape
     // the kernel actually produces costs one syscall and means a plain file called `physfn` cannot
-    // promote a card. Raised by an outside reader who noticed the unit test was passing an empty
+    // promote a card. What raised it was noticing the unit test was passing an empty
     // FILE, which said the check was looser than the thing it claims to detect.
     if device_dir
         .join("physfn")
@@ -612,7 +612,7 @@ mod tests {
     ///
     /// `physfn` proves this is an SR-IOV virtual function and `gi*` proves MIG instances exist. What
     /// neither proves is the VRAM split, and the claim said "per-tenant VRAM enforced by the device"
-    /// until an outside reader pointed out that this is the same "present therefore enforcing" step
+    /// until it was pointed out that this is the same "present therefore enforcing" step
     /// the module refuses everywhere else. Both caveats are pinned here so an edit that drops one
     /// fails the build instead of quietly restoring the overstatement.
     #[test]

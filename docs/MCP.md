@@ -115,10 +115,13 @@ what accumulates and nothing a single cell does; the SDK now measures the worksp
 runs** and stops the box when it crosses, with a fault that names the cap (`workspace_full`) rather than
 reading as a timeout or an OOM. Three things to know:
 
-- **the overshoot is the interval.** Measurements start one second apart and the next is scheduled at
-  ten times the last one's duration, so a workspace with many files makes the poller back off rather
-  than compete for the disk. At ~810 MB/s, one second can let ~800 MB past the cap, against the tens of
-  gigabytes it replaces;
+- **the overshoot is what the workspace costs to MEASURE**, not a fixed interval. The interval scales
+  to the headroom, and between two walks of the tree a cheap probe re-checks the eight biggest files and
+  every directory's fingerprint, so a workspace with many files is still walked rarely without the cap
+  going blind between walks. An interval can never be shorter than one walk, which is where what gets
+  past it comes from. MEASURED with the headroom held at 50 MiB and only the pre-existing file count
+  varied: 1.26x the cap at 0 files, 1.32x at 1,000, 4.12x at 10,000 and 12.88x at 50,000 (Node pays more
+  per walk: 1.30x, 1.80x, 8.40x, 12.80x). The `workspace_full` fault repeats those figures;
 - **it is still not a kernel boundary**: a measurement and a kill, not a refusal from the filesystem;
 - **a non-root `KERN_MCP_USER` keeps the old behaviour** for any directory the box account closed to the
   host: there is nothing to measure mid-call, so the cap falls back to the between-calls check rather

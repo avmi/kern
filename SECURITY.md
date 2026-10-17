@@ -23,7 +23,13 @@ section is the summary; the rest of this file is the per-mechanism detail behind
   recorded capability/seccomp posture) through any host-path input: `-v`, `--secret`, `--env-file`,
   `--rootfs`, the `kern build` context/`-f` Dockerfile, or `kern cp`/`kern save -o`.
 
-- Resource limits must hold: fork bombs and OOM must be contained.
+- Resource limits must hold WHERE KERN SAYS THEY DO, and kern must not say they do when they do not:
+  on a host that delegates a cgroup, a fork bomb and an OOM must be contained; on one that does not,
+  `kern box` warns and runs uncapped and `--require-limits` (or `KERN_REQUIRE_LIMITS`) makes that
+  fatal. A cap reported as in force while the kernel is not enforcing it is in scope; a host with no
+  delegation, which `kern doctor` names, is not a vulnerability. The workspace cap
+  (`workspace_max_bytes`) is cooperative by construction - a measurement and a kill on a host
+  directory - and its documented overshoot is not a finding either.
 
 - seccomp must block the dangerous syscall set unconditionally.
 

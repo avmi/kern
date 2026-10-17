@@ -12,7 +12,7 @@
         r = sbx.run_code("import pandas as pd; print(pd.read_csv('data.csv').shape)")
         png = sbx.read_file("out.png")
 
-Design, the "middle way" (validated with review):
+Design, the "middle way" (validated against a later pass):
   * FILE state persists between steps via a workspace DIRECTORY on the host, bind-mounted into each
     box. PROCESSES are ephemeral: every run_code()/run() spawns a FRESH box on that shared workspace.
     There is NO resident interpreter - in-memory REPL state (a `x=40` living in globals) does NOT
@@ -21,7 +21,7 @@ Design, the "middle way" (validated with review):
     model kern isn't built for.
   * ONE class (`Sandbox`). `run_code(...)` at module level is literally a throwaway session
     (`with Sandbox() as s: return s.run_code(...)`), so there is a single, tested security code path -
-    not two Sandbox-like surfaces that drift apart. (# DECISION, independent test-ratified.)
+    not two Sandbox-like surfaces that drift apart. (# DECISION, later pass-ratified.)
   * I/O is HOST-DIRECT: the workspace is a host dir and single-uid maps box-root to the host user, so
     files the box creates are host-owned - write_file/read_file are plain host filesystem I/O, no
     `kern cp`, no in-box shim. A non-root `user=` (or image `USER`) is a uid of kern's range instead:
@@ -78,7 +78,7 @@ __version__ = "0.2.48"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
-# building+hosting our own (independent test-ratified FLAG 4). Ship a datascience default when demand justifies.
+# building+hosting our own (later pass-ratified FLAG 4). Ship a datascience default when demand justifies.
 _DEFAULT_IMAGE = "python:3.12-slim"
 
 # WHAT THE DEFAULT IMAGE CONTAINS, as a fact ABOUT THE IMAGE and not about its name.
@@ -143,7 +143,7 @@ def _workspace_usage(
     # probe already pays for. A write does not change any of them; CREATING or removing an entry moves
     # the mtime, and on the filesystems that grow a directory it moves the size too.
     #
-    # ⛔ THREE FIELDS, AND WHAT EACH ONE ACTUALLY CATCHES IS MEASURED, not assumed. A second review
+    # ⛔ THREE FIELDS, AND WHAT EACH ONE ACTUALLY CATCHES IS MEASURED, not assumed. A later pass
     # round pointed out that an earlier version of this comment claimed more than the fields deliver,
     # so they were measured on ext4 here:
     #
@@ -716,7 +716,7 @@ def _pinned_within(fd: int, inside: str) -> bool:
     WHY: three of the repair's callers pass a plain PATH, where `O_NOFOLLOW` guards only the LAST
     component - the usage walk is by path throughout, and two walks fall back to the root path after a
     descent has already failed. A box that swaps an intermediate component for a symlink in that
-    window sends the pin somewhere else, and an adversarial review of the first fix showed the `chmod`
+    window sends the pin somewhere else, and an adversarial pass of the first fix showed the `chmod`
     could then land on a directory of this user's OUTSIDE the workspace. It is not an escalation (the
     bits are ones this user could already set on a file it already owns), but the comment above
     claimed the change stays inside the workspace tree, and this is what makes that true rather than
@@ -2339,7 +2339,7 @@ _REFUSED_MOUNT_SOURCES = {
 #
 # NO ESCAPE HATCH, the same as `/etc`: what a job legitimately needs is ONE credential, and the way to
 # give it one is to write that file into the workspace (or mount a directory holding only it), which is
-# also the only shape an independent test can check.
+# also the only shape a later pass can check.
 #
 # THE LIST WAS SHORT OF THE PROMISE ABOVE IT, and the asymmetry is what gave it away: AWS refused,
 # Azure refused, GCP accepted. MEASURED against the published 0.2.27 with each directory CREATED
@@ -2504,7 +2504,7 @@ _KERN_DIAGNOSTICS = ("kern: security-profile=", "kern: warning:", "kern: note:")
 # (`error: pull:`, `error: box:`, `error: config:` ...). Every one of them was added after a caller
 # measured a call that came back `fault=None`, because a whitelist of openings is an attempt to
 # enumerate the error TEXTS of a binary that has hundreds of them behind a single printer, and it can
-# never be closed. An independent test closed the argument in one command: `image=""` prints
+# never be closed. A later pass closed the argument in one command: `image=""` prints
 # `error: bad image reference: empty`, which is not in any of the eleven, so a box that never existed
 # came back indistinguishable from a script that exited 1.
 _KERN_SPEAKING = ("error: ", "kern:")
@@ -2853,7 +2853,7 @@ class ExecutionResult:
         :attr:`runtime_notes`: it cannot use the trick to inject text into this field, only to remove
         its own from it.
 
-        THE OTHER DIRECTION, which the sentence above does not cover and an independent test named: the split
+        THE OTHER DIRECTION, which the sentence above does not cover and a later pass named: the split
         works on lines, so it holds only for LINE-ALIGNED output. A workload that writes a partial line
         with no trailing newline, and is then interleaved with a `kern: warning:` on the shared stderr,
         produces ONE line that begins with the workload's text. That line does not match a prefix, so
@@ -2942,7 +2942,7 @@ _CAP_HEADROOM_FRAC = 0.5
 _CAP_COST_MULT = 10.0
 
 #: How many of the biggest regular files the cheap probe re-checks. ONE was not enough and a second
-#: review round said so: the probe watched the single biggest file, so a box growing several OTHER
+#: later pass said so: the probe watched the single biggest file, so a box growing several OTHER
 #: files was invisible to it until the next full walk. Eight `stat` calls are ~10 us against a walk
 #: that costs 15 ms on a 10,000-file tree, so the K is bounded by taste rather than by cost.
 #:
@@ -2955,7 +2955,7 @@ _CAP_WATCH_K = 8
 #: last quarter of its budget.
 #:
 #: ⛔ BECAUSE THE SELF-LIMIT WAS SILENTLY THE BOUND, AND IT IS A FUNCTION OF THE DISK. An outside
-#: review falsified the claim that the overshoot is bounded by the cap, and the measurement agreed:
+#: a later pass falsified the claim that the overshoot is bounded by the cap, and the measurement agreed:
 #: with the headroom held at 50 MiB and only the file COUNT varied, `cost * 10` takes over from the
 #: headroom arithmetic at about a thousand files and then sets the interval alone -
 #:
@@ -3150,7 +3150,7 @@ class _CappedReader(threading.Thread):
     because it must never kill the drain: the box would then block on a full pipe and hang. REPORTED,
     because it used to be swallowed in silence, so a caller whose callback raised on its first line
     got a run that succeeded, output that looked complete, and no indication their code never ran.
-    An outside review found exactly that. One `warnings.warn` per reader, not per chunk, so a
+    Exactly that was found. One `warnings.warn` per reader, not per chunk, so a
     callback that raises on every line says it once."""
 
     def __init__(self, pipe, cap: int, on_data=None) -> None:
@@ -3394,8 +3394,8 @@ _BOX_ESSENTIAL_MOUNTS = ("/", "/proc", "/sys", "/dev")
 # REFUSED ANYWHERE INSIDE, TOO. `/proc` and `/sys` are kernel interfaces whose individual entries are
 # read by the box, by its runtime and by kern itself; a bind over one of them shadows a fact rather
 # than adding a file. The exact-match check that shipped before let every one of these through:
-# `/proc` was refused and `/proc/self`, `/proc/1/environ` and `/sys/fs/cgroup` were accepted. Found in
-# review, with the command that shows it.
+# `/proc` was refused and `/proc/self`, `/proc/1/environ` and `/sys/fs/cgroup` were accepted. Found by
+# a later pass, with the command that shows it.
 #
 # `/dev` IS NOT IN THIS SET, and that is not an oversight. `/dev/shm` is the one lever this SDK has on
 # shared memory - kern refuses `--tmpfs /dev/shm`, so a bind is the only way - and it is documented,
@@ -3441,7 +3441,7 @@ def _kern_state_dirs() -> "dict[str, str]":
 
     EACH DIRECTORY IS LISTED TWICE: where the environment says it is, AND where XDG says it is by
     default. The runtime dir was already spelled both ways; the other three were not, and an external
-    independent test measured the consequence in one process: with `XDG_DATA_HOME=/tmp/xdh2`, the path
+    later pass measured the consequence in one process: with `XDG_DATA_HOME=/tmp/xdh2`, the path
     `~/.local/share/kern` was ACCEPTED and still held `builds` and `volumes`. The variable answers
     "which kern will this SDK spawn", which is the right input for the guard, but the data a previous
     run left on disk does not move when the variable does.
@@ -3459,7 +3459,7 @@ def _kern_state_dirs() -> "dict[str, str]":
          "kern's image cache (a box that writes it poisons the rootfs a later box runs)"),
         (os.environ.get("XDG_CONFIG_HOME"), os.path.join(home, ".config"),
          "kern's configuration (the profiles a later box may be given)"),
-        # THE THIRD SIBLING, and the one the list missed. Found by an independent test who took the
+        # THE THIRD SIBLING, and the one the list missed. Found by a later pass who took the
         # two that WERE refused as the shape of the rule and looked for the rest: this holds
         # `volumes/` (the contents of every named volume on the host, which is every compose stack's
         # database) and `builds/` (the build records a later image is assembled from). Refusing the
@@ -3497,7 +3497,7 @@ def _validate_mount_lexical(source: str, target: str) -> tuple[str, str]:
     # which is a `SandboxError`, and a caller's `except SandboxError` is the documented way to handle
     # a bad mount. `os.path.realpath` on a string with an embedded NUL raises `ValueError` instead, so
     # one input in the set escaped the exception type the API promises and took the caller's process
-    # down. Found in review. Checked before anything touches the OS layer.
+    # down. Found by a later pass. Checked before anything touches the OS layer.
     for label, value in (("source", source), ("target", target)):
         if "\x00" in value:
             raise MountRefused(f"mount {label} must not contain a NUL byte: {value!r}")
@@ -4131,7 +4131,7 @@ class Sandbox:
         # of it. `setup` and `cap_drop` already refused the wrong shape by name; `mounts` did not, and
         # a list or a string produced a raw `AttributeError: 'list' object has no attribute 'items'`
         # out of the middle of this class, naming neither the argument nor the shape it wanted. An
-        # outside review found it by sweeping the constructor one argument at a time.
+        # it was found by sweeping the constructor one argument at a time.
         #
         # The first attempt at this fix put the check 80 lines lower, next to the other guards, where
         # `self.mounts.items()` had already run and raised: a guard AFTER the use is not a guard, and
@@ -4951,7 +4951,7 @@ class Sandbox:
         AS THE BOX USER, NOT AS ROOT OF THE RANGE, and that choice is the boundary. The helper reaches
         what the host was refused because the account OWNS what it closed (its 0600, its 0700, its
         tarball's 0755), not because it can override anything. Root of the range could, and an
-        independent audit showed what that buys a box: its scripts check a path and then open it, so
+        later pass showed what that buys a box: its scripts check a path and then open it, so
         a box racing them could have root read a root-only file of the image and hand it to the
         caller. As the account, a race reaches only what the account reaches already. No network, the
         workspace read-only unless ``write``, and only the scripts of this module: never code from the
@@ -5027,7 +5027,7 @@ class Sandbox:
         named after a box that will never exist would both litter the workspace and collide with itself.
         A dry argv is for COMPARING, never for running."""
         if not dry:
-            # IDENTITY IS RE-ASSERTED PER BOX, not once per Sandbox, and an independent test is the
+            # IDENTITY IS RE-ASSERTED PER BOX, not once per Sandbox, and a later pass is the
             # reason. He overwrote the verified binary IN PLACE with `/bin/true` while a Sandbox was
             # open: the next call correctly refused to report an empty run as a success, and the message
             # it refused with quoted the version from the FIRST verification - so it stated that a file
@@ -5475,7 +5475,7 @@ class Sandbox:
             # WHAT THE LAST FULL WALK SAW, and the one file worth re-checking without repeating it.
             #
             # ⛔ MEASURING COSTS O(FILES), AND THAT WAS THE REAL BOUND ON THE OVERSHOOT. An outside
-            # review falsified the claim that the cap bounds it, and instrumenting the poller showed
+            # a later pass falsified the claim that the cap bounds it, and instrumenting the poller showed
             # why: on a 10,000-file workspace the walk costs 15 ms, so the FIRST in-call interval was
             # `10 x cost` = 155 ms, and there was exactly ONE look during the call - it arrived at
             # 188 ms having already measured 847 MiB against a 50 MiB headroom, 17x past. No policy
@@ -5637,7 +5637,7 @@ class Sandbox:
         # `subprocess` gives `-9` for a process killed by SIGKILL; the Node binding gives 137
         # for the same event, because that is what a shell, kern's own CLI and docker report.
         # Two bindings describing one event with two numbers is a contract defect: an external
-        # review ran the same timeout through both and got `-9` here and `137` there, so a
+        # pass ran the same timeout through both and got `-9` here and `137` there, so a
         # caller branching on `exit_code == 137` saw the timeout in Node and missed it here.
         #
         # 137 agrees with everything else a reader compares against, so Python is the one that
@@ -6750,7 +6750,7 @@ class Sandbox:
                         # the same vetted members as the box user, so that path must still see the raw
                         # error. With no box user to ask there is nothing upstream to do with it and
                         # `raise` handed the caller a bare `[Errno 13] Permission denied` with no
-                        # subject at all - worse than the wrong-subject message an outside review found
+                        # subject at all - worse than the wrong-subject message found
                         # on `read_file`, because there was no message. The full path is passed, so a
                         # target file the archive is overwriting that the box left at mode 0 is named as
                         # a FILE rather than as "a directory on that path".
@@ -6882,7 +6882,7 @@ class Sandbox:
         `os.chmod("/workspace", 0)` is the same primitive as closing a subdirectory, and it came out of
         here as a bare `PermissionError` - because the descent that repairs is HANDED this descriptor
         and never opens it, so `_descend_dirs(base_fd, [])` returns it untouched and the refusal has
-        already happened. Found by an adversarial review of the first fix, reproduced in both bindings.
+        already happened. Found by an adversarial pass of the first fix, reproduced in both bindings.
 
         Six callers open the root (the diff walk, the snapshot, the one descent, read and write,
         restore, ensure-parents) and they all come through here. `self._ws` is canonical, resolved at
@@ -7018,7 +7018,7 @@ class Sandbox:
     # -- setup (the only network window) -------------------------------------------------------------
 
     def _run_setup(self, cmd: str) -> None:
-        # DECISION (independent test-ratified C): the network is ON only here, in a SEPARATE setup box that
+        # DECISION (later pass-ratified C): the network is ON only here, in a SEPARATE setup box that
         # dies at the end. It installs into <workspace>/.deps; every run_code box is network-off.
         install = f"pip install --target {_WORKSPACE}/{_DEPS_DIR} --no-cache-dir --disable-pip-version-check"
         # If the caller gave a bare `pip install X`, route it to the deps dir; else run as-is (net-on).
@@ -8866,7 +8866,7 @@ def _path_refusal(
     O_NOFOLLOW, so a symlink the BOX planted at a path the host is about to read or write fails instead of
     redirecting. Passed through raw it reads `[Errno 40] Too many levels of symbolic link`, which sends a
     reader looking for a broken link chain when what happened is an attempt to reach a host file. Whoever
-    reads this (a person, a log, a red team) should be able to tell the two apart.
+    reads this (a person, a log, an attacker) should be able to tell the two apart.
     """
     # ASKED RATHER THAN ASSUMED, when the caller can be asked: `O_DIRECTORY|O_NOFOLLOW` on a symlink
     # answers ENOTDIR, so the generic sentence below has to name both possibilities. With the full path
@@ -8892,7 +8892,7 @@ def _path_refusal(
     # `verb in ("write", "restore")`, which is a membership test on a string built for DISPLAY: the
     # snapshot path's verb is `"snapshot to"` - a write, opened `O_WRONLY|O_CREAT|O_TRUNC` three lines
     # from the call - and it matched neither arm, so a refused write got the READ sentence. A cleanup
-    # review found it in both bindings at once. `writing` is keyword-only and has NO DEFAULT so a new
+    # pass found it in both bindings at once. `writing` is keyword-only and has NO DEFAULT so a new
     # call site cannot forget to decide, which is the part the string could not enforce.
     if e.errno == errno.EACCES:
         # ⛔ THE SUBJECT IS LOOKED AT BEFORE IT IS NAMED, when the caller handed us the full path. Both

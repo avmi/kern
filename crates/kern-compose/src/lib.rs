@@ -2635,7 +2635,7 @@ mod tests {
     #[test]
     fn randomized_fuzz_never_panics_incl_multibyte_and_deep_nesting() {
         // Property: `balanced_braces` / `split_top_level_commas` / `parse_depends` NEVER panic on any
-        // input - Err or benign Ok only. This is the `cargo fuzz`-equivalent the review asked for,
+        // input - Err or benign Ok only. This is the `cargo fuzz`-equivalent that pass asked for,
         // run inline (the parser is a private fn in a bin crate, not reachable from the fuzz
         // workspace). Two classes the length-6 enumeration can't reach are covered HERE:
         //   * MULTIBYTE UTF-8 in values (`é`, `→`, emoji) - the byte-offset-slicing panic class. The

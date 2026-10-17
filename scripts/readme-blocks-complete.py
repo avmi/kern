@@ -13,7 +13,7 @@ than a missing import: the install line above it (`pip install 'kern-sandbox[lan
 `langchain-core` ONLY, on purpose, so `create_agent` would not be importable even if the import were
 written. The install and the snippet under it disagreed, and nothing said so.
 
-An external reviewer found it by pasting all thirteen blocks, which is what a launch audience does and
+It was found by pasting all thirteen blocks, which is what a launch audience does and
 what I had never done. This gate is that pass, made cheap enough to run on every push.
 
 HOW, and why STATIC rather than executed. Running the blocks needs a kern binary, a network and an

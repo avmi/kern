@@ -1467,7 +1467,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "-f" | "--follow" => follow = true,
                     "-t" | "--timestamps" => timestamps = true,
                     // `--since`/`--until`: the flags a monitoring loop writes (`logs --since 30s`)
-                    // and the ones an incident review writes (an RFC3339 pair). A value that does
+                    // and the ones an incident write-up writes (an RFC3339 pair). A value that does
                     // not parse is REFUSED with the three forms named: a silently misread time
                     // shows the wrong window, and wrong output that looks like output is the worst
                     // of the three outcomes.
@@ -2046,7 +2046,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "--allow-privileged" => allow_privileged = true,
                     // `-f` IS DOCKER'S FILE FLAG BEFORE THE VERB AND ITS FOLLOW FLAG AFTER `logs`,
                     // and reading it as `--follow` everywhere is how `kern compose -f
-                    // docker-compose.yml logs web` came to hang. MEASURED by an independent test,
+                    // docker-compose.yml logs web` came to hang. MEASURED by a later pass,
                     // who lost half an hour to a job parked on it, and reproduced here in one pair:
                     // `compose docker-compose.yml logs a` prints and exits, `compose -f
                     // docker-compose.yml logs a` never returns. It is also the invocation in every

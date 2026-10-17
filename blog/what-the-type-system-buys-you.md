@@ -140,12 +140,12 @@ semi-trusted code, CI, dev, edge, your own agents' code, not actively hostile mu
 workloads, where you want a microVM.)
 
 What it *does* buy is specific and real: one category of "the steps ran in the wrong order" bug,
-the kind that survives review and slips past happy-path tests, is gone at compile time, and stays
+the kind that survives a reading and slips past happy-path tests, is gone at compile time, and stays
 gone because CI proves it. For security-critical sequencing, that's a good trade: a few marker
 structs and a `PhantomData` in exchange for an invariant you cannot forget to check.
 
 The lesson isn't "use typestates everywhere." It's this: when the *order* of a sequence is
-load-bearing for safety, the order is something the type system can hold for you, so an independent test,
+load-bearing for safety, the order is something the type system can hold for you, so a later pass,
 and every future contributor, doesn't have to.
 
 ---

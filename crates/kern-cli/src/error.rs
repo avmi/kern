@@ -60,7 +60,7 @@ impl Error {
             // A DOCKER HABIT GETS THE PAIR THAT DOES THE JOB, rather than a pointer to a list of
             // fifty verbs. `kern rm` does not exist and never will: a box is stopped and its
             // remains are collected, which is two verbs because they are two decisions. An outside
-            // independent test typed it, and so does everyone arriving from Docker; kern's own README
+            // later pass typed it, and so does everyone arriving from Docker; kern's own README
             // shipped it once. Naming the pair costs one line and absorbs the habit.
             // A workload's own status carries no hint: kern has nothing to add about someone
             // else's exit code.
@@ -97,7 +97,7 @@ impl Error {
             Error::Sandbox(_) => None,
             // Branch on the message, for the same reason `oci_hint` does: the setup step that failed
             // decides what the reader should do next, and the variant alone does not know it. An
-            // independent test measured a box refused by `RLIMIT_NPROC` and got
+            // later pass measured a box refused by `RLIMIT_NPROC` and got
             //
             //   error: sandbox: fork(idmap helper) failed: Resource temporarily unavailable (os error 11)
             //   hint: needs unprivileged user namespaces and a valid --rootfs directory
@@ -140,8 +140,8 @@ impl Error {
             // A FORK FAILURE IS NEVER A USERNS OR ROOTFS PROBLEM, whatever the errno, and the
             // generic hint below asserts that it is.
             //
-            // The EAGAIN branch above fixed one errno in this class after an independent test was sent to two
-            // places that were both fine. A second independent test then hit the same wrong hint under a
+            // The EAGAIN branch above fixed one errno in this class after a later pass was sent to two
+            // places that were both fine. A second later pass then hit the same wrong hint under a
             // DIFFERENT one, on WSL2 kernel 6.6, deterministically 3 of 3:
             //
             //   error: sandbox: fork failed: Out of memory (os error 12)
@@ -365,7 +365,7 @@ mod tests {
     /// **Every process-creation failure site in the isolation crate reaches the fork branch, and the
     /// set of them is pinned so a new one cannot be added silently.**
     ///
-    /// The branch matches on the word `fork` in the rendered message, and an outside independent test could
+    /// The branch matches on the word `fork` in the rendered message, and a later pass could
     /// not exercise it end to end because both of our kernels answer `RLIMIT_NPROC=1` with EAGAIN,
     /// which the more specific branch takes first. So it is proven by CONSTRUCTION instead, through the
     /// real rendering chain rather than a hand-written string:
@@ -496,7 +496,7 @@ mod tests {
     /// needs a real failure to prove it survives. This branch matches on the word `fork`, which comes
     /// from kern's own message and from nowhere else.
     ///
-    /// The ENOMEM case is the one an independent test measured on WSL2 kernel 6.6, deterministic
+    /// The ENOMEM case is the one a later pass measured on WSL2 kernel 6.6, deterministic
     /// 3 of 3, where the hint told them to check user namespaces and `--rootfs` and both were fine.
     #[test]
     fn no_errno_makes_a_fork_failure_a_userns_or_rootfs_problem() {
@@ -571,7 +571,7 @@ mod tests {
 
     /// A setup failure caused by EAGAIN on a fork is a process-limit problem, and the userns/rootfs
     /// hint sends the reader to two places that are both already fine: the code could not have
-    /// reached the fork otherwise. Reported by an independent test who hit it with a tightened
+    /// reached the fork otherwise. Reported by a later pass who hit it with a tightened
     /// `ulimit -u`, message exact and hint pointing elsewhere.
     ///
     /// The subject is the REAL rendering, not a hand-written string: the message is built from
@@ -727,7 +727,7 @@ mod hint_tests {
     ///
     /// `kern rm` does not exist and never will: stopping a box and collecting what it left behind
     /// are two decisions, so they are two verbs. Everyone arriving from Docker types it anyway, an
-    /// outside independent test did, and kern's own README shipped it once. A hint that only says "run
+    /// later pass did, and kern's own README shipped it once. A hint that only says "run
     /// --help" sends them to a list of fifty verbs to find the two.
     #[test]
     fn a_docker_verb_kern_lacks_is_answered_with_the_verbs_that_replace_it() {

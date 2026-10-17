@@ -1,5 +1,5 @@
 #!/bin/sh
-# The one measurement the review cycle asked for and nobody had: is the cold-start residue kern
+# The one measurement that cycle asked for and nobody had: is the cold-start residue kern
 # pays the SAME residue under two different definitions of "cold"?
 #
 # Two conditions, same binary, same rootfs, same `/bin/true`, same core:

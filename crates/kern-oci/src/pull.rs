@@ -136,7 +136,7 @@ pub struct ImageHealthcheck {
     /// ships `Interval 300s, StartPeriod 300s, StartInterval 5s`: Docker probes every 5 s and marks
     /// it healthy in about ten, kern waited the whole 300 s interval for its FIRST probe and reported
     /// `starting` for five minutes. Anything gated on `depends_on: condition: service_healthy` waits
-    /// with it. An independent test found it by sampling the process table at 0.1 s and seeing the
+    /// with it. A later pass found it by sampling the process table at 0.1 s and seeing the
     /// probe run once, late, and pass.
     pub start_interval_ns: Option<u64>,
     pub retries: Option<u32>,
@@ -647,7 +647,7 @@ pub(crate) fn parse_ref(image: &str) -> Result<(String, String, String), OciErro
     // for a manifest and got a document that is not one: unpinned it parsed as a manifest with NO
     // LAYERS, and pinned it failed as a digest mismatch against a digest that returns 404
     // MANIFEST_UNKNOWN in that repository. Two symptoms, one cause, and both messages sent the reader
-    // to look at the image instead of at the host. MEASURED by an independent test bringing up
+    // to look at the image instead of at the host. MEASURED by a later pass bringing up
     // Immich on WSL2, and reproduced here.
     //
     // `library/` is added AFTER the alias, and only for Docker Hub: `docker.io/alpine` means
@@ -803,7 +803,7 @@ fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
     // body. The distribution spec answers an error with `{"errors":[{"code":"...","message":"..."}]}`,
     // so `errors[].code` is the registry DECLARING what happened; `manifest.contains("denied")` is a
     // guess that fires on any body that happens to carry the word - a proxy's HTML interstitial, a
-    // `message` quoting a policy, a repository literally named `denied`. An outside review flagged
+    // `message` quoting a policy, a repository literally named `denied`. What made it visible was
     // exactly that, and the consequence was the sharpest possible: a reader sent to `kern login` for a
     // repository that is public.
     //
@@ -812,7 +812,7 @@ fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
     // or a truncated response, and it is one the reader can act on, because the text is in front of
     // them. Codes are uppercased for comparison because the spec's are uppercase and registries have
     // been seen lowercasing them.
-    // ⛔ AND THE HUNT IS RESTRICTED TO `errors[]`, not run over the whole document. A second review
+    // ⛔ AND THE HUNT IS RESTRICTED TO `errors[]`, not run over the whole document. A later pass
     // round caught this: `all_str_values(manifest, "code")` finds the key ANYWHERE, so a body that
     // embeds `"code":"DENIED"` in some unrelated object - an annotation, a nested policy, a vendor
     // extension - still took the auth arm, which is the same defect one level down from the substring
@@ -1956,7 +1956,7 @@ pub(crate) const TLS_PIN: &[&str] = &["--proto", "=https", "--proto-redir", "=ht
 /// IPv4 in 127/8 (four numeric octets), and `localhost`/`::1` are exact-string matches.
 pub(crate) fn is_loopback_registry(registry: &str) -> bool {
     // `localhost` is a NAME, not an IP - exact match, never a prefix (`localhost.evil.com` is NOT
-    // loopback). NOTE (documented residual, per review): this trusts that `localhost` resolves to
+    // loopback). NOTE (documented residual, per a later pass): this trusts that `localhost` resolves to
     // loopback - the default, but not guaranteed if `/etc/hosts` is tampered. The decision is on the
     // STRING, never on DNS resolution: we never treat "an arbitrary host that resolves to 127.0.0.1"
     // as a reason for http (which would let `attacker.com`→127.0.0.1 bypass pinning).
@@ -3648,7 +3648,7 @@ mod tests {
         assert!(!is_loopback_registry("::1.evil.com"));
         assert!(!is_loopback_registry("ghcr.io"));
         assert!(!is_loopback_registry("registry-1.docker.io"));
-        // Canonical-IP edge forms the stdlib parser rules on (review §A):
+        // Canonical-IP edge forms the stdlib parser rules on (pass §A):
         assert!(!is_loopback_registry("127.999.0.1")); // invalid octet → not a valid IP → pinned
         assert!(!is_loopback_registry("::ffff:127.0.0.1")); // IPv4-mapped → is_loopback()==false → pinned
         assert!(is_loopback_registry("127.255.255.254")); // still 127/8 → loopback
@@ -3976,7 +3976,7 @@ mod tests {
             assert!(e.contains("it may be private"), "got: {e}");
         }
         // ⛔ AND A BODY THAT MERELY CONTAINS THE WORD MUST NOT. Deciding by substring over the whole
-        // document sent a reader at a credential for a public repository: an outside review flagged
+        // document sent a reader at a credential for a public repository, and what showed it was
         // it, and these are the shapes that produce it. A proxy's HTML, a `message` that quotes a
         // policy, a repository whose NAME carries the word - none of them is the registry saying
         // "unauthorized", and `errors[].code` is the field that would have.

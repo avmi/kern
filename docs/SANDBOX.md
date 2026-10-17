@@ -1,7 +1,9 @@
 # Kern Sandbox: running a model's code from Python or Node
 
-Your model writes the code. This runs it where it cannot touch your machine: a real Linux container
-per call, and a hundred of them cost 1.4 s in total. How much survives between calls is
+Your model writes the code. This runs it where it cannot reach your files unless you hand them over:
+a real Linux container per call, and a hundred of them cost 1.4 s in total. What it CAN write is the
+workspace you give it - a host directory, by default a temp one that is deleted when the session
+ends - and `workspace_max_bytes` bounds that cooperatively rather than from the filesystem. How much survives between calls is
 [your choice](#choose-how-much-survives-between-calls).
 
 **Works with** Claude Code, Cursor, Claude Desktop, LM Studio, LangChain and pi.

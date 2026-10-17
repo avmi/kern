@@ -169,7 +169,7 @@ What the phase actually produced, in order of how long it will matter:
    mechanism. Nothing about that shape is specific to GPUs.
 3. The GPU tier itself, which is the least of the three and the only one a user sees.
 
-Three reviews across three rounds found ten real defects in this work, and every one of them was the
+Three passes found ten real defects in this work, and every one of them was the
 same class: a sentence or an exit code that said more than had been measured. Not one was a runtime
 bug. If you are about to change something here, that is the failure mode to expect from yourself.
 
@@ -199,7 +199,7 @@ nobody knows works.
 ## Changing a flag or config key (deprecation policy)
 
 The CLI/config surface isn't frozen pre-1.0, but changes still must not break a user's scripts
-without warning. This is **blocking** on review, same as tests:
+without warning. This is **blocking** before merge, same as tests:
 
 - **Rename with identical semantics** → keep the old name as a **deprecated alias**. Parse it to
   the same `Command` field and emit a single stderr warning (`warning: --old is deprecated; use
@@ -221,7 +221,7 @@ state (a line naming a pod on a stack that has none is a failure, not cosmetics)
 crosses with NO settling time (a bare connect cannot see a stale relay; only bytes back can), and that
 `down` leaves nothing behind in processes OR on disk, counted by pid rather than by process name.
 
-It was written after four defects in one release cycle were found by an independent test rather than
+It was written after four defects in one release cycle were found by a later pass rather than
 by this repo's own tests, and all four had that shape. `--self-check` exercises its own assertions
 against fixed strings, so a matrix that cannot fail is caught before it is trusted.
 
@@ -276,7 +276,7 @@ is a positive control: reintroduce the thing CI rejected and confirm your clippy
 
 kern and a box's workload share one stderr. A progress line written with a bare `eprintln!` therefore
 lands in whatever is reading that stream: a shell pipeline, `kern logs`, or an agent's context through
-the SDK, where an external audit found six `-> layer ...` lines sitting in front of the program's own
+the SDK, where a later pass found six `-> layer ...` lines sitting in front of the program's own
 output inside a LangChain tool result.
 
 ```sh
@@ -299,7 +299,7 @@ reads the whole macro call rather than one line, because the site that first esc
 string on the following line.
 
 **It is scoped rather than global, and the scope is the judgement.** Its first version instead matched
-a set of leading markers (`->`, `OK`, `  layer `). An independent test pointed out that this freezes today's
+a set of leading markers (`->`, `OK`, `  layer `). A later pass pointed out that this freezes today's
 punctuation rather than the rule, and they were right: rescoping it immediately found seven more
 progress lines written as `[1/3] FROM ...` and `  [cached - ...]`, plus the three unprefixed
 diagnostics. A global rule is not reachable statically, because 55 `eprintln!` calls in the workspace
@@ -316,7 +316,7 @@ The commit explains how a defect was found and why the fix is shaped that way. T
 place for it: the reader is whoever maintains this next, and the diagnosis is the content.
 
 The changelog has a different reader, deciding whether a version changes anything for them. So an
-entry answers that in its first line and stops. What went wrong, which review caught it, and how it
+entry answers that in its first line and stops. What went wrong, which pass caught it, and how it
 was verified do not belong there, because a reader scanning for "does this affect me" has to walk
 past them to find out.
 

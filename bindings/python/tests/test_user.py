@@ -361,7 +361,7 @@ def test_the_repair_refuses_a_directory_OUTSIDE_the_workspace(tmp_path):
     Three callers hand the repair a plain PATH, where `O_NOFOLLOW` guards only the last component, so a
     box that swaps an intermediate one for a symlink in the retry window could send the pin outside the
     workspace. The bits are ones this user could set anyway, so it was never an escalation - but the
-    comment on the repair claimed the change stays inside the workspace tree, and an adversarial review
+    comment on the repair claimed the change stays inside the workspace tree, and an adversarial pass
     showed that claim was only nearly true."""
     if os.getuid() == 0:
         pytest.skip("root is not refused by a mode, so neither half of this measures anything")
@@ -390,7 +390,7 @@ def test_a_refused_SNAPSHOT_gets_the_write_sentence_and_not_the_read_one(tmp_pat
     The snapshot path's verb is `"snapshot to"`, opened `O_WRONLY|O_CREAT|O_TRUNC`; the refusal builder
     tested `verb in ("write", "restore")`, which that string does not match, so a refused WRITE was
     explained with the READ sentence - told its owner bits could not be restored, when what happened is
-    that the repair deliberately left the directory at `0o500`. Found by a cleanup review reading the
+    that the repair deliberately left the directory at `0o500`. Found by a cleanup pass reading the
     two bindings side by side, in both of them, with no test on it."""
     if os.getuid() == 0:
         pytest.skip("root writes into a 0500 directory, so nothing here is refused")
@@ -420,7 +420,7 @@ def test_a_write_under_a_repaired_directory_is_refused_by_a_sentence_that_explai
     directory the workload shut - but the mode the reader then sees (`0o500`) is KERN'S, not theirs, so
     the refusal owes them that fact. Before this it was `[Errno 13] Permission denied: 'sub'` in Python
     and a BARE EACCES in Node, where the write path's first call was unwrapped. Found by an adversarial
-    review of the first fix."""
+    pass over the first fix."""
     if os.getuid() == 0:
         pytest.skip("root writes into a 000 directory, so nothing here is closed to it")
     ws = tmp_path / "ws"
@@ -451,7 +451,7 @@ def test_a_chmod_0_on_the_WORKSPACE_ROOT_no_longer_ends_the_session(tmp_path):
     `os.chmod("/workspace", 0)` is the same primitive as closing a subdirectory and it is the one a
     hostile cell reaches first, but the repair never saw it: the descent that repairs is HANDED the
     root descriptor and never opens it, so the refusal had already happened on the `os.open` above.
-    Found by an adversarial review of the first fix, reproduced raw in BOTH bindings, and closed by
+    Found by an adversarial pass of the first fix, reproduced raw in BOTH bindings, and closed by
     routing every root open through `_ws_fd`."""
     if os.getuid() == 0:
         pytest.skip("root reads a 000 directory, so nothing here is closed to it")
@@ -1089,7 +1089,7 @@ def test_the_tick_works_on_a_kernel_WITHOUT_pidfd_too(monkeypatch):
     `_wait_for_exit` prefers a pidfd and falls back to `Popen.wait` in slices when `os.pidfd_open` is
     missing or refused - an old kernel (pre-5.3), or a syscall filter in whatever sandbox the CALLER is
     itself running under. Every machine this is tested on has pidfd, so that branch ships unexercised
-    unless it is forced; a cleanup review pointed out it holds the cap poller's whole timing contract
+    unless it is forced; a cleanup pass pointed out it holds the cap poller's whole timing contract
     on those hosts. Forced here by removing `os.pidfd_open`, which is the same thing the kernel does."""
     seen: list = []
 

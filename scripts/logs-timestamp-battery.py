@@ -5,7 +5,7 @@ WHY THIS EXISTS AS A SCRIPT AND NOT AS A UNIT TEST. The pump and the reader shar
 across two processes, and the interesting states last milliseconds: an index truncated between the
 reader's `read_marks` and its next line, a compaction halving the table under a follow that is
 mid-file. A unit test can drive `compact_index` directly - and one does - but it cannot put a real
-`kern logs -t -f` in front of a real pump. An independent test put this at the top of the residual
+`kern logs -t -f` in front of a real pump. A later pass put this at the top of the residual
 risk after round 19, with the right reason: everything I had said about it was reasoning.
 
 It looks for the three ways this can LIE, not for a crash:

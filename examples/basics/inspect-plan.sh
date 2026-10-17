@@ -2,7 +2,7 @@
 # Audit the isolation BEFORE running anything.
 #
 # `kern box <name> --plan` prints the exact, ordered mount sequence the sandbox would perform -
-# no privileges, nothing executed. Useful for review, docs, and CI policy checks.
+# no privileges, nothing executed. Useful for inspection, docs, and CI policy checks.
 set -eu
 kern="${KERN:-kern}"
 # WHICH BINARY IS THIS. Printed to stderr on every run, because `${KERN:-kern}` silently

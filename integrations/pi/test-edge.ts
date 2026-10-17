@@ -179,7 +179,7 @@ async function main() {
 		const b = kernBashOps(box);
 
 		// Every exec below goes through this. `exec` THROWS on a timeout fault, and one throw at an
-		// unguarded call site cost an outside independent test 31 of 88 assertions and any tally at all: a slow
+		// unguarded call site cost a later pass 31 of 88 assertions and any tally at all: a slow
 		// command on a cold machine ended the file. A throw is now ONE failed assertion with the reason
 		// attached, and the remaining assertions still run.
 		const ex = async (cmd: string, cwd: string, opts: Parameters<typeof b.exec>[2]) => {
@@ -256,7 +256,7 @@ async function main() {
 		const nz = await ex("exit 255", "/workspace", { onData });
 		ok("exit 255 is reported as data", nz.exitCode === 255 && Number.isInteger(nz.exitCode));
 
-		// THIS ASSERTION USED TO BE VACUOUS, and an outside independent test found it. It ran
+		// THIS ASSERTION USED TO BE VACUOUS, and a later pass found it. It ran
 		// `:(){ :|:& };:`, which is BASH syntax, through a `language: "bash"` that actually ran `sh`.
 		// dash answers `Syntax error: Bad function name` and exits 2 in 0.02 s without forking once,
 		// and the check was `typeof exitCode === "number"`, which a syntax error satisfies. It had

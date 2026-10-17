@@ -544,7 +544,7 @@ pub(crate) fn parse_with_env(
 /// box's healthcheck wasn't convertible and we omitted it). Instead of letting `validate_conditions`
 /// hard-abort the whole `up` with a message disconnected from the root cause, we DEGRADE the edge to a
 /// plain `depends_on` (start-order) and warn ONCE with the causal chain - the honest drop-in-with-
-/// degrade posture, and what the omit-healthcheck warning already promised. (Adversarial review: the
+/// degrade posture, and what the omit-healthcheck warning already promised. (Adversarial pass: the
 /// parser must not promise a degrade it doesn't deliver.)
 fn degrade_orphan_health_gates(boxes: &mut [ComposeBox]) {
     // Which service names lack a health command (so a `service_healthy` gate toward them is unsatisfiable).
@@ -3941,7 +3941,7 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     // MEASURED as a gap on a neutral corpus of 259 real compose files: 6 of them
                     // use it, and it was the second most common remaining difference after the keys
                     // that ask kern to be less confining.
-                    // HONOURED, AND SAID OUT LOUD. It was applied in silence, which a release review
+                    // HONOURED, AND SAID OUT LOUD. It was applied in silence, which a release pass
                     // caught: this is the largest posture change a compose file can ask for (the service
                     // gets NO network namespace, so the host's interfaces, its loopback and its sysctls
                     // are the service's), and every smaller one in this file is named - `privileged`,
@@ -5329,7 +5329,7 @@ fn platform_matches_host(v: &str) -> bool {
 #[must_use]
 pub(crate) fn docker_shares_to_cpu_weight(shares: u64) -> u64 {
     // DOCKER'S OWN CURVE, IDENTIFIED FROM TEN MEASURED POINTS, not a linear scale on 1024 and not
-    // the formula two independent tests (and this codebase) remembered.
+    // the formula two later passes (and this codebase) remembered.
     //
     // Measured on Docker 29.6.2, cgroup v2, aarch64, one container per value:
     //
@@ -6574,7 +6574,7 @@ mod tests {
 
     /// THE REFUSAL MUST NOT NAME A FEATURE THIS PARSER SUPPORTS.
     ///
-    /// Reported by an outside independent test against the released binary: a malformed file of theirs was
+    /// Reported by a later pass against the released binary: a malformed file of theirs was
     /// refused with "YAML anchors/aliases not supported (rewrite the value inline)", and anchors,
     /// aliases and merge keys all work - `DOCKER-COMPAT.md` lists them as supported and they verify
     /// four ways. The message sent the reader to rewrite the one construct that was never the
@@ -7616,7 +7616,7 @@ mod tests {
     /// * the LINEAR map on 1024 fixed the default and missed everything else: 50 where Docker gives
     ///   59, 200 where it gives 174, 6400 where it gives 3023.
     /// * `1 + (shares - 2) * 9999 / 262142`, offered as "runc's formula" by two independent
-    ///   independent tests and remembered as such here, gives 20 for 512 and 39 for 1024. It was about to be
+    ///   later passes and remembered as such here, gives 20 for 512 and 39 for 1024. It was about to be
     ///   shipped on that recollection; the measurement below stopped it.
     ///
     /// Measured on Docker 29.6.2, cgroup v2, aarch64: one container per value, `cat cpu.weight`.
@@ -8619,7 +8619,7 @@ mod tests {
 
     #[test]
     fn env_value_with_braces_is_not_over_parsed() {
-        // The DUAL of the inline-table fix (review P1): a `{`-containing value in `environment` (a JSON
+        // The DUAL of the inline-table fix (pass P1): a `{`-containing value in `environment` (a JSON
         // config, very common) must stay a verbatim STRING, not be structured into a table (which made
         // the env var come out empty). Both quoted and raw forms keep the value.
         let y = "services:\n  a:\n    image: alpine\n    environment:\n      CFG: {key: val}\n      JSON: \"{\\\"k\\\":\\\"v\\\"}\"\n";
@@ -8803,7 +8803,7 @@ mod tests {
 
     #[test]
     fn partial_stack_failure_honors_depends_chain() {
-        // Review P3 (the untested angle): a failed service must not start its dependents, but the
+        // Pass P3 (the untested angle): a failed service must not start its dependents, but the
         // parser-level guarantee is that the dependency edge exists. (Runtime behaviour - independent
         // services start, dependents don't - is verified live; here we assert the edge is recorded so
         // `validate`/`wait` can enforce it.)
@@ -8845,7 +8845,7 @@ mod tests {
 
     #[test]
     fn healthcheck_test_reads_present_representation_not_expected() {
-        // Review P1 "third state": `healthcheck.test` is SOMETIMES a string (CMD-SHELL) and SOMETIMES a
+        // Pass P1 "third state": `healthcheck.test` is SOMETIMES a string (CMD-SHELL) and SOMETIMES a
         // list (exec). With the dual scalar+children representation, the converter must read whichever
         // is PRESENT for the value's form, not blindly the same one - else the block/inline × list/bare
         // matrix drops or mis-parses a cell. All four cells must resolve to the same command.
@@ -9179,7 +9179,7 @@ mod tests {
         // COLUMN ZERO is the boundary the rule has to survive, because there the pop-at-equal has
         // nothing left to pop: a top-level key whose items sit at its own indentation (`include:`
         // is written this way in the spec's own examples) is followed by `services:` at the same
-        // column 0. Asked for by an independent test as the case a dedent rule is most likely to get wrong.
+        // column 0. Asked for by a later pass as the case a dedent rule is most likely to get wrong.
         let top = concat!(
             "include:\n",
             "- ./other.yml\n",
@@ -10334,13 +10334,13 @@ services:
 
     #[test]
     fn network_mode_host_is_applied_and_said_out_loud() {
-        // FOUND BY A RELEASE REVIEW: `network_mode: host` was honoured in silence. It is the largest
+        // FOUND BY A RELEASE PASS: `network_mode: host` was honoured in silence. It is the largest
         // posture change a compose file can ask for, and every smaller one here is named. MEASURED
         // before the warning, on a box brought up from such a file: the service saw the HOST's three
         // interfaces (a box of its own sees two) and the host's `net.core.somaxconn`, so the key was
         // applied and the reader was told nothing.
         //
-        // The same review reported `ulimits` and `sysctls` as silent too. They are APPLIED, which is
+        // The same pass reported `ulimits` and `sysctls` as silent too. They are APPLIED, which is
         // why they say nothing: measured in a box, `ulimits: {nofile: 4321}` gives `ulimit -n` 4321
         // against a 1048576 default, and `sysctls: {net.core.somaxconn: 1234}` reads 1234 inside
         // against the host's 4096. A key that works needs no warning; silence is only a defect when
@@ -10790,7 +10790,7 @@ mod surface_tests {
     /// of in one of them, and a key kern does NOT apply must always be.
     fn is_unread_voice(w: &str) -> bool {
         // `"is NOT read"` WAS IN THIS LIST AND MATCHED NOTHING kern emits - dead the day it was
-        // written, found by a review of this branch. The four that remain are each grepped for in
+        // written, found by a pass over this branch. The four that remain are each grepped for in
         // the parser, and a fifth voice added later would make this test pass while the surface it
         // freezes has broken; the honest bound on that is the `assert` at the end of
         // `every_key_kern_does_not_apply_says_so`, which proves each of these voices is REACHABLE.

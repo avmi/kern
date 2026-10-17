@@ -391,7 +391,7 @@ pub fn clear_health(name: &str, pid: i32) {
 /// the box has left `list()`, and this tells us whether it finished cleanly (0) or failed.
 ///
 /// The sidecar filename is an opaque compose-supplied KEY that encodes BOTH the stack AND the `up`
-/// epoch: `<pod>-<token>-<name>` (adversarial review, rounds 1-2):
+/// epoch: `<pod>-<token>-<name>` (adversarial pass, rounds 1-2):
 ///  * **`<pod>`** namespaces by stack, so two different stacks that each contain a `db` never collide
 ///    on one `exit/db` - one stack could otherwise read the OTHER's `db` exit.
 ///  * **`<token>`** (a fresh per-`up` epoch) namespaces by RUN. This is the round-2 fix: with the
@@ -964,7 +964,7 @@ pub fn current_caps(pid: i32) -> Option<(Option<u64>, Option<u64>)> {
 /// down` clears `<pod>-<*any-token*>-<name>` only for the box `<name>` it is actually stopping. A
 /// blind `<pod>-` prefix would ALSO delete `<pod>-<otherToken>-<name>` of a DIFFERENT run of the same
 /// stack that is still in flight - re-opening, from the GC side, the exact cross-run deletion the
-/// token-in-key fix closed for clear/write (adversarial review, final round). Anchoring the suffix to
+/// token-in-key fix closed for clear/write (adversarial pass, final round). Anchoring the suffix to
 /// the box name keeps GC safe: the only run that can own `<pod>-*-<name>` is the one whose `<name>`
 /// box exists, and duplicate live box names are refused, so down can't wipe a concurrent run's box.
 /// Best-effort.
@@ -3890,7 +3890,7 @@ mod tests {
     fn exit_key_bracketed_matches_pod_and_name_across_tokens() {
         // `compose down` reaps `<pod>-<*any token*>-<name>` for a box it stops. It must match every
         // token of THAT box, and NOT a different box of the same stack (the concurrent-run leak the
-        // final review flagged).
+        // final pass flagged).
         let p = "myapp-"; // pod prefix
         let s = "-migrate"; // -<name>
         assert!(exit_key_bracketed("myapp-tokenA-migrate", p, s));

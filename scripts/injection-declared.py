@@ -29,7 +29,7 @@ THE LINE
 WHAT IT IS NOT
     It never fails the build. A warning that cannot be silenced by writing the wrong thing is worth
     more here than a refusal that gets worked around, and the entries it warns about are visible in
-    the same review as the code.
+    the same pass as the code.
 
 Usage:  python3 scripts/injection-declared.py
 Exit:   always 0. The report is the product.
@@ -161,7 +161,7 @@ def main() -> int:
             "      Injection: verified - <the case it turns red>\n"
             "      Injection: manual: <host> - <the case, and where it ran>\n"
             "      Injection: none - <why there is nothing to inject>\n"
-            "  This never fails the build; it is here so the count is visible in review.",
+            "  This never fails the build; it is here so the count is visible in the diff.",
             file=sys.stderr,
         )
     return 0

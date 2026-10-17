@@ -47,7 +47,7 @@ fn version_prints_and_succeeds() {
 /// matcher against it. That proves the matcher matches a string this repo wrote. It does NOT prove
 /// that the string a live failure produces still contains the key: an errno carried through anything
 /// that is not an `io::Error` loses the `(os error 11)` suffix, the match fails, and the hint
-/// silently reverts to the misleading one while the unit test stays green. An independent test named
+/// silently reverts to the misleading one while the unit test stays green. A later pass named
 /// that gap; this closes it, and it costs one `setrlimit`.
 ///
 /// `RLIMIT_NPROC` is lowered in the CHILD only, between fork and exec, so the test runner's own
@@ -943,7 +943,7 @@ fn started_bytes_and_stderr(args: &[&str]) -> (Option<i32>, Vec<u8>, String) {
 /// reads the box's own `memory.events` for the stderr sentence - and this puts that same observation on
 /// a channel the workload cannot write, where stderr is a stream the workload shares.
 ///
-/// WHY THE FOURTH BYTE, and two independent tests found it from opposite directions: kern propagates the
+/// WHY THE FOURTH BYTE, and two later passes found it from opposite directions: kern propagates the
 /// workload's status as `128 + N`, so a workload the kernel SIGKILLed and one that called `exit(137)` are
 /// BOTH a normal exit 137 of kern. MEASURED through the Python binding: `sys.exit(137)` was reported
 /// `fault = killed` (an external kill that never happened) and `sys.exit(159)` was reported
@@ -1012,7 +1012,7 @@ fn the_started_signal_carries_the_oom_verdict_and_the_workload_signal() {
         sig[2], 0,
         "an exit 137 with no OOM behind it was reported as an OOM: {sig:?}"
     );
-    // THE ONE THE INDEPENDENT TESTS FOUND: the same exit code as the OOM below, and nothing signalled this
+    // THE ONE THE A LATER PASSS FOUND: the same exit code as the OOM below, and nothing signalled this
     // workload. Without this byte a cell could fabricate `fault = killed` with one `exit 137`.
     assert_eq!(
         sig[3], 0,
@@ -1538,7 +1538,7 @@ fn a_refused_group_list_leaves_the_workload_with_none_of_the_callers_groups() {
 /// **A fork failure must never be answered with the user-namespace and rootfs hint, whatever the
 /// errno.**
 ///
-/// That hint has now been wrong twice, for two different errnos, to two different independent tests. The
+/// That hint has now been wrong twice, for two different errnos, to two different later passes. The
 /// first time it was EAGAIN under `RLIMIT_NPROC` and it got its own branch. The second was ENOMEM on
 /// WSL2, deterministic, and the reader was again sent to two places that were both fine.
 ///

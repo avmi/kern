@@ -26,7 +26,7 @@
  *   - `grep` runs IN THE BOX, so what it can reach is the box's mount namespace, the same boundary
  *     `bash` gets. A symlink under the workspace therefore re-roots into the box rather than being
  *     refused, which is a real difference from the verbs below and is stated in the README. This
- *     line said the opposite until an external audit read the code and the behaviour apart.
+ *     line said the opposite until a later pass read the code and the behaviour apart.
  *   - `read`, `write`, `edit`, `ls`, `find` are HOST filesystem I/O confined to the workspace
  *     by [[refuseOutsideWorkspace]] and, for reads and writes, by the SDK's own O_NOFOLLOW and
  *     directory-descent guards. That is a path check plus a syscall flag, not a namespace.
@@ -714,7 +714,7 @@ export default function (pi: ExtensionAPI) {
 			//
 			// Built against GUEST_WORKSPACE with pi's own tool, its bundled ripgrep ran `rg /workspace`
 			// on the HOST and grep failed on every call. Built against hostWorkspace it worked and was
-			// UNCONFINED: an external audit read /etc/passwd through an absolute `path` and host
+			// UNCONFINED: a later pass read /etc/passwd through an absolute `path` and host
 			// content through a workspace symlink. Matching in this process instead fixed the boundary
 			// and introduced a worse failure: the pattern comes from a model, and `(a+)+b` against a
 			// 4000-character line blocks the ONLY JavaScript thread. No timeout can rescue that,
@@ -750,7 +750,7 @@ export default function (pi: ExtensionAPI) {
 			const ctxLines = Math.max(0, Math.min(p.context ?? 0, 20));
 			// `-H` FORCES THE FILENAME. Without it grep omits the name when it is given a single
 			// file, so `path: "ctx.txt"` came back as `2:L2` and the agent could not tell which file
-			// a line was from. Raised by an external audit of 0.1.5, reproduced here.
+			// a line was from. Raised by a later pass of 0.1.5, reproduced here.
 			const flags = ["-rnH", p.literal ? "-F" : "-E"];
 			if (p.ignoreCase) flags.push("-i");
 			if (ctxLines > 0) flags.push(`-C${ctxLines}`);
@@ -762,7 +762,7 @@ export default function (pi: ExtensionAPI) {
 			// parsed as shell syntax. `-e` is what lets a pattern begin with a dash.
 			// STDERR IS NOT DISCARDED. It was, and that made four different outcomes look identical:
 			// no matches, an image with no `grep`, an unsupported flag, and a permission denial all
-			// returned "No matches found". An external audit named it, and I then produced the exact
+			// returned "No matches found". A later pass named it, and I then produced the exact
 			// failure myself while changing the flags: every result went empty and silent, and the
 			// reason was invisible. grep exits 1 for "no match" and 2 or more for an error, but the
 			// pipe makes `$?` `head`'s, so the discriminator is stderr rather than the exit code.
@@ -790,7 +790,7 @@ export default function (pi: ExtensionAPI) {
 			// separator that is followed by a line number.
 			// THE PATH IS LOOKED UP, NOT GUESSED. grep writes `path:line:text` and `path-line-text`
 			// and the separator also occurs in filenames, so a regex cannot tell them apart: an
-			// external audit measured `a-1-b.txt:1:MATCH` being read as `a`, because the non-greedy
+			// later pass measured `a-1-b.txt:1:MATCH` being read as `a`, because the non-greedy
 			// prefix stops at the `-1-` inside the NAME. There is nothing in the line that says where
 			// the path ends. So the box's own file list is the ground truth, and the answer is the
 			// LONGEST prefix that is a real file: longest, because `a` and `a-1-b.txt` can both
@@ -828,7 +828,7 @@ export default function (pi: ExtensionAPI) {
 			// BOTH PREFIXES END AT A SEPARATOR, and one of them did not. `.deps/` was anchored on the
 			// slash and behaved: `.depsomething.txt` and `.deps-old/x.txt` are the user's and are
 			// reported. `.kern-env` was not anchored, so it swallowed `.kern-envelope.md`, an
-			// ordinary file that merely starts with those letters. Measured by an external audit
+			// ordinary file that merely starts with those letters. Measured by a later pass
 			// driving the shipped execute, and reproduced here.
 			//
 			// The trailing dot is the anchor: kern's own file is `.kern-env.<boxid>`. A user file

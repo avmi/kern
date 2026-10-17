@@ -1098,7 +1098,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // ```
     //
     // The same command, twice, two outcomes: the first `up` on a clean machine breaks the stack and
-    // the second one fixes it. An outside independent test predicted exactly this shape from the `config`
+    // the second one fixes it. A later pass predicted exactly this shape from the `config`
     // behaviour and asked which side of the pull the decision falls on. It falls on the wrong one.
     //
     // Pulling here is also what Docker does: MEASURED on 29.6.2, `docker compose up -d` on a cold
@@ -1802,7 +1802,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         }
     }
     // Static rejection of conditions that can NEVER be satisfied - caught here, not left to time out
-    // at runtime (adversarial-review 2d). `topo_order` above already rejects cycles and unknown deps.
+    // at runtime (adversarial pass 2d). `topo_order` above already rejects cycles and unknown deps.
     validate_conditions(&boxes)?;
     // Static rejection of DUPLICATE published host ports: the bring-up below is CONCURRENT per level,
     // so two services on the same host port would race for the bind - one wins, the other dies with
@@ -1869,7 +1869,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     let project_dir = compose_dir(file);
 
     // Compose `build:` - build each service's image via `kern build` BEFORE the launch loop, so a box
-    // with `build:` gets a real image to run. Four hardenings the adversarial review demanded, because
+    // with `build:` gets a real image to run. Four hardenings the adversarial pass demanded, because
     // `build:` is the first place the YAML parser drives a privileged operation on host paths:
     //  1. `context`/`dockerfile` are CONFINED under the compose file's directory (traversal guard).
     //  2. `build.args` are already `${VAR}`-interpolated by the parser (never literal `${VAR}`).
@@ -1957,7 +1957,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     }
     // A fresh epoch token for THIS `up`. Stamped into every `depends_completed` target's exit sidecar
     // and required to match on read, so a sidecar left by a previous `up` of the same stack can't
-    // satisfy this run's wait (adversarial-review 1a). Uniqueness only needs to hold within this
+    // satisfy this run's wait (adversarial pass 1a). Uniqueness only needs to hold within this
     // process's lifetime; our pid + a monotonic-ish clock read is plenty and needs no rng/new deps.
     let up_token = format!(
         "{}-{}",

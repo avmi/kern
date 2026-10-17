@@ -4,7 +4,7 @@
 WHAT THE DEFECT IS. A literal split across lines is continued with `\\` at end of line, which in Rust
 eats the newline AND the next line's indentation. Write it without the `\\`, or generate the code with
 a tool that treats `\\` as ITS OWN line continuation, and you get a literal that compiles, survives
-review by eye, and prints:
+reading by eye, and prints:
 
     kern vgpu: the cgroup quota is capped by the cores the machine actually has,
     so this profile would                                   not slow the workload down

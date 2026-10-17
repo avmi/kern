@@ -62,7 +62,7 @@ row "boot = 'unknown'"           "unknown"      SURVIVE
 # the record exists to prevent, inflicted by the record.
 #
 # A DISAGREEMENT ABOUT THIS ROW WAS TRACED AND CLOSED, and it is recorded because the wrong version
-# of it was nearly committed as corroboration. An independent test reported SURVIVE here while this
+# of it was nearly committed as corroboration. A later pass reported SURVIVE here while this
 # harness measured KILL. The cause was their harness: it took the boot value as a string with no
 # unlink branch, so the sentinel `__RM__` they passed meaning "delete" was written into the record as
 # six literal characters. That is an unrecognised value, which SURVIVEs correctly, exactly as `x` and

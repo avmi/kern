@@ -137,7 +137,7 @@ fn check_scope_toll() -> R {
         // exec` joining a box's cgroup: cgroup v2 delegation containment needs write access to the
         // `cgroup.procs` of the COMMON ANCESTOR, and from outside the user manager's tree that is the
         // root cgroup. So `kern exec` refuses, and the refusal points HERE to tell the two causes
-        // apart. An outside independent test, on WSL2 with `systemd=true`, reported that the pointer resolved
+        // apart. A later pass, on WSL2 with `systemd=true`, reported that the pointer resolved
         // to a row which did not name the way through; this is that gap.
         //
         // The health probe is named for the opposite reason: it does NOT refuse, it runs outside the
@@ -1081,7 +1081,7 @@ fn check_max_userns() -> R {
 /// than none, because the reader spends the attempt and concludes kern is broken rather than
 /// undelegated.
 fn delegation_hint() -> String {
-    // Every branch ends with the same CHECK, because an independent test who saw this warning and a 137 from a
+    // Every branch ends with the same CHECK, because a later pass who saw this warning and a 137 from a
     // `--memory` box on the same host had no way to tell which of the two was describing kern's cap.
     // `memory_max_enforced` is read back from the box's own cgroup, so `null` there agrees with this
     // row and a number contradicts it; and a kill by kern's OWN cap always prints kern's OOM line,
@@ -1286,7 +1286,7 @@ fn check_cgroup() -> R {
 
 /// The directories the `--memory` probe actually wrote into, formatted for a report row.
 ///
-/// An outside independent test held a release on this row: doctor said a `--memory` write "silently never
+/// A later pass held a release on this row: doctor said a `--memory` write "silently never
 /// bites" while a box on the same host exited 137 under `--memory`, and the sentence named no
 /// directory, so neither of us could tell whether the two statements were even about the same cgroup.
 /// Their box's PID 1 sat in `0::/`. A verdict about a cgroup that does not say WHICH cgroup cannot be
@@ -1428,7 +1428,7 @@ fn check_overlay() -> R {
 /// which is a command that runs an attacker's script as root, printed by the tool the reader ran to
 /// find out whether their machine is safe. An ANSI escape in the same variable also reaches the
 /// terminal verbatim and can repaint or hide the rest of the report. Neither is exotic: a container
-/// image, a CI runner or a `sudo -E` all get to set `USER`. Found by an outside review of this
+/// image, a CI runner or a `sudo -E` all get to set `USER`. Found by a sweep of this
 /// module on 2026-08-28, in code that predates the GPU work but was read because of it.
 ///
 /// The allowlist is the portable POSIX user-name set, plus the leading-hyphen rule that keeps a name
@@ -1982,7 +1982,7 @@ mod tests {
 
     /// EVERY NEGATIVE MEMORY-CAP ROW MUST NAME THE DIRECTORY IT PROBED.
     ///
-    /// An outside independent test refused a release on this. doctor printed that a `--memory` write
+    /// A later pass refused a release on this. doctor printed that a `--memory` write
     /// "silently never bites", and on the same host a `--memory 64m` box exited 137 through `exec`.
     /// The sentence named no cgroup and their box's PID 1 sat in `0::/`, so nothing in the output
     /// said whether the two statements were even about the same directory - and the verdict could
@@ -2036,7 +2036,7 @@ mod tests {
             let row = no_user_manager_verdict(st, SITES).text();
             assert!(
                 row.contains(SITES),
-                "a row saying a cap does not bind names no cgroup, so an independent test cannot \
+                "a row saying a cap does not bind names no cgroup, so a later pass cannot \
                  check it against /proc/<pid1>/cgroup: {row}"
             );
         }

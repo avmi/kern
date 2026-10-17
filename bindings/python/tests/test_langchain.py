@@ -544,7 +544,7 @@ def test_concurrent_calls_on_one_tool_do_not_contaminate_each_other():
         assert out == [str(i * i) for i in range(8)]
 
 def test_every_sabotage_anchor_still_exists():
-    """The review protocol proves each guard by REMOVING it and watching a test go red. Every one of
+    """The sabotage protocol proves each guard by REMOVING it and watching a test go red. Every one of
     those sabotages edits a named symbol or an exact line, so the day a refactor renames one, the edit
     lands nowhere, the test stays green, and the counter-proof becomes a ritual that always passes:
     the same fake gate this project refuses everywhere else, except hidden inside the thing that is
@@ -567,7 +567,7 @@ def test_every_sabotage_anchor_still_exists():
         "max_code_bytes": ("if size > max_code_bytes:", tool),
     }
     missing = [name for name, (needle, text) in anchors.items() if needle not in text]
-    assert not missing, f"the review protocol sabotages symbols that no longer exist: {missing}"
+    assert not missing, f"the sabotage protocol sabotages symbols that no longer exist: {missing}"
 
 
 # ---------------------------------------------------------------------------
@@ -1347,7 +1347,7 @@ def test_raw_sockets_stay_out_of_reach_and_that_is_rootless_not_a_flag():
 @needs_shell
 class TestBothVocabulariesReachThePolicy:
     """`command_timeout` is langchain's name and `timeout_s` is this package's, and the policy is a
-    subclass of langchain's base, so only one of the two can be the field. An external audit passed
+    subclass of langchain's base, so only one of the two can be the field. A later pass passed
     `timeout_s=` and got `TypeError: unexpected keyword argument` with nothing naming the spelling
     that works. Both are accepted now; the dataclass still keeps langchain's names."""
 
@@ -1448,7 +1448,7 @@ class TestTheAliasesCannotWeakenWhatTheyTranslate:
 
 @needs_shell
 def test_the_shell_policys_mount_goes_through_the_SAME_validator_as_every_other():
-    """The one `-v` in this package that did not pass a validator, found by an altitude review.
+    """The one `-v` in this package that did not pass a validator, found by an altitude pass.
 
     `Sandbox(workspace=...)` and `mounts={...}` refuse `$HOME`, `/etc`, `/root`, the docker socket, any
     path with a credential directory in it and kern's own runtime state. This policy built

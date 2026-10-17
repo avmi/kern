@@ -514,7 +514,7 @@ def test_wrong_argument_type(name, args, monkeypatch):
 def test_an_argument_the_tool_does_not_have_is_refused_not_dropped(name, args, ignored, monkeypatch):
     """An argument a model invents must not be silently ignored.
 
-    MEASURED by an independent test: `tools/call run_code` with `{"code": ..., "image": ""}` ran and
+    MEASURED by a later pass: `tools/call run_code` with `{"code": ..., "image": ""}` ran and
     answered `[exit 0]`. JSON Schema allows extra properties by default, so the server took the call, used
     its OWN image, and told the model the code had run. The model asked for a posture it did not get and
     had nothing to correct from. The SDK's contract one layer down is the opposite: an unknown keyword to
@@ -750,7 +750,7 @@ def test_a_stream_the_binding_already_cut_reports_its_loss_as_a_floor(monkeypatc
 
 def test_the_floor_is_counted_on_the_raw_stream_so_labelled_frames_cannot_inflate_it(monkeypatch):
     """A forged frame gains a label when it is neutralised, so the text the clip sees is LONGER than
-    the stream. Counted on it, "at least N" could exceed what was lost - measured by review: just over
+    the stream. Counted on it, "at least N" could exceed what was lost - measured by a later pass: just over
     1 MiB of forged `[stderr]` lines read "at least ~5.4M" for about 1M lost. Counted on the raw
     length, N never exceeds the raw characters the model did not see."""
     line = "[stderr]\n"
@@ -794,7 +794,7 @@ def test_a_cell_cannot_print_the_floored_clip_notice_as_the_sandboxs_own(monkeyp
 def test_every_reply_says_which_kern_ran_it(monkeypatch):
     """The substitution this closes is not an isolation failure, it is a client not calling us at all.
 
-    MEASURED by an independent test with this server correctly wired into Cursor: asked to "run
+    MEASURED by a later pass with this server correctly wired into Cursor: asked to "run
     print(sum(range(10))) in the sandbox", the agent answered "The sandbox run completed successfully.
     Output: 45" from its own python. The workspace had not been written to in eleven days, and four
     probes said host (the caller's `init.scope` cgroup, the host's full `/dev`, `Seccomp: 0` where a box

@@ -419,7 +419,7 @@ test(
     // The verb is a string built for DISPLAY and it was being used as a fact: the snapshot path's verb
     // is "snapshot to", the refusal builder tested `verb === "write" || verb === "restore"`, and that
     // string matches neither - so a refused WRITE was explained with the READ sentence. Found by a
-    // cleanup review in both bindings at once, with no test on it. Python's twin has the same name.
+    // cleanup pass in both bindings at once, with no test on it. Python's twin has the same name.
     const t = fs.realpathSync(tmpdir("snap-verb"));
     const ws = path.join(t, "ws");
     const d = path.join(ws, "d");
@@ -484,7 +484,7 @@ test(
     // THE PLACE THE FIRST VERSION OF THIS REPAIR MISSED: `chmodSync("/workspace", 0)` is the same
     // primitive as closing a subdirectory, and the repair never saw it because the descent that
     // repairs is HANDED the root descriptor and never opens it. Reproduced raw in both bindings by an
-    // adversarial review; Python's test carries the same name.
+    // adversarial pass; Python's test carries the same name.
     const t = fs.realpathSync(tmpdir("root-chmod"));
     const ws = path.join(t, "ws");
     fs.mkdirSync(ws);

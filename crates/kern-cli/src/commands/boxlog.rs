@@ -724,7 +724,7 @@ pub(crate) fn tail_file(f: &mut std::fs::File, n: usize) -> Result<Vec<u8>, Erro
 /// 🔴 IT USED TO FOLLOW AN INODE, AND A ROTATION ENDED THE STREAM IN SILENCE. `rotate` renames the
 /// active log and opens a fresh one; a follower holding the old descriptor kept polling a file
 /// nothing writes to any more, printed nothing, and reported nothing. MEASURED by an external
-/// independent test in round 20 and reproduced here: a box that printed 120 lines after its first rotation
+/// later pass in round 20 and reproduced here: a box that printed 120 lines after its first rotation
 /// showed **zero** of them through `kern logs -f`, while all three generations sat on disk. Rotation
 /// is the DEFAULT (16 MiB), so this was every long-running box, and `kern attach` had it too.
 ///
@@ -1373,7 +1373,7 @@ impl Stamper {
     ///
     /// ⭐ THE SYMPTOM IS FORWARD, WHICH IS WHY EVERY ASSERTION PASSED. The concurrency battery hunts
     /// time going BACKWARDS, torn records and missing columns; none of them fires on a stamp that is
-    /// merely too new. An independent test predicted this from the code in round 20 and then measured
+    /// merely too new. A later pass predicted this from the code in round 20 and then measured
     /// it. A test that cannot see a defect is not evidence that the defect is absent.
     ///
     /// The check sits AFTER the index re-read on purpose: a rotation landing between the two leaves
@@ -1980,7 +1980,7 @@ mod log_time_tests {
 
     /// THE THREE SPELLINGS DOCKER TAKES, and the round trip that makes the third one useful.
     ///
-    /// `--since` is the flag a monitoring loop writes and an incident review writes, and the two
+    /// `--since` is the flag a monitoring loop writes and an incident write-up writes, and the two
     /// write it differently: `--since 30s` against `--since 2026-09-18T11:33:44.731Z`, the second
     /// copied out of kern's own `logs -t` output. A parser that took only one of them would send
     /// half its callers to convert a timestamp by hand.

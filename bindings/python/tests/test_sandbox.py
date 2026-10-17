@@ -265,7 +265,7 @@ def test_both_bindings_produce_THE_SAME_tmpfs_argv_for_one_corpus():
         ({"mounts": {here: "/data"}}, {"mounts": {here: "/data"}}),      # elsewhere: untouched
         ({"mounts": {here: "/data"}, "tmpfs": {"/tmp": "8m"}},
          {"mounts": {here: "/data"}, "tmpfs": {"/tmp": "8m"}}),          # different targets: both
-        # The axes the first version of this corpus did not vary, added after review: the memory cap
+        # The axes the first version of this corpus did not vary, added after a later pass: the memory cap
         # (which the DEFAULT is clamped against) and the hardening profile (which the default steps
         # aside for). Both are places where one binding could grow a rule the other lacks.
         ({"memory_mb": 64}, {"memoryMb": 64}),                           # clamp to half the cap
@@ -479,7 +479,7 @@ def test_dangerous_mounts_refused(mounts):
 @pytest.mark.parametrize(
     "target",
     [
-        # THE HOLE REVIEW FOUND. The essentials check compared the target for EQUALITY, so `/proc`
+        # THE HOLE A LATER PASS FOUND. The essentials check compared the target for EQUALITY, so `/proc`
         # was refused and everything INSIDE it was not. Reported with the command that shows it:
         # `Sandbox(mounts={tmp: "/proc/self"})` started a box.
         "/proc/self",
@@ -525,7 +525,7 @@ def test_an_ordinary_mount_target_is_still_accepted(target, tmp_path):
     "source,target",
     [
         # A NUL used to escape as `ValueError` from `os.path.realpath`, which is not a `SandboxError`,
-        # so a caller's `except SandboxError` missed it and the agent's process died. Found in review.
+        # so a caller's `except SandboxError` missed it and the agent's process died. Found by a later pass.
         ("/tmp/x\x00y", "/data"),
         ("/tmp/x", "/data\x00y"),
         # A NEWLINE is legal in a Linux path and poisons every line-oriented reader downstream.
@@ -1392,7 +1392,7 @@ def test_any_error_kern_prints_before_the_box_exists_is_a_startup_failure():
     """The class, after three patches that each closed one member of it.
 
     `error: config:` was added because a caller measured it; before that `error: image:`, before that
-    `error: pull:`. An independent test then ran `image=""` and got
+    `error: pull:`. A later pass then ran `image=""` and got
     `error: bad image reference: empty`, in none of the eleven openings the list had grown to, so a box
     that never existed came back `fault=None` again. The list was the defect: kern reports every error
     through ONE `eprintln!("error: {}", ...)` in `kern-cli/src/main.rs` and there are hundreds of
@@ -1609,7 +1609,7 @@ def test_a_scratch_bigger_than_the_cap_is_refused_and_the_default_is_clamped_to_
     assert _cfg(memory_mb=1)._tmpfs_args == ["--tmpfs", "/tmp:1m"]        # the floor, never "0m"
     assert _cfg(memory_mb=None)._tmpfs_args == ["--tmpfs", "/tmp:64m"]    # no cap, nothing to resolve
     # DIRECTION: the clamp only ever reduces. `min(64, cap/2)` cannot exceed 64, so a big box does not
-    # get a big default. An independent test read "clamped to half" as a formula that applies both ways and
+    # get a big default. A later pass read "clamped to half" as a formula that applies both ways and
     # flagged 512 -> 256m as the consequence; it is 64m, and this is the assertion that says so.
     for cap in (128, 256, 512, 1024, 4096):
         assert _cfg(memory_mb=cap)._tmpfs_args == ["--tmpfs", "/tmp:64m"], cap
@@ -1641,7 +1641,7 @@ def test_the_clamped_default_fails_with_ENOSPC_instead_of_killing_the_box():
 
 @integration
 def test_every_security_profile_has_a_PINNED_set_of_writable_paths():
-    """The general form of a defect an independent test had to predict for us.
+    """The general form of a defect a later pass had to predict for us.
 
     `security_profile="untrusted"` gave a read-only /tmp in 0.1.35. A default added in the BINDING
     would have handed it a writable, executable one in 0.1.36: a hardening bundle defined by the
@@ -2127,7 +2127,7 @@ def test_kerns_own_state_is_refused_as_a_mount_source(monkeypatch, tmp_path):
     dir holds the profiles a later box may be given. Same reason the docker socket is refused, which was
     already in the list while these were not.
 
-    The DATA dir was missing from that list until an independent test took the refused two as the shape
+    The DATA dir was missing from that list until a later pass took the refused two as the shape
     of the rule and looked for the rest: `$XDG_DATA_HOME/kern` holds `volumes/`, which is the CONTENT of
     every named volume on the host (every compose stack's database), and `builds/`. On his machine a
     sandbox could be handed all of them, read-write, while its two siblings were refused by name.
@@ -2151,7 +2151,7 @@ def test_kerns_own_state_is_refused_as_a_mount_source(monkeypatch, tmp_path):
     with pytest.raises(MountRefused):
         kern._validate_mount(str(other / "kern"), "/x")
     # THE DEFAULT LOCATION STAYS REFUSED WHILE THE VARIABLE POINTS ELSEWHERE. Measured by the same
-    # independent test, in one process: with `XDG_DATA_HOME=/tmp/xdh2`, `~/.local/share/kern` was ACCEPTED and
+    # later pass, in one process: with `XDG_DATA_HOME=/tmp/xdh2`, `~/.local/share/kern` was ACCEPTED and
     # still held `builds` and `volumes`, because the guard protected the CONFIGURED directory while the
     # data a previous run wrote sat at the default one. Both spellings are in the list now.
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "elsewhere"))
@@ -3436,7 +3436,7 @@ def test_the_cap_poll_interval_is_scaled_to_the_headroom_not_to_the_clock():
     # And a headroom of a few bytes asks for a busy loop, which the floor refuses.
     assert kern._cap_next_delay(1, 20e9, 0.0, cap) == FLOOR
 
-    # ⛔ AND THE SELF-LIMIT MUST YIELD IN THE LAST QUARTER, which an outside review falsified this
+    # ⛔ AND THE SELF-LIMIT MUST YIELD IN THE LAST QUARTER, which falsified this
     # test for. `cost * 10` sits in the outer `max`, so on a workspace that is expensive to measure it
     # set the interval alone and the overshoot went back to being a function of the DISK: MEASURED
     # with the headroom held at 50 MiB and only the file count varied, 1.20x at 0 files, 1.28x at
@@ -4053,7 +4053,7 @@ def test_a_signal_death_is_reported_as_128_plus_n_not_as_minus_n():
     """`exit_code` for a killed process must be 137, the value every other tool a reader compares
     against reports: a shell, kern's own CLI, docker, and the Node binding.
 
-    FOUND BY AN EXTERNAL REVIEW running one timeout through both bindings: Python answered `-9` (the
+    FOUND BY AN A LATER PASS running one timeout through both bindings: Python answered `-9` (the
     `subprocess` convention, negative meaning "killed by signal N") and Node answered `137`. Same
     event, two numbers, so a caller branching on `exit_code == 137` saw the timeout in one binding and
     missed it in the other.
@@ -4077,7 +4077,7 @@ from kern_sandbox import _KERN_DIAGNOSTICS as NOTE_PREFIXES
 class TestKernNotesAreNotTheCodesStderr:
     """kern and the workload share ONE stderr, so the raw field carries the launcher's own voice.
 
-    An external audit found kern's `note:` lines inside a LangChain tool result, spending the model's
+    A later pass found kern's `note:` lines inside a LangChain tool result, spending the model's
     context on the runtime's housekeeping where they can be misread as the program's own errors.
     `code_stderr` and `runtime_notes` are the two halves. These run on FIXED strings rather than a box,
     so they pin the rule itself and cannot pass because a particular host happened to print no notes.
@@ -4340,7 +4340,7 @@ def test_the_alive_probe_never_invents_a_startup_failure():
 def test_a_binary_that_is_not_kern_is_refused_before_any_code_runs():
     """`KERN_BIN` pointing at anything that is not kern must RAISE, never return a clean result.
 
-    MEASURED, and found by an independent test running the positive control this project wrote for
+    MEASURED, and found by a later pass running the positive control this project wrote for
     him: with `KERN_BIN=/bin/true` a call returned `success=True, exit_code=0, fault=None` and an empty
     stdout. The code never ran and the caller was told it had. Both bindings did it. Any `kern` earlier
     in `PATH` that is not kern reaches this: a leftover wrapper, a shim, a no-op. An agent loop reads
@@ -4520,7 +4520,7 @@ def test_a_box_that_printed_is_never_a_box_that_never_started():
 def test_a_binary_that_identifies_itself_but_runs_nothing_is_not_a_success():
     """Answering `kern <version>` is not behaving like kern, and this is the layer that says so.
 
-    MEASURED, and found by an independent test attacking the design of the gate rather than the code: a two-line
+    MEASURED, and found by a later pass attacking the design of the gate rather than the code: a two-line
     script that prints `kern v9.9.9-fake` for `--version` and then exits 0 passed `_verify_is_kern` and
     the call came back `success=True, exit_code=0, fault=None` with an empty stdout. The original defect,
     one layer down.
@@ -5884,7 +5884,7 @@ def test_a_figure_drawn_on_after_display_comes_back_as_it_ends_in_both_drivers(t
 
 def test_cold_and_kernel_runs_agree_when_one_figure_cannot_be_drawn(tmp_path):
     """The prewarmed box runs the kernel driver and the cold box the one-shot runner, so a rule only
-    one of them follows is a call whose result depends on which box served it. Measured by review:
+    one of them follows is a call whose result depends on which box served it. Measured by a later pass:
     with one figure whose savefig raises, the kernel returned the good figure and the cold path none."""
     code = _MPL + "bad = plt.figure()\nbad.savefig = lambda *a, **k: 1 / 0\nplt.figure(); plt.plot([1])"
     assert _figure_counts([code]) == [1]
@@ -6101,7 +6101,7 @@ def test_a_mode_0_file_is_refused_as_a_file_and_as_ours(tmp_path):
 def test_every_path_refusal_call_site_hands_over_the_path():
     """A refusal can only name its SUBJECT if the call site passes the path, and most did not.
 
-    An outside review found `read_file` naming a mode-0 FILE as "a directory on that path"; the same
+    `read_file` was found naming a mode-0 FILE as "a directory on that path"; the same
     message was reachable through `write_file`, `restore` and the snapshot/restore open, because those
     call sites never handed over the path either - and `restore` was worse, re-raising a bare
     `PermissionError` with no subject at all. Asserting one fixed site would not stop the next one, so

@@ -194,7 +194,7 @@ the local change that would make a cap bind there, and the refusal names the cau
 
 - A cgroup kern did not write counts as proof of a `--memory` only when its SWAP is bounded too.
   kern's own cap writes `memory.swap.max = 0`, so an ancestor accepted in its place has to be at
-  least as strong, and systemd's default `memory.swap.max=max` is not: an independent reviewer
+  least as strong, and systemd's default `memory.swap.max=max` is not: it was
   measured a scope with `MemoryMax=48M` accepted as proof of a 64 MiB request, and the command
   allocated 100 MB and exited 0 on 48 MiB of RAM plus the host's swap. A level now states
   `memory.max` plus the swap it opens, unbounded swap makes it state nothing at all, and a host with
@@ -908,7 +908,7 @@ without `--uid-range`; `--no-uid-range` is the opt-out.
 `images --filter`, `stats --no-stream`, and `build` reading a `Containerfile` so a project need not
 carry another project's name.
 
-Six of the twelve commits that built this surface are FIXES the reviews found in it, and one was
+Six of the twelve commits that built this surface are FIXES those passes found in it, and one was
 live on 0.9.35: **`--mount readonly=1` mounted the path WRITABLE**, which is the worst shape a
 compatibility gap can take, the flag asking for less privilege granting more.
 

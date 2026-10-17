@@ -41,7 +41,7 @@ PROFILE = REPO / "crates" / "kern-isolation" / "seccomp" / "moby-default-v27.3.1
 OUT = REPO / "crates" / "kern-isolation" / "src" / "seccomp_allow.rs"
 # The arch-independent DECISION RECORD: the exact syscall NAMES the allowlist permits
 # (`moby_allow ∖ KERN_DENIED`), one per line. Committed and diff-gated (`--check`) so a bump of the
-# pinned profile that adds/removes a syscall surfaces HERE, for review, before it reaches the numbers.
+# pinned profile that adds/removes a syscall surfaces HERE, for inspection, before it reaches the numbers.
 NAMES = REPO / "crates" / "kern-isolation" / "seccomp" / "allow-names.txt"
 
 # The 35 kern denies regardless of the OCI profile (kill / ENOSYS / nesting). They must NOT enter the
@@ -191,7 +191,7 @@ def sidecar_text(names: list[str]) -> str:
         "# The syscall NAMES kern's seccomp allowlist permits = the pinned OCI/moby default allow set\n"
         "# (moby-default-v27.3.1.json) MINUS the 35 syscalls kern denies for being rootless. The\n"
         "# per-architecture NUMBERS in src/seccomp_allow.rs are these names resolved via kernel headers.\n"
-        "# A profile bump that changes this list is caught by `--check` in CI: regenerate and review.\n"
+        "# A profile bump that changes this list is caught by `--check` in CI: regenerate and read the diff.\n"
     )
     return header + "".join(f"{n}\n" for n in names)
 
@@ -289,7 +289,7 @@ def check() -> int:
 
     1. NAME level (always, no compiler): the committed allow-names.txt MUST equal
        `moby_allow ∖ KERN_DENIED` recomputed from the pinned profile. This is what catches a profile
-       bump silently pulling a new syscall into the allow set - it shows up here, named, for review.
+       bump silently pulling a new syscall into the allow set - it shows up here, named, for inspection.
     2. NUMBER level (only when BOTH cross-compilers are present): the number sets in seccomp_allow.rs
        MUST equal the names resolved per arch. Skipped-with-notice where a compiler is missing, because
        resolution needs that arch's kernel headers - the name layer still gates the actual risk.
@@ -308,7 +308,7 @@ def check() -> int:
         if removed:
             print(f"  - would LEAVE the allow set: {', '.join(removed)}", file=sys.stderr)
         print(
-            "  Run `python3 scripts/gen-seccomp-allowlist.py --write` and review the diff before\n"
+            "  Run `python3 scripts/gen-seccomp-allowlist.py --write` and read the diff before\n"
                 "  committing. WITHOUT `--write` this script only checks, so the bare command\n"
                 "  re-prints this message and changes nothing.",
             file=sys.stderr,

@@ -997,7 +997,7 @@ pub fn inside_user_manager_tree() -> bool {
     // `/proc/self/cgroup` a second time: the root this found is an ANCESTOR of `cur` by construction,
     // so `common_cgroup_ancestor(cur, root)` is `root` itself and the two calls are the same question.
     //
-    // ⛔ `access(2)` AND `write(2)` CAN DISAGREE IN THIS SUBSYSTEM, and an outside review was right to
+    // ⛔ `access(2)` AND `write(2)` CAN DISAGREE IN THIS SUBSYSTEM, and it is fair to
     // ask whether that breaks this. MEASURED here: a cgroup with a child and controllers in its
     // `subtree_control` answers `access(W_OK)` YES on its own `cgroup.procs` and REFUSES the write -
     // cgroup v2's "no internal processes" rule - while the same write into a childless leaf succeeds.
@@ -1365,7 +1365,7 @@ const SCOPE_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(1
 /// them: `(kern.slice, the caller's own cgroup)`. Either may be `None`.
 ///
 /// Public so `kern doctor` can NAME the places it probed instead of asserting an unlocated verdict.
-/// An outside independent test refused a release over exactly that gap: doctor said a `--memory` write
+/// A later pass refused a release over exactly that gap: doctor said a `--memory` write
 /// "silently never bites" while a box on the same host exited 137, and the sentence pointed at no
 /// directory, so neither of us could tell whether doctor or the 137 was describing kern's cap. A
 /// claim about a cgroup that does not say WHICH cgroup cannot be checked against `/proc/<pid>/cgroup`.
@@ -1388,7 +1388,7 @@ pub fn memory_cap_state() -> MemoryCapState {
     // where the slice EXISTS but boxes do not use it, this probed the slice and reported on a
     // directory no box goes near.
     //
-    // MEASURED by an outside independent test, uid 0, no user manager: `kern doctor` printed "the `memory`
+    // MEASURED by a later pass, uid 0, no user manager: `kern doctor` printed "the `memory`
     // controller is listed but NOT delegated to a child cgroup - a `--memory` write is accepted and
     // silently never bites", and on the same host in the same session a box started with
     // `--memory 64m` reported `memory_max = 67108864` and an `exec` that overran it exited 137.
@@ -1808,7 +1808,7 @@ fn kern_slice_path() -> Option<PathBuf> {
     // THE DELEGATION ROOT IS NOT ALWAYS AN ANCESTOR OF THE CALLER, and assuming it was made the
     // direct cap path unreachable on a whole class of hosts.
     //
-    // MEASURED by an outside independent test on WSL2 with `systemd=true`, 2026-09-09: a user manager IS
+    // MEASURED by a later pass on WSL2 with `systemd=true`, 2026-09-09: a user manager IS
     // running, and the login shell sits in `0::/init.scope`, whose only ancestors are `/init.scope`
     // and the root. Neither matches, so this returned `None`, `direct_caps_available()` was false,
     // and every `kern run` there took the per-invocation systemd scope: 11.5 ms against the 1.0 ms
@@ -2221,7 +2221,7 @@ pub fn live_box_cgroups() -> Vec<(String, u32)> {
 /// per-box cgroup to ask about.
 ///
 /// WHY A SECOND CHANNEL EXISTS AT ALL. `live_box_cgroups` reads `kern.slice`, and on a host without
-/// cgroup delegation there is no `kern-box-*` directory to read: an independent test ran the
+/// cgroup delegation there is no `kern-box-*` directory to read: a later pass ran the
 /// registry-wipe case as uid 0 with no systemd and reported THREE live `kern box g1` processes,
 /// absent from `ps`, unreachable by `stop`, untouched by `gc` - and the warning could not fire,
 /// because its evidence did not exist. That is the host where the defect is MOST likely and where it
@@ -2537,7 +2537,7 @@ pub fn box_cgroup_dir_for_exec(pid1: i32) -> Option<PathBuf> {
 /// refused on a host with no delegation, where `apply_limits` returns `None`, the box sits in the
 /// caller's own cgroup, `box_cgroup_dir_for_exec` answers `None` and the placement therefore has
 /// nothing to place. The command was refused for a loss that did not happen, with a message naming
-/// caps that did not exist. Reported by an outside independent test on a box that was not at its pids limit.
+/// caps that did not exist. Reported by a later pass on a box that was not at its pids limit.
 ///
 /// A pure function of two bools so all four combinations are asserted without a cgroup filesystem,
 /// which is the same treatment `supervisor_needs_leaf` and `caps_gate_satisfied` get for the same
@@ -2586,7 +2586,7 @@ pub fn sweep_orphans_off_hot_path() {
     // BOTH DIRECTORIES A LEAF CAN BE BUILT IN, which is the same pair `gc_orphan_box_cgroups` reaps.
     // It used to be `kern.slice` alone, and that is the directory a host WITHOUT a systemd user
     // manager never has: there the leaf is built in the caller's own cgroup, so nothing on this path
-    // ever swept anything. MEASURED by an outside independent test on WSL2 with no user manager, 2026-09-09:
+    // ever swept anything. MEASURED by a later pass on WSL2 with no user manager, 2026-09-09:
     // 200 sequential `kern run` left 201 directories, cleared only by an explicit `kern gc`. That is
     // the shipped WSL rootfs's own configuration, so it was the documented Windows install path that
     // accumulated them.
@@ -2619,7 +2619,7 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
     // which is what "can this cap" means. It is not what "can this cap US" means, and the difference
     // is a whole class of host.
     //
-    // MEASURED by an outside independent test on WSL2 with `systemd=true`, 2026-09-09, after an earlier
+    // MEASURED by a later pass on WSL2 with `systemd=true`, 2026-09-09, after an earlier
     // version of this file learned to FIND the slice there: the leaf was created, `memory.max` and
     // `pids.max` were written and read back, and then both `clone3(CLONE_INTO_CGROUP)` and the
     // `cgroup.procs` write FAILED, because cgroup v2's delegation containment rule needs write access
@@ -2754,7 +2754,7 @@ fn locate_or_create_kern_slice() -> Option<PathBuf> {
         //
         // Inherited, they were kern's stderr, and kern's stderr is the box's stderr as far as the SDK
         // is concerned. On a host with the systemd tools installed but not booted (a container, a WSL
-        // session, the plain-root machine an external audit ran on), this probe answers "no" and prints
+        // session, the plain-root machine a later pass ran on), this probe answers "no" and prints
         //
         //   System has not been booted with systemd as init system (PID 1). Can't operate.
         //   Failed to connect to bus: Host is down
@@ -3660,7 +3660,7 @@ fn cgroup_dir_from_proc_line(raw: &str) -> Option<std::path::PathBuf> {
     // cap that truly failed to apply is caught by its fail-closed read-back and by
     // `--require-limits`, neither of which routes through here.
     //
-    // Found by an independent test reading the function, with no host and no binary. It is a
+    // Found by a later pass reading the function, with no host and no binary. It is a
     // property of the code, not of a machine, which is why it did not need one.
     if rel == "/" {
         return None;
@@ -3745,7 +3745,7 @@ fn memory_cap_proven_under(root: &Path, own: Option<&Path>, bytes: u64) -> bool 
 /// SWAP IS PART OF THE CEILING, and leaving it out made the proof weaker than the cap it stands in
 /// for. kern's own cap writes `memory.swap.max = 0` (swap off, so `--memory` is a hard total), so an
 /// ancestor accepted INSTEAD of writing that cap has to be at least as strong. MEASURED by an
-/// independent reviewer on 2026-10-10: a scope with `MemoryMax=48M` and systemd's default
+/// measured on 2026-10-10: a scope with `MemoryMax=48M` and systemd's default
 /// `memory.swap.max=max` was accepted as proof of a 64 MiB request, and a command that asked for
 /// 64 MiB allocated 100 MB and exited 0 - `memory.peak` 50331648 and `memory.swap.peak` 63635456 on
 /// that scope, `oom_kill 0`. Smaller than the 25.5 GB incident and the same class: the verdict
@@ -4396,7 +4396,7 @@ pub fn effective_cgroup_dir(pid: i32) -> Option<PathBuf> {
 /// add `memory.swap.max` (see [`effective_ceiling_at`], and the measurement that forced it) and this
 /// one did not, so for a day the claim was false in exactly the direction that matters: a level with
 /// `memory.max=48M` and unbounded swap would have been reported as a 48 MiB ceiling the kernel does
-/// not hold. An external reviewer raised it as an opinion rather than a finding, having no way to
+/// not hold. It was raised as an opinion rather than a finding, with no way to
 /// build a box in that position; the property was mine to keep either way.
 pub fn memory_max_in_force(dir: &std::path::Path) -> Option<u64> {
     tightest_effective_ceiling_under(std::path::Path::new(CGROUP_V2_MOUNT), dir)
@@ -4420,7 +4420,7 @@ fn tightest_effective_ceiling_under(
         // predicate at `/sys/fs/cgroup` before stopping, so a box one level under a cgroup-NAMESPACE
         // root had the refusal read that root's ceiling and this walk stop short of it. The same box
         // was "proven capped" to `kern run` and `null` to `kern inspect`, which is exactly the
-        // contradiction the docstring above promises cannot happen. Found by review, not by a test:
+        // contradiction the docstring above promises cannot happen. Found by a later pass, not by a test:
         // both walks were written from the same shape and only one of them was anchored like the
         // predicate it has to agree with.
         if cur.as_path() == root || !cur.pop() || !cur.starts_with(root) {
@@ -4818,7 +4818,7 @@ mod tests {
 
     /// The `/proc` channel finds a live box, and it does not use `kern.slice` to do it.
     ///
-    /// This exists because an independent test ran the registry-wipe case on a host with NO
+    /// This exists because a later pass ran the registry-wipe case on a host with NO
     /// cgroup delegation - uid 0, no systemd - and measured three live `kern box` processes that
     /// `ps` could not report, `stop` could not reach and `gc` would not touch. The cgroup channel had
     /// nothing to read there, so the warning could not fire on the host where the defect is most
@@ -4891,7 +4891,7 @@ mod tests {
     /// here" about a box that may be capped exactly as asked. A guaranteed false RED for anyone who
     /// cannot locate themselves.
     ///
-    /// Found by an independent test reading the function with no host, no repo and no binary. The
+    /// Found by a later pass reading the function with no host, no repo and no binary. The
     /// asymmetry is the reason it is worth a test rather than a comment: a false red is loud and
     /// annoying, a false green is silent, and this module's stated policy already picks silence
     /// when it cannot tell.
@@ -5316,7 +5316,7 @@ mod tests {
 
     /// The ceiling a level really states, including the swap it opens.
     ///
-    /// An external reviewer measured what leaving swap out cost: a scope with `MemoryMax=48M` and
+    /// What leaving swap out cost was measured: a scope with `MemoryMax=48M` and
     /// systemd's default `memory.swap.max=max` was accepted as proof of a 64 MiB request, and the
     /// command allocated 100 MB and exited 0 (`memory.peak` 50331648, `memory.swap.peak` 63635456 on
     /// that scope, `oom_kill 0`). kern's own cap writes `swap.max = 0`, so an ancestor accepted in
@@ -5333,7 +5333,7 @@ mod tests {
         // A bounded swap allowance ADDS to it.
         assert_eq!(effective_ceiling_from(m(48), m(8), swapful), m(56));
         // Unbounded swap on a host that HAS swap states no ceiling at all: the room it opens is the
-        // host's, not this level's. This is the reviewer's case.
+        // host's, not this level's. This is that case.
         assert_eq!(effective_ceiling_from(m(48), None, swapful), None);
         // ... but on a swapless host there is nothing to swap into, so `memory.max` stands. Without
         // this, every swapless host would start refusing a cap that binds perfectly.
@@ -5625,7 +5625,7 @@ mod tests {
     fn a_box_in_the_cgroup_root_has_no_cgroup_of_its_own_to_report() {
         // THE PIN FOR A REPORTING DEFECT, and the reason it belongs here rather than in the CLI.
         //
-        // `kern inspect` echoes the `--memory` the box was STARTED with. An outside independent test measured
+        // `kern inspect` echoes the `--memory` the box was STARTED with. A later pass measured
         // `"memory_max": 67108864` on a box whose PID 1 sat in `0::/`, the cgroup-v2 ROOT, which has
         // no `memory.max` file at all: a cap reported as a fact where the kernel holds none. Their
         // `kern doctor` said so correctly on the same host, and the two readings disagreed.
@@ -5683,7 +5683,7 @@ mod tests {
         // reaches the second only when the first is `None`: on a host where the slice EXISTS but
         // boxes do not use it, it reported on a directory no box goes near.
         //
-        // MEASURED by an outside independent test, uid 0 with no user manager: doctor said a `--memory` write
+        // MEASURED by a later pass, uid 0 with no user manager: doctor said a `--memory` write
         // "silently never bites" while a box on the same host held `memory_max = 67108864` and an
         // exec that overran it was killed with 137.
         //
@@ -5778,7 +5778,7 @@ mod tests {
             exec_join_outcome_after_failure(&open()),
             ExecCgroupJoin::Unbounded
         ));
-        // And a real pids ceiling alone, which is the case an outside independent test reproduced with a
+        // And a real pids ceiling alone, which is the case a later pass reproduced with a
         // saturated `--pids-limit` and the one that must keep refusing.
         std::fs::write(d.join("memory.max"), "max\n").unwrap();
         std::fs::write(d.join("pids.max"), "4\n").unwrap();
@@ -5793,7 +5793,7 @@ mod tests {
     fn placement_is_gated_on_the_common_ancestor_and_not_on_the_destination() {
         // THE RULE THIS PINS, and the defect it was written after. cgroup v2 delegation containment
         // needs write access to the `cgroup.procs` of the COMMON ANCESTOR of the source and the
-        // destination, not just of the destination. An independent test measured the consequence on WSL2 with
+        // destination, not just of the destination. A later pass measured the consequence on WSL2 with
         // `systemd=true`, where the shell sits in `/init.scope`: kern found a delegated, writable,
         // correctly capped `kern.slice`, created a leaf in it, wrote and read back both caps, and
         // then could not put the process in, because the common ancestor of `/init.scope` and
@@ -6656,7 +6656,7 @@ mod tests {
     /// not create would reshape a user's own session: `kern doctor` recommends `systemd-run --user
     /// --scope bash` to pay the scope cost once, and every box started in that shell runs in an
     /// ambient `run-*.scope`. The prefix kern puts on its OWN units is the proof of ownership, and this
-    /// is the assertion that keeps a future "any scope will do" from passing review.
+    /// is the assertion that keeps a future "any scope will do" from being accepted.
     #[test]
     fn only_a_leaf_kern_named_itself_counts_as_a_box_cgroup() {
         for ours in [

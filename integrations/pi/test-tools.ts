@@ -5,7 +5,7 @@
  * pieces: the gate as a function, the box through the SDK, the registration shape, and pi's dispatch.
  * None of them called `execute` with a hostile argument, so grep was first built against a path that
  * does not exist on the host (broken on every call) and then against one that does (unconfined: an
- * external audit read /etc/passwd through an absolute `path`, and host content through a workspace
+ * later pass read /etc/passwd through an absolute `path`, and host content through a workspace
  * symlink). Both passed every test in this directory.
  *
  *   node --experimental-strip-types test-tools.ts
@@ -106,7 +106,7 @@ ok(!(await call("grep", { pattern: "MARKER_AMBIG", glob: "a" })).includes("a-1-b
 fs.writeFileSync(path.join(ws, "dashline.txt"), "x\n--\n");
 ok((await call("grep", { pattern: "^--$" })).includes("dashline.txt:2:--"), "a matched line that is exactly --");
 // `.deps` is what `setup=` installs. `listFiles` omits it and so does `find`, but grep -r walks it,
-// so the two disagree. An external audit measured those hits vanishing through the path-lookup
+// so the two disagree. A later pass measured those hits vanishing through the path-lookup
 // fallback: the right answer for the wrong reason. The exclusion is a prefix test on the raw line
 // now, which needs no parse and cannot be defeated by a filename.
 fs.mkdirSync(path.join(ws, ".deps", "pkg"), { recursive: true });
@@ -114,7 +114,7 @@ fs.writeFileSync(path.join(ws, ".deps", "pkg", "a-1-b.txt"), "MARKER_DEPS\n");
 ok((await call("grep", { pattern: "MARKER_DEPS" })).includes("No matches"), "a hit under .deps is excluded, by prefix");
 // BOTH PREFIXES MUST END AT A SEPARATOR. `.deps/` did; `.kern-env` did not, and swallowed
 // `.kern-envelope.md`, an ordinary file that merely starts with those letters. Measured by an
-// external audit driving this same execute.
+// later pass driving this same execute.
 fs.writeFileSync(path.join(ws, ".kern-envelope.md"), "MARKER_ENVELOPE\n");
 fs.writeFileSync(path.join(ws, ".depsomething.txt"), "MARKER_DEPSISH\n");
 fs.mkdirSync(path.join(ws, ".deps-old"), { recursive: true });

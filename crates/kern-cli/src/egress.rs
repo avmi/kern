@@ -27,7 +27,7 @@ use std::os::unix::process::CommandExt; // for Command::pre_exec
 /// to nothing.
 ///
 /// WHY IT IS A FUNCTION. It was written out three times: here, in `host_of_authority`'s tail, and in
-/// the `Host:`-agreement check. A cleanup review pointed out the direction the drift would fail in,
+/// the `Host:`-agreement check. A cleanup pass pointed out the direction the drift would fail in,
 /// which is the reason this is worth a function: the allowlist decides "may the box reach this", and
 /// the agreement check decides "is the head's `Host:` the same host we vetted". If the second learns a
 /// folding rule the first does not (IDNA, a leading dot, odd whitespace), a `Host:` the allowlist
@@ -473,7 +473,7 @@ pub fn spawn(allow: &[String], box_port: u16) -> Result<EgressPending, String> {
     // THE READINESS PIPE, and it exists because the pump's failure used to be invisible.
     //
     // The pump joins the box netns and listens on `127.0.0.1:<port>` INSIDE it. That bind can fail: an
-    // external review hit `os error 99` (EADDRNOTAVAIL) on a host where the box's loopback was not
+    // later pass hit `os error 99` (EADDRNOTAVAIL) on a host where the box's loopback was not
     // usable, and the pump then printed one line and `_exit(1)`. Nobody read that exit. The box started
     // anyway with `http_proxy` pointing at a port nothing listens on, so every request the caller made,
     // including to the domains they had explicitly allowed, failed with `Connection refused`. The
@@ -808,7 +808,7 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
     //   6.8.0     x86_64  policy routing YES -> accepts    5.15.148 arm64  NO  -> REFUSES
     //   6.18 WSL2 x86_64  policy routing YES -> accepts    6.16.7   arm64  NO  -> REFUSES
     //
-    // (a seventh, the 6.12.8+ host of an external audit, refuses; its config was not readable)
+    // (a seventh, the 6.12.8+ host of a later pass, refuses; its config was not readable)
     //
     // Three earlier guesses died on the way here, and they are worth listing because each looked
     // sufficient at the time. Not the kernel VERSION: ordered 5.15, 6.6, 6.8, 6.12, 6.16, 7.0 the
@@ -825,7 +825,7 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
     // a correlation over five hosts with a candidate mechanism, NOT a proven cause, and it is written
     // that way on purpose.
     //
-    // What never varies is `connect`, and that is what this guard is built on. An external audit
+    // What never varies is `connect`, and that is what this guard is built on. A later pass
     // reported the first row and it could not be reproduced on the machine that wrote the fix, which
     // is the second column. Reproduced later on an Orin Nano, byte for byte, with the SHIPPED binary:
     //

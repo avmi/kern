@@ -1720,7 +1720,7 @@ test("a reply without a usable exit code is a fault, not a success", () => {
 });
 
 test("a binary that is not kern is refused before any code runs", async () => {
-  // MEASURED, and found by an independent test running the positive control this project wrote for him:
+  // MEASURED, and found by a later pass running the positive control this project wrote for him:
   // with `KERN_BIN=/bin/true` a call returned `success: true, exitCode: 0, fault: null` and an empty
   // stdout. The code never ran and the caller was told it had. Both bindings did it.
   const prev = process.env.KERN_BIN;
@@ -2452,7 +2452,7 @@ test("the setup leaves bytecode behind, so the default costs nothing", exec, asy
 });
 
 // kern and the workload share ONE stderr, so the raw field carries the launcher's own voice. An
-// external audit found kern's `note:` lines inside a LangChain tool result, spending a model's
+// later pass found kern's `note:` lines inside a LangChain tool result, spending a model's
 // context on the runtime's housekeeping where they can be misread as the program's own errors.
 // `codeStderr` and `runtimeNotes` are the two halves.
 //
@@ -2729,7 +2729,7 @@ test("kern's own state is refused as a mount source", () => {
   // is the same class one step removed (write it and the rootfs a LATER box runs is yours). Same reason
   // the docker socket is refused, which was in the list while these were not.
   //
-  // The DATA dir joined the list after an independent test took the refused two as the shape of the
+  // The DATA dir joined the list after a later pass took the refused two as the shape of the
   // rule and looked for the rest: `$XDG_DATA_HOME/kern` holds `volumes/`, the CONTENT of every named
   // volume on the host, and `builds/`. Its two siblings were refused by name and it was not.
   const prev = { kb: process.env.KERN_BIN, rt: process.env.XDG_RUNTIME_DIR,
@@ -2752,7 +2752,7 @@ test("kern's own state is refused as a mount source", () => {
       }
     }
     // THE DEFAULT LOCATION STAYS REFUSED WHILE THE VARIABLE POINTS ELSEWHERE. Measured by the same
-    // independent test, in one process: with `XDG_DATA_HOME` pointed at a scratch dir, `~/.local/share/kern`
+    // later pass, in one process: with `XDG_DATA_HOME` pointed at a scratch dir, `~/.local/share/kern`
     // was ACCEPTED and still held `builds` and `volumes`. Both spellings are in the list now, so the
     // guard covers where kern WILL write and where a previous run already did.
     {
@@ -2937,7 +2937,7 @@ test("a box that printed is never a box that never started", async () => {
 
 test("any error kern prints before the box exists is a startup failure", () => {
   // The CLASS, after three patches that each closed one member of it. `error: config:` was added because
-  // a caller measured it, `error: image:` before that, `error: pull:` before that. An independent test
+  // a caller measured it, `error: image:` before that, `error: pull:` before that. A later pass
   // then ran `image: ""` and got `error: bad image reference: empty`, in none of the eleven openings the
   // list had grown to. The list was the defect: kern reports every error through ONE
   // `eprintln!("error: {}", ...)` and there are hundreds of messages behind it.
@@ -4121,7 +4121,7 @@ test("the cap poll interval is scaled to the headroom, not to the clock", () => 
   assert.strictEqual(RATE, 8e9);
   assert.strictEqual(FRAC, 0.5);
 
-  // ⛔ AND THE SELF-LIMIT MUST YIELD IN THE LAST QUARTER, which an outside review falsified this test
+  // ⛔ AND THE SELF-LIMIT MUST YIELD IN THE LAST QUARTER, which a later pass falsified this test
   // for. `costMs * 10` sits in the outer `max`, so on a workspace that is expensive to measure it set
   // the interval alone and the overshoot went back to being a function of the DISK: MEASURED with the
   // headroom held at 50 MiB and only the file count varied, 1.20x at 0 files, 18.54x at 10,000,
@@ -4207,7 +4207,7 @@ test("a mode-0 file is refused as a file and as ours", () => {
 });
 
 test("every pathRefusal call site hands over the path", () => {
-  // An outside review found `readFile` naming a mode-0 FILE as "a directory on that path". The same
+  // A later pass found `readFile` naming a mode-0 FILE as "a directory on that path". The same
   // message was reachable through `writeFile`, `restore` and the snapshot/restore open, because none
   // of those call sites handed over the path. Asserting one fixed site would not stop the next one, so
   // this reads the module's own source and counts the arguments.

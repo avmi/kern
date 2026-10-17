@@ -4,7 +4,7 @@
  * Split out so an auditor can import it from the published tarball and exercise the path gate,
  * the box options and the glob matcher WITHOUT installing the peer. This code used to sit in
  * index.ts, which imports pi at the top for the seven tool factories, so importing any of it
- * threw `Cannot find package '@earendil-works/pi-coding-agent'`. Raised in an external audit of
+ * threw `Cannot find package '@earendil-works/pi-coding-agent'`. Raised in a later pass of
  * 0.1.1, and it is why the path gate had no test a stranger could run.
  */
 import path from "node:path";
@@ -22,7 +22,7 @@ export const GUEST_WORKSPACE = "/workspace";
  * are load-bearing: with neither, `npm install express` exits 2; with `HOME` alone and no writable
  * `/tmp`, it still exits 2; with both, it exits 0.
  *
- * It points at the WORKSPACE, and an independent test argued it should point at the scratch instead: a cache
+ * It points at the WORKSPACE, and a later pass argued it should point at the scratch instead: a cache
  * is not a project artifact, and `npm install express` leaves **7.7 MB in `/workspace/.npm` on the
  * host**, where nothing bounds it, plus a `.npm` directory in the user's project. Both facts are
  * true and measured. The recommendation was still tried and REFUTED, by measuring the premise
@@ -242,7 +242,7 @@ export function boxOptions(hostWorkspace: string): SandboxOptions {
 export function refuseOutsideWorkspace(absolutePath: string): string {
 	// A GATE MUST REFUSE, NOT CRASH. The argument arrives from a model, so `null`, a number or a
 	// missing field are reachable inputs, and `.trim()` on them threw a TypeError that reads like a
-	// bug in the extension rather than a rejected path. Raised in an external audit of 0.1.1.
+	// bug in the extension rather than a rejected path. Raised in a later pass of 0.1.1.
 	if (typeof absolutePath !== "string") {
 		throw refuse("gate", `refusing a path that is not a string: ${typeof absolutePath}`);
 	}

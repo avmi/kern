@@ -265,7 +265,7 @@ _TOOLS = [
     {
         "name": "run_code",
         # WHAT THIS SENTENCE IS FOR, and why it no longer opens with "on the user's own machine". An
-        # independent test wired this server into Cursor correctly and the agent answered
+        # later pass wired this server into Cursor correctly and the agent answered
         # "The sandbox run completed successfully. Output: 45" from its OWN python, never calling the
         # tool: the workspace was untouched for eleven days. The client already owns the word "sandbox"
         # (its terminal policy says "outside the sandbox (allowlisted)"), so a model choosing between
@@ -361,7 +361,7 @@ _RUN_CODE_LANGUAGES = next(
 # what the client was told is the only honest definition, and a retyped copy drifts.
 #
 # WHY THE SERVER CHECKS IT AT ALL, since JSON Schema allows extra properties by default and most servers
-# drop them. MEASURED by an independent test: a `tools/call` carrying `{"code": ..., "image": ""}` ran
+# drop them. MEASURED by a later pass: a `tools/call` carrying `{"code": ..., "image": ""}` ran
 # and returned `[exit 0]`, so a model that asked for a different image was told its code had run and was
 # never told the image it named had no effect. Under `additionalProperties` the SDK's own contract is the
 # opposite: an unknown keyword to `Sandbox()` raises. A model cannot correct what it is not told about.
@@ -466,7 +466,7 @@ class _Server:
             # cap it gets depends on what the workspace costs to MEASURE - the interval scales to the
             # headroom but can never be shorter than one walk of the tree, so a few files are crossed
             # by ~1.2x and 50,000 by ~10x. This was the third copy of a sentence that claimed a
-            # tighter bound than the code has; an outside review found two of them.
+            # tighter bound than the code has; two of them were found that way.
             #
             # NO SENTINEL HERE, unlike the memory, tmpfs and prewarm knobs, and the difference is that
             # their default is a VALUE while this one's default is OFF: `0` is simply what unset means,
@@ -491,7 +491,7 @@ class _Server:
                 # to `_MAX_TEXT` (16k chars per stream, `_MAX_TOTAL_TEXT` aggregate). So a cell that
                 # prints 100 MB made the binding read 64 MiB of stdout AND 64 MiB of stderr into host
                 # RAM, decode both, and throw away all but 16k - 128 MiB and the time it takes, spent
-                # to produce nothing. An independent test wired this server into a client and the
+                # to produce nothing. A later pass wired this server into a client and the
                 # client stalled on exactly that cell while the server stayed alive, which is the
                 # shape this produces: the reply was small, the wait was not.
                 # 1 MiB per stream is ~64x the most a reply can carry, so nothing surfaceable is lost,
@@ -887,7 +887,7 @@ class _Server:
         # the scratch charge for `oom`. Appended for EVERY type rather than for the one that prompted
         # this: a per-type branch here is a second place to keep in step with the taxonomy.
         # THE PROVENANCE STAMP, folded into the frame that is already on every reply so it costs no line.
-        # WHY IT IS HERE. An independent test wired this server into Cursor correctly, asked the agent to
+        # WHY IT IS HERE. A later pass wired this server into Cursor correctly, asked the agent to
         # "run print(sum(range(10))) in the sandbox", and got "The sandbox run completed successfully.
         # Output: 45" from the client's OWN python, with this server's workspace untouched for eleven days.
         # Four probes said host: the caller's `init.scope` cgroup, the host's full `/dev`, `Seccomp: 0`

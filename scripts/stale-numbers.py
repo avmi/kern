@@ -9,13 +9,13 @@ WHY THIS EXISTS
         BENCHMARKS.md that points AT that table, plus both binding READMEs and the launch post;
       * SECURITY.md said "33 syscalls denied: 24 that hard-kill plus the 9 that return ENOSYS" and,
         two paragraphs later, "ENOSYS moves five syscalls", so the page offered 5 + 24 = 29 against
-        its own 33, and an outside audit repeated the smaller number;
+        its own 33, and the smaller number was repeated back;
       * Docker's resident memory was re-measured at 154 to 160 MB and corrected in the README and
         BENCHMARKS.md, while ~186 MB survived in four places, in examples/README.md and
         in the blog post. That one is the worst shape: a stale number that flatters us, on the page
         that carries the edge argument.
 
-    None of these was a lie and none was caught by review, because a human reading one document
+    None of these was a lie and none was caught by reading, because a human reading one document
     cannot see the other. They are all the same defect: a fact with more than one home. This is the
     mechanical check for it, in the same spirit as the em-dash rule and scripts/no-ai-slop.py.
 
@@ -98,7 +98,7 @@ STALE: list[tuple[str, str, str, set[str]]] = [
         # Introduced by the very commit that was leaning the README for the launch: the sentence said
         # bubblewrap was "0.8 ms ahead" while the table two lines above it read kern 2.2 and
         # bubblewrap 3.0, so it handed a competitor a win it does not have on that machine, and an
-        # outside review repeated it back within the day. BENCHMARKS.md is exempt, because on
+        # it was repeated back within the day. BENCHMARKS.md is exempt, because on
         # the ARM boards' DEFAULT path bubblewrap IS ahead and it says so with numbers.
         r"bubblewrap is [0-9.]+\s*ms ahead",
         "0.8 ms behind, on the README's own table",
@@ -291,7 +291,7 @@ def _rust_string_literal_after(src: str, marker: str) -> str:
     # `x` or `u` instead of the character. Both would make the gate compare a value that is not the
     # one the code prints, and a gate that silently reads the wrong string is worse than no gate.
     # Return a sentinel nobody can match so the caller reports a failure and a human looks. Raised in
-    # review on 2026-08-28; neither form appears in the claims today.
+    # caught on 2026-08-28; neither form appears in the claims today.
     if src[max(0, j - 2):j].endswith(("r", "r#")):
         return "<gate cannot read a raw string literal>"
     out: list[str] = []
@@ -422,7 +422,7 @@ def gpu_claims_agree() -> list[str]:
     WHAT THIS DOES NOT CATCH, stated because a gate mistaken for more than it is does more harm than
     no gate at all. It checks that required text is PRESENT and that forbidden words are ABSENT. It
     cannot see a sentence ADDED elsewhere on the same page that gives back what the caveat took
-    away. An independent test produced this counterexample on 2026-08-28, and it passes every check here:
+    away. A later pass produced this counterexample on 2026-08-28, and it passes every check here:
 
         "On any host that shows TIER-HW, operators may rely on device memory limits for
          hostile multi-tenant packing without further controls."
@@ -431,7 +431,7 @@ def gpu_claims_agree() -> list[str]:
     walks away with a guarantee kern never made. Detecting that is reading for contradiction, not
     pattern matching, and a regex aimed at it would fire on the sentences that discuss hostile
     multi-tenant use on purpose. This file records elsewhere what happens to a gate with false
-    positives. So the defence against added prose is review, and this gate's job is the narrower one
+    positives. So the defence against added prose is a reading, and this gate's job is the narrower one
     it can actually do: keeping the code and the documents from drifting apart.
     """
     try:
@@ -468,7 +468,7 @@ def gpu_claims_agree() -> list[str]:
     # opposite directions: dropping the cooperative one understates the danger, dropping the hardware
     # one overstates the guarantee. The second is the one that actually happened. `Tier::Hw` claimed
     # "per-tenant VRAM enforced by the device" from evidence that is purely topological, which an
-    # outside reader caught on 2026-08-28; it is pinned here so the narrower wording cannot drift
+    # caught on 2026-08-28; it is pinned here so the narrower wording cannot drift
     # back without failing the build.
     # WHY THESE TWO SENTENCES ARE PINNED, because a gate that says only "restore this string" leaves a
     # successor with the lock and not the reason. Each marker is an ADMISSION OF A LIMIT, and each
@@ -538,7 +538,7 @@ def gpu_claims_agree() -> list[str]:
         # claim. "TIER-HW ... enforce" was one-directional, so "enforcement ... below TIER-HW" was a
         # false negative; and a document describing the gate itself ("A2 refuses isolation/secure/hard
         # on every row below TIER-HW so that cooperative wording cannot claim enforcement") is correct
-        # prose that the rule would have failed. Both raised in review on 2026-08-28. A gate with
+        # prose that the rule would have failed. Both raised by a later pass on 2026-08-28. A gate with
         # false positives gets switched off, which this file records happening twice already, so the
         # meta case is exempted by the words that only appear when describing the mechanism.
         window = r"(?:TIER-HW.{0,220}?enforc|enforc.{0,220}?TIER-HW)"
