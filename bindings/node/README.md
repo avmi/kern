@@ -219,9 +219,9 @@ new Sandbox({
   setup,           // one-time, network-on, e.g. "pip install pandas"
   workspace,       // host dir to persist; omit for a temp dir deleted on close()
   workspaceMaxBytes, // default null; measured WHILE a call runs, so the call that crosses it is
-                   // stopped with a `workspace_full` fault. The interval scales to the headroom, so
-                   // the overshoot is bounded by the cap and not by the disk (measured: 1.5x a
-                   // 50 MiB cap). Cooperative: a measurement and a kill, not a filesystem refusal
+                   // stopped with a `workspace_full` fault. How far past it depends on what the
+                   // workspace costs to measure: a few files are crossed by ~1.3x and 50,000 by
+                   // ~13x. Cooperative: a measurement and a kill, not a filesystem refusal
   persist,         // default false; true = ONE resident box per name, every call `kern exec`s into it.
                    // Keeps the box, not the interpreter. Needs name + workspace; survives close(),
                    // destroy() stops it

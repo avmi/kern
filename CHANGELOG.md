@@ -81,15 +81,29 @@ reclaimed is no longer left behind here. Measured end to end on a cache of 20 su
 and the layer key, where a failed removal used to be dropped in silence. It is a note and not an
 error: the sweep removed everything it could, and the exit code still reports that.
 
-**`workspace_max_bytes` bounds the overshoot by the CAP now, not by the disk.** The in-call poller
-looked once a second whatever the limit was, so what got past it was whatever the disk could write in
-that second: a 50 MiB cap stopped a box at 5,964,300,288 bytes, 113.8x the cap, and a report from a
-slower disk measured ~933 MB of the same thing. A faster disk overshot further, which makes the number
-a lagging indicator rather than a limit. The interval is now the time the box would need to spend half
-the remaining headroom at a rate above any disk measured here, floored at 2 ms and still backed off to
-ten times what a measurement costs, so a workspace with many files cannot be walked into the ground.
-The same test now stops at 1.2x the cap in Python and 1.5x in Node. The cap remains a measurement and a
-kill on a host directory, not a refusal from the filesystem.
+**`workspace_max_bytes` is overshot by far less, and by an amount that depends on what the workspace
+costs to MEASURE.** The in-call poller looked once a second whatever the limit was, so what got past it
+was whatever the disk could write in that second: a 50 MiB cap stopped a box at 5,964,300,288 bytes,
+113.8x the cap, and a report from a slower disk measured ~933 MB of the same thing. The interval is now
+scaled to the remaining headroom, floored at 1 ms, and between two walks of the tree a cheap probe
+re-checks the eight biggest files and every directory's fingerprint instead of walking it again.
+
+⛔ IT IS NOT BOUNDED BY THE CAP, and an earlier draft of this entry said it was. Measured with the
+headroom held at 50 MiB and only the pre-existing file count varied:
+
+| files  | Python  | Node    |
+|--------|---------|---------|
+| 0      | 1.26x   | 1.30x   |
+| 1,000  | 1.32x   | 1.80x   |
+| 10,000 | 4.12x   | 8.40x   |
+| 50,000 | 12.88x  | 12.80x  |
+
+An interval can never be shorter than one walk of the tree, so on a large workspace the bound is the
+walk's duration times the write rate, and Node pays more per walk (19.85 ms against 13.17 ms on the
+same 10,000-file tree). The `workspace_full` fault says this and gives the figures. Closing it needs a
+measurement that is not O(files), which would have to keep hard links counted once, symlinks refused
+and a closed directory refusing the call, or it defeats the cap for good. The cap remains a measurement
+and a kill on a host directory, not a refusal from the filesystem.
 
 In Node the backoff that bounds the poller's own cost had never run: its timer was started after the
 walk returned instead of before it, so it measured the comparison that follows and always came out at

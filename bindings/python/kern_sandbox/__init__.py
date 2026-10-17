@@ -143,12 +143,21 @@ def _workspace_usage(
     # probe already pays for. A write does not change any of them; CREATING or removing an entry moves
     # the mtime, and on the filesystems that grow a directory it moves the size too.
     #
-    # ⛔ THREE FIELDS AND NOT JUST THE MTIME, because mtime alone can miss a create and a second review
-    # round named the mounts where it does: `lazytime` defers the visible timestamp, and a coarse
-    # filesystem (FAT, some network mounts, 1-2 second ticks) leaves two creates inside one tick
-    # indistinguishable. Size and nlink are independent of the clock, so a create that the timestamp
-    # hides can still be caught. It does not CLOSE that class - a coarse mount with a fixed-size
-    # directory can still hide one - and the full walk remains the backstop for it.
+    # ⛔ THREE FIELDS, AND WHAT EACH ONE ACTUALLY CATCHES IS MEASURED, not assumed. A second review
+    # round pointed out that an earlier version of this comment claimed more than the fields deliver,
+    # so they were measured on ext4 here:
+    #
+    #   mtime  moves on EVERY create and unlink - but `lazytime` defers the visible timestamp, and a
+    #          coarse filesystem (FAT, some network mounts, 1-2 second ticks) leaves two creates inside
+    #          one tick indistinguishable.
+    #   size   moves only when the directory needs another block: one file in a directory with room
+    #          left it at 4096, three hundred took it to 12288. It catches a BURST, not one file.
+    #   nlink  moves only for a SUBDIRECTORY (2 to 3), never for a regular file.
+    #
+    # So the three together are strictly better than the timestamp alone and they do NOT close the
+    # coarse-mtime case: a single file created in a directory with room, on a mount whose timestamp is
+    # deferred or coarse, moves none of them. The full walk is the backstop for that, and it is no
+    # weaker than what came before the probe existed.
     dirs: "dict[str, tuple[int, int, int]]" = {}
     try:
         base_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)

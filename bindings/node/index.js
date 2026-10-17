@@ -310,10 +310,22 @@ function workspaceUsage(root, blind = null, regranted = null, biggest = null) {
   let total = 0;
   const seen = new Set();
   const unreadable = [];
-  // The biggest REGULAR file, and every directory's own mtime: what a caller needs to re-check the
-  // tree WITHOUT walking it again. A write does not move a directory's mtime; creating or removing an
-  // entry does, so one `stat` per DIRECTORY spots a file never seen before for 1 syscall on a flat
-  // workspace instead of 10,000. Free here - the walk already holds every `st`. Mirrors Python.
+  // The K biggest REGULAR files, and every directory's FINGERPRINT: what a caller needs to re-check
+  // the tree WITHOUT walking it again, for one `stat` per DIRECTORY instead of one per file. Free
+  // here - the walk already holds every `st`.
+  //
+  // ⛔ THREE FIELDS, AND WHAT EACH ONE ACTUALLY CATCHES IS MEASURED, not assumed. An earlier version
+  // of this comment claimed more than they deliver, and a review round said so. On ext4 here: `mtime`
+  // moves on every create and unlink, but `lazytime` defers the visible timestamp and a coarse
+  // filesystem (FAT, some network mounts, 1-2 second ticks) leaves two creates inside one tick
+  // indistinguishable; `size` moves only when the directory needs another block - one file left it at
+  // 4096 and three hundred took it to 12288 - so it catches a BURST and not one file; `nlink` moves
+  // only for a SUBDIRECTORY (2 to 3), never for a regular file.
+  //
+  // So the three together are strictly better than the timestamp alone and they do NOT close the
+  // coarse-mtime case: a single file created in a directory with room, on a mount whose timestamp is
+  // deferred or coarse, moves none of them. The full walk is the backstop for that, and it is no
+  // weaker than what came before the probe existed. Mirrors Python.
   const top = [];
   const dirs = new Map();
   const retried = new Set();
