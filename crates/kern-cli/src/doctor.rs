@@ -1275,10 +1275,9 @@ fn check_cgroup() -> R {
                     .into(),
                 format!(
                     "{}; user manager delegates: {listed}. `--memory` won't be enforced \
-                     (`--cpus`/`--pids-limit` may still work). Enable it: \
-                     /etc/systemd/system/user@.service.d/delegate.conf → [Service] \
-                     Delegate=memory pids cpu cpuset, then reboot (common on Raspberry Pi OS)",
-                    memory_probe_sites_phrase()
+                     (`--cpus`/`--pids-limit` may still work). {}",
+                    memory_probe_sites_phrase(),
+                    memory_delegation_next_step(&have)
                 ),
             )
         }
@@ -1311,13 +1310,40 @@ fn memory_probe_sites_phrase() -> String {
     }
 }
 
+/// What to DO about a `--memory` write that did not bind, given the set the manager actually delegates.
+///
+/// ⛔ DO NOT RECOMMEND A LINE THAT IS ALREADY IN PLACE. This row used to end with "Enable it:
+/// … Delegate=memory pids cpu cpuset, then reboot" unconditionally, in the same sentence that had
+/// just listed what the manager delegates. MEASURED inside `unshare -Ur`, 10/10 runs: "user manager
+/// delegates: cpuset cpu io memory pids. … Enable it: … Delegate=memory" - the row told the reader to
+/// add `memory` delegation while reporting that `memory` is delegated, and a reader who follows it
+/// reboots for nothing and still has the warning.
+///
+/// Same rule the uncapped-cap clause already follows and says out loud: name the step only when
+/// taking it would change the answer, and otherwise say what the host really is. When `memory` IS
+/// delegated the cause is in the cap target, not in the delegation, and the honest row says so
+/// instead of inventing a remedy.
+fn memory_delegation_next_step(have: &[String]) -> &'static str {
+    if have.iter().any(|c| c == "memory") {
+        "The manager DOES delegate `memory`, so delegation is not the missing step and adding it \
+         changes nothing: the write did not bind in the cap target itself"
+    } else {
+        "Enable it: /etc/systemd/system/user@.service.d/delegate.conf → [Service] \
+         Delegate=memory pids cpu cpuset, then reboot (common on Raspberry Pi OS)"
+    }
+}
+
 /// The cgroup controllers the systemd **user manager** can hand to a box's transient scope - read
 /// from `user@<uid>.service/cgroup.controllers`. Empty if it can't be read.
 fn delegated_controllers() -> Vec<String> {
-    let uid = unsafe { libc::getuid() };
-    let path =
-        format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/cgroup.controllers");
-    std::fs::read_to_string(path)
+    // THE SAME TREE THE RUNTIME CAPS IN, resolved by the runtime. Spelling the canonical path here
+    // read `cgroup.controllers` out of a tree the runtime would not have used: inside `unshare -Ur`
+    // the uid is 0, so this looked in `user@0.service` and reported "none readable" in the same row
+    // that named `user@1000.service` as the probe site.
+    let Some(root) = kern_isolation::user_delegation_root() else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(root.join("cgroup.controllers"))
         .map(|s| s.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default()
 }
@@ -2041,6 +2067,42 @@ mod tests {
             src[start..end].contains("memory_probe_sites_phrase()"),
             "the row saying {d:?} states a cap does not bind without naming the cgroup it probed"
         );
+    }
+
+    /// A row must not tell the reader to add what the same row reports is already there.
+    ///
+    /// MEASURED inside `unshare -Ur`, 10/10 runs before the fix: "user manager delegates: cpuset cpu
+    /// io memory pids. `--memory` won't be enforced … Enable it: … Delegate=memory pids cpu cpuset,
+    /// then reboot". A reader who follows that reboots for nothing and comes back to the same
+    /// warning. The pure function is the testable half; the row around it reads the real host.
+    #[test]
+    fn the_row_does_not_recommend_a_delegation_it_just_reported_as_present() {
+        let present: Vec<String> = ["cpuset", "cpu", "io", "memory", "pids"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let step = super::memory_delegation_next_step(&present);
+        assert!(
+            !step.contains("Delegate=memory"),
+            "the step recommends delegation the manager already grants: {step}"
+        );
+        assert!(
+            step.contains("not the missing step"),
+            "it must say WHERE the cause is instead, or the row ends with no next step: {step}"
+        );
+        // THE OTHER HALF, which is what makes the assertion above capable of failing: with `memory`
+        // absent the delegation line IS the actionable step and must still be there in full.
+        for absent in [Vec::new(), vec!["cpu".to_string(), "pids".to_string()]] {
+            let step = super::memory_delegation_next_step(&absent);
+            assert!(
+                step.contains("Delegate=memory pids cpu cpuset"),
+                "with {absent:?} delegated, the fix IS the delegation line: {step}"
+            );
+            assert!(
+                !step.contains("not the missing step"),
+                "it must not deny the remedy it is about to give: {step}"
+            );
+        }
     }
 
     /// The phrase must name REAL, absolute cgroup paths - not an empty parenthesis.

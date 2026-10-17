@@ -145,7 +145,6 @@ pub use real::Secret;
 /// Exported so the launcher and the box agree on one symbol instead of two literals.
 pub use real::READY_PREPARED;
 
-/// The same question asked of /proc, for a host with no per-box cgroup. See [`cgroup::live_box_supervisors_via_proc`].
 pub use cgroup::env_flag;
 /// Fork the workload into a capped leaf, reporting whether it got there.
 /// See [`cgroup::fork_workload_into_leaf`].
@@ -153,12 +152,16 @@ pub use cgroup::fork_workload_into_leaf;
 /// Reap orphaned `kern-box-*` cgroup dirs under kern.slice (the direct-cap path leaves an empty one
 /// on a box SIGKILL). Called by `kern gc`. See [`cgroup::gc_orphan_box_cgroups`].
 pub use cgroup::gc_orphan_box_cgroups;
-/// How many processes the kernel's OOM killer has killed in this cgroup subtree.
-/// See [`cgroup::oom_kill_count`].
+/// Is THIS process inside a systemd user manager's own tree (`user@<n>.service`), the condition that
+/// decides whether an exec can join a box's cgroup directly or has to pay for a transient scope?
+/// See [`cgroup::inside_user_manager_tree`].
+pub use cgroup::inside_user_manager_tree;
 /// Put the calling process into the box's capped cgroup. See [`cgroup::join_box_cgroup`].
 pub use cgroup::join_box_cgroup;
 /// Boxes the kernel still has, whatever the registry says. See [`cgroup::live_box_cgroups`].
 pub use cgroup::live_box_cgroups;
+/// The same question asked of /proc, for a host with no per-box cgroup.
+/// See [`cgroup::live_box_supervisors_via_proc`].
 pub use cgroup::live_box_supervisors_via_proc;
 /// Whether a `--memory` cap can actually be ENFORCED here (the `memory` controller is available in
 /// the cgroup tree). False on kernels that don't delegate it - a stock Raspberry Pi OS and the
@@ -174,13 +177,12 @@ pub use cgroup::memory_cap_proven_at_or_below;
 /// Why no systemd user manager is reachable on THIS host, for the uncapped warning's middle clause.
 /// See [`cgroup::missing_manager_clause`].
 pub use cgroup::missing_manager_clause;
+/// How many processes the kernel's OOM killer has killed in this cgroup subtree.
+/// See [`cgroup::oom_kill_count`].
 pub use cgroup::oom_kill_count;
 /// `oom_kill` read from a directory already resolved. See [`cgroup::oom_kill_count_at`].
 pub use cgroup::oom_kill_count_at;
 
-/// Is the systemd manager kern would use present? (root → the system manager `/run/systemd/system`,
-/// else a per-user `systemd` dir under `$XDG_RUNTIME_DIR`). See [`cgroup::user_systemd_present`].
-pub use cgroup::inside_user_manager_tree;
 /// The cgroup directory whose `oom_kill` counter covers the box a pid runs in, resolved while that
 /// pid is alive. See [`cgroup::oom_kill_dir_for_pid`].
 pub use cgroup::oom_kill_dir_for_pid;
@@ -204,6 +206,12 @@ pub use cgroup::sweep_orphans_off_hot_path;
 pub use cgroup::systemd_scope_mode;
 /// The capped cgroup this process created for its box. See [`cgroup::this_box_cgroup_dir`].
 pub use cgroup::this_box_cgroup_dir;
+/// The delegated tree kern caps in when it is not root, resolved the way the runtime resolves it.
+/// Exported so `kern doctor` reads `cgroup.controllers` from the SAME tree instead of spelling the
+/// canonical path a second time. See [`cgroup::user_delegation_root`].
+pub use cgroup::user_delegation_root;
+/// Is the systemd manager kern would use present? (root → the system manager `/run/systemd/system`,
+/// else a per-user `systemd` dir under `$XDG_RUNTIME_DIR`). See [`cgroup::user_systemd_present`].
 pub use cgroup::user_systemd_present;
 pub use cgroup::warn_unenforced_caps;
 /// The RAII handle on a capped cgroup leaf: it names the directory the workload must run in and
