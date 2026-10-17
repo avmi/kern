@@ -4,7 +4,7 @@
  * The suite whose absence let two grep defects ship three days apart. The other files here test the
  * pieces: the gate as a function, the box through the SDK, the registration shape, and pi's dispatch.
  * None of them called `execute` with a hostile argument, so grep was first built against a path that
- * does not exist on the host (broken on every call) and then against one that does (unconfined: an
+ * does not exist on the host (broken on every call) and then against one that does (unconfined: a
  * later pass read /etc/passwd through an absolute `path`, and host content through a workspace
  * symlink). Both passed every test in this directory.
  *
@@ -113,7 +113,7 @@ fs.mkdirSync(path.join(ws, ".deps", "pkg"), { recursive: true });
 fs.writeFileSync(path.join(ws, ".deps", "pkg", "a-1-b.txt"), "MARKER_DEPS\n");
 ok((await call("grep", { pattern: "MARKER_DEPS" })).includes("No matches"), "a hit under .deps is excluded, by prefix");
 // BOTH PREFIXES MUST END AT A SEPARATOR. `.deps/` did; `.kern-env` did not, and swallowed
-// `.kern-envelope.md`, an ordinary file that merely starts with those letters. Measured by an
+// `.kern-envelope.md`, an ordinary file that merely starts with those letters. Measured by a
 // later pass driving this same execute.
 fs.writeFileSync(path.join(ws, ".kern-envelope.md"), "MARKER_ENVELOPE\n");
 fs.writeFileSync(path.join(ws, ".depsomething.txt"), "MARKER_DEPSISH\n");

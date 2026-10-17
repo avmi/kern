@@ -789,7 +789,7 @@ export default function (pi: ExtensionAPI) {
 			// filename containing a dash made it worse. The path is what precedes the first
 			// separator that is followed by a line number.
 			// THE PATH IS LOOKED UP, NOT GUESSED. grep writes `path:line:text` and `path-line-text`
-			// and the separator also occurs in filenames, so a regex cannot tell them apart: an
+			// and the separator also occurs in filenames, so a regex cannot tell them apart: a
 			// later pass measured `a-1-b.txt:1:MATCH` being read as `a`, because the non-greedy
 			// prefix stops at the `-1-` inside the NAME. There is nothing in the line that says where
 			// the path ends. So the box's own file list is the ground truth, and the answer is the
