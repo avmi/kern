@@ -4079,3 +4079,111 @@ test("with kern 0.30.1 a refused resident call cannot be told from an exit 126",
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("the cap poll interval is scaled to the headroom, not to the clock", () => {
+  // The in-call workspace cap polled at a flat one-second floor, so what got past it was whatever the
+  // disk could write in a second. MEASURED 2026-10-16 against a 50 MiB cap: 5,964,300,288 bytes on
+  // disk, 113.8x the cap, and an independent report measured ~933 MB of the same thing on a ~1 GB/s
+  // disk. The interval is now the time the box would need to spend half the remaining headroom, so the
+  // overshoot is a function of the CAP, and the same measurement lands at 1.4x.
+  //
+  // THE REGRESSION THIS PINS IS THE FIRST FIX, not the original defect. Scaling the interval to the
+  // OBSERVED rate measured 67x - worse than the 30x it replaced - because the early look landed while
+  // the box was still starting, saw an empty workspace, called it idle and went back to the ceiling.
+  const { _capNextDelayMs: next, _CAP_POLL_MS: CEIL, _CAP_POLL_MIN_MS: FLOOR } = kern;
+  const { _CAP_FILL_RATE: RATE, _CAP_HEADROOM_FRAC: FRAC } = kern;
+  const cap = 50 << 20;
+
+  // A QUIET BOX WITH A SMALL CAP IS STILL WATCHED CLOSELY. This is the assertion the 67x version fails.
+  const idle = next(cap, 0, 0);
+  assert.ok(idle < CEIL / 10, `a zero observed rate bought the ceiling again: ${idle}`);
+  assert.ok(Math.abs(idle - ((cap * FRAC) / RATE) * 1000) < 1e-9, `${idle}`);
+
+  // The ceiling still applies when the headroom is large enough to be worth a full second.
+  assert.strictEqual(next(100 * 2 ** 30, 0, 0), CEIL);
+
+  // A box writing FASTER than the planning floor pulls the next look in; one writing slower cannot push
+  // it out. The rate is a floor, not a measurement.
+  assert.ok(next(cap, 20e9, 0) < idle, "a faster box must be looked at sooner");
+  assert.strictEqual(next(cap, 1, 0), idle, "a slow box must not relax the interval");
+
+  // THE SELF-LIMIT WINS OVER THE ARITHMETIC, which is the half that keeps a 500k-file workspace from
+  // spending more of the call in the poller than in the workload. 400 ms of walk buys a 4 s wait.
+  assert.strictEqual(next(cap, 20e9, 400), 4000, "cost * 10 must dominate");
+
+  // And a headroom of a few bytes asks for a busy loop, which the floor refuses.
+  assert.strictEqual(next(1, 20e9, 0), FLOOR);
+
+  // THE TWO BINDINGS ARE ONE CONTRACT, so the table is pinned in the units the other one uses too:
+  // Python's `_cap_next_delay` returns SECONDS and is asserted against the same five rows.
+  assert.strictEqual(CEIL / 1000, 1.0);
+  assert.strictEqual(FLOOR / 1000, 0.001);
+  assert.strictEqual(RATE, 8e9);
+  assert.strictEqual(FRAC, 0.5);
+
+  // POSITIVE CONTROL on the claim itself: the OLD policy, inlined, is where those numbers came from.
+  const oldPolicy = (headroom, rate, costMs) => Math.max(CEIL, costMs * 10);
+  assert.ok(oldPolicy(cap, 0, 0) === CEIL && CEIL > idle, "the old policy was the flat ceiling");
+});
+
+test("a mode-0 file is refused as a file and as ours", () => {
+  // MEASURED 2026-10-16 through the Python binding, which carried the same two strings: `readFile`
+  // against a file a cell had closed with `chmod 0` answered "a directory on that path is closed to
+  // this process and its owner bits could not be restored - it is not ours (a `user` session's box
+  // account owns it)". It was a file, it was owned by this uid, and the `/proc` hint was a third dead
+  // end. `writeFile` had the same defect on the same file and nobody reported that one.
+  //
+  // `pathRefusal` had NO test in either binding - its own comment says the verb-parsing defect was
+  // "found in both bindings at once, with no test on it" - so this covers the arms, not just the
+  // reported one.
+  const { _pathRefusal: refusal, _CLOSED_PATH_CAUSES: CAUSES } = kern;
+  const eacces = Object.assign(new Error("EACCES"), { code: "EACCES" });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kern-refusal-"));
+  try {
+    const f = path.join(dir, "shut.txt");
+    fs.writeFileSync(f, "x");
+    fs.chmodSync(f, 0);
+    if (process.getuid() === 0) {
+      // Root bypasses access(2), so the file arm is unreachable - say so instead of asserting nothing.
+      console.log("skip: the file arm needs a non-root uid (root bypasses access(2))");
+      return;
+    }
+    for (const [writing, bit] of [
+      [false, "u+r"],
+      [true, "u+w"],
+    ]) {
+      const said = refusal("read", "shut.txt", eacces, writing, f).message;
+      assert.ok(said.includes("it is a FILE"), said);
+      assert.ok(said.includes("mode 0o0"), said);
+      assert.ok(said.includes(`owned by uid ${process.getuid()} - which is this process`), said);
+      assert.ok(said.includes(`chmod ${bit}`), said);
+      // THE THREE FALSE CLAIMS, named so a future edit cannot quietly bring one back.
+      assert.ok(!said.includes("a directory on that path"), said);
+      assert.ok(!said.includes("not ours"), said);
+      assert.ok(!said.includes("/proc"), said);
+    }
+
+    // WITH NOTHING TO LOOK AT the enumeration stands, in the ONE spelling `snapshot` also uses.
+    const blind = refusal("read", "shut.txt", eacces, false).message;
+    assert.ok(blind.includes(CAUSES), blind);
+    assert.ok(blind.includes("a file the box left at mode 0"), blind);
+
+    // ⛔ AND A PARENT THAT DENIES MUST NOT BE REPORTED AS THE FILE. `0o500` is what the repair leaves:
+    // it refuses a NEW file while the target itself would be a writable `0o644`.
+    const d = path.join(dir, "d");
+    fs.mkdirSync(d);
+    fs.writeFileSync(path.join(d, "ok.txt"), "y");
+    fs.chmodSync(d, 0o500);
+    try {
+      const parent = refusal("write", "d/new.txt", eacces, true, path.join(d, "new.txt")).message;
+      assert.ok(parent.includes("a directory on that path is readable but NOT WRITABLE"), parent);
+      assert.ok(!parent.includes("it is a FILE"), parent);
+      const inside = refusal("read", "d/ok.txt", eacces, false, path.join(d, "ok.txt")).message;
+      assert.ok(!inside.includes("it is a FILE"), inside);
+    } finally {
+      fs.chmodSync(d, 0o700);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

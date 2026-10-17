@@ -2855,10 +2855,84 @@ class ExecutionResult:
         return self.success
 
 
-#: The first interval between two in-call workspace measurements. It is only the FIRST: the poller
-#: multiplies it by how long the measurement took, so the walk can never cost more than about a tenth
-#: of the call's wall time on a workspace with many files.
+#: The SLOWEST the in-call workspace poller goes while there is headroom left. A quiet workspace is
+#: looked at once a second; a workspace being filled is looked at sooner, because the interval is
+#: scaled to the headroom (see :func:`_cap_next_delay`).
 _CAP_POLL_S = 1.0
+
+#: The FASTEST the poller goes, whatever the arithmetic asks for, and 1 ms because that is the
+#: granularity the waits themselves have: ``_wait_for_exit`` rounds its slice UP to whole milliseconds
+#: for ``poll(2)``, and Node's ``setTimeout`` is no finer, so asking for less buys nothing.
+#:
+#: THIS IS THE ONLY THING THAT BOUNDS THE OVERSHOOT ON A SMALL CAP, and it was 2 ms for the wrong
+#: reason - a guess that ``cost * 10`` would dominate anyway. MEASURED 2026-10-16: walking a workspace
+#: of a few files costs **0.003 ms**, so ``cost * 10`` is 0.03 ms and 60x below the floor, which binds
+#: alone for every cap under ~32 MiB. The duty cycle there is 0.3%, so the floor was paying nothing for
+#: the overshoot it caused: a 1 MiB cap was crossed at 14x while a 1024 MiB one was crossed at 1.01x.
+#: At 10,000 files the walk costs 13.5 ms and ``cost * 10`` takes over at 135 ms, which is the half that
+#: keeps a large workspace from being walked into the ground - so the floor can be small safely.
+#:
+#: ⛔ AND IT CANNOT GO BELOW THE PRODUCT OF THE TIMER AND THE DISK. One millisecond at the 5.6 GB/s
+#: measured here is ~5 MB that no poller can see coming, so a cap of a few MiB on a fast disk is still
+#: crossed by a multiple of itself. A caller who needs a tight bound needs a filesystem whose size they
+#: chose, which is what the fault message says.
+_CAP_POLL_MIN_S = 0.001
+
+#: Bytes per second the poller PLANS against, whatever the box is observed writing. Above the fastest
+#: thing measured here (5.6 GB/s through the page cache, 2026-10-16), because this is the assumption
+#: that has to fail safe: a box can go from idle to full speed between two looks, so planning on the
+#: rate it is currently writing at is planning on the past. ⛔ THAT WAS THE FIRST FIX AND IT WAS WORSE
+#: THAN THE DEFECT - the poller looked early, saw an empty workspace while the box was still starting,
+#: concluded "nothing is being written" and went back to the one-second ceiling, which measured 67x the
+#: cap against the 30x it replaced. The observed rate is used only when it is HIGHER than this.
+_CAP_FILL_RATE = 8e9
+
+#: How much of the remaining headroom the box may be allowed to write between two looks. At 0.5 the
+#: poller aims to look again with half the headroom still unspent, which is what turns the overshoot
+#: into a function of the CAP instead of a function of the disk's bandwidth.
+_CAP_HEADROOM_FRAC = 0.5
+
+
+def _cap_next_delay(headroom: float, observed_rate: float, cost: float) -> float:
+    """Seconds until the next in-call workspace measurement.
+
+    ⛔ THE OVERSHOOT USED TO BE A FUNCTION OF THE DISK, NOT OF THE CAP, and that is the defect this
+    exists to close. The first interval was the one-second floor and nothing scaled it: MEASURED on
+    2026-10-16, a 50 MiB ``workspace_max_bytes`` stopped the box at 5,668,601,856 bytes - 108x the cap -
+    because this disk writes 5.6 GB/s and the first look is also the only one a one-second call gets.
+    An independent report measured the same mechanism at ~933 MB on a ~1 GB/s disk. A cap that a faster
+    disk overshoots further is not a cap, it is a lagging indicator.
+
+    So the interval is the time the box would need to spend HALF the remaining headroom at the PLANNING
+    rate: as the workspace fills, the looks get closer together on their own, and the overshoot is
+    bounded by the CAP instead of by the disk. That rate is ``_CAP_FILL_RATE`` raised to
+    ``observed_rate``, so what the box was JUST doing can make the poller look sooner and never later.
+    A box that is quiet right now says nothing about the next two milliseconds, and treating it as idle
+    is how the first version of this fix measured 67x the cap - WORSE than the 30x it replaced, because
+    the early look landed while the box was still starting, found an empty workspace, and went back to
+    the one-second ceiling.
+
+    SIMULATED against the controller itself, worst-case aligned (the box starts writing immediately
+    after a look), and the model reproduces both field measurements before it is trusted: planning on
+    the observed rate gives 953 MiB on a 1 GB/s disk against the ~933 MB reported, and 107x on this
+    5.6 GB/s one against the 108x measured. The same model puts this policy at 1.00-1.17x the cap.
+
+    Bounded at BOTH ends, and the bounds are the two costs that are not negotiable:
+
+    * ``cost * 10`` - the walk is synchronous, so a measurement that takes 400 ms on a 500k-file
+      workspace must not be repeated more often than every 4 s, or the poller spends more of the call
+      than the workload does. This is the self-limit that was already here.
+    * ``_CAP_POLL_MIN_S`` - a floor under the arithmetic, so a headroom of a few bytes cannot ask for a
+      busy loop.
+
+    Pure, so both bindings can assert the same table of intervals without a disk.
+    """
+    # THE FLOOR UNDER THE RATE LIVES HERE AND NOT AT THE CALL SITE, because the call site got it wrong
+    # once already and the next one cannot be asked to remember the trap. `_CAP_FILL_RATE` is always
+    # positive, so there is no zero-rate branch and no division to guard.
+    plan = max(_CAP_FILL_RATE, observed_rate)
+    want = headroom * _CAP_HEADROOM_FRAC / plan
+    return max(max(_CAP_POLL_MIN_S, cost * 10.0), min(want, _CAP_POLL_S))
 
 
 def _wait_by_backoff(
@@ -4126,8 +4200,8 @@ class Sandbox:
                 "domain allowlist for run_code, network=True gives the full host network"
             )
         self._kern = _find_kern()
-        self._resident: str | None = None  # nome del box residente adottato (`persist=True`)
-        self._resident_calls = 0  # chiamate servite dal box residente corrente
+        self._resident: str | None = None  # name of the adopted resident box (`persist=True`)
+        self._resident_calls = 0  # calls served by the current resident box
         self._kern_version = _verify_is_kern(self._kern)
 
     # -- lifecycle -----------------------------------------------------------------------------------
@@ -5120,9 +5194,15 @@ class Sandbox:
         # cap it is one `scandir` pass per call, the same order as the `track_files` snapshot the line
         # below already pays when tracking is on - and the MCP server, the one caller that runs this
         # hottest, turns tracking off and sets no cap.
+        # The pre-call walk is also the poller's SAMPLE ZERO: it is the only measurement taken before
+        # the box can write anything, so timing it costs nothing and lets the first in-call interval be
+        # scaled to the real headroom instead of starting from a guess about the workspace's size.
+        cap_used0: "int | None" = None
+        cap_cost0 = 0.0
         if self.workspace_max_bytes is not None and self._ws:
             blind: list[str] = []
             regranted: list[str] = []
+            cap_t0 = time.monotonic()
             try:
                 used = _workspace_usage(self._ws, blind if self._shared else None, regranted)
             except SandboxError as e:
@@ -5153,6 +5233,7 @@ class Sandbox:
                     head = line.split("\t", 1)[0].strip()
                     if head.isdigit():
                         used += int(head) * 1024
+            cap_used0, cap_cost0 = used, time.monotonic() - cap_t0
             if used > self.workspace_max_bytes:
                 raise SandboxError(
                     f"workspace holds {used} bytes, over the {self.workspace_max_bytes}-byte "
@@ -5299,21 +5380,43 @@ class Sandbox:
             cap_overrun: "int | None" = None
             cap_limit = self.workspace_max_bytes
 
+            # The previous sample, so the poller can see the RATE the box is writing at. It starts at
+            # the pre-call walk, which is the one measurement taken before the box existed.
+            cap_prev = (time.monotonic(), cap_used0)
+
             def _cap_tick() -> "float | None":
                 # No `cap_limit is None` test: the tick is only installed when it is set, and
                 # `_wait_for_exit` only consults a tick it was given.
-                nonlocal cap_overrun
+                nonlocal cap_overrun, cap_prev
                 t0 = time.monotonic()
                 try:
                     used = _workspace_usage(self._ws, None, None)
                 except (SandboxError, OSError):
-                    return _CAP_POLL_S  # cannot measure right now: keep waiting, never kill on unknown
+                    # CANNOT MEASURE RIGHT NOW: keep waiting, never kill on unknown - and pay for the
+                    # attempt at the same tenth-of-the-call rate a successful one does. Re-arming at
+                    # the flat floor is the one path with no backoff at all, and on a `user=` session
+                    # the failure is permanent (the box account owns a directory the repair refuses by
+                    # design, and there is no helper to ask mid-call), so it is a full useless walk
+                    # every second for the rest of the call - measured at a 40% duty cycle on a
+                    # 500k-file workspace. The cap stays alive, which stopping would give up.
+                    return max(_CAP_POLL_S, (time.monotonic() - t0) * 10.0)
+                now = time.monotonic()
                 if used > cap_limit:
                     cap_overrun = used
                     return None
-                return max(_CAP_POLL_S, (time.monotonic() - t0) * 10.0)
+                prev_t, prev_used = cap_prev
+                rate = (used - prev_used) / (now - prev_t) if now > prev_t else 0.0
+                cap_prev = (now, used)
+                return _cap_next_delay(cap_limit - used, rate, now - t0)
 
-            cap_tick = _CAP_POLL_S if (cap_limit is not None and self._ws) else None
+            # THE FIRST INTERVAL IS SCALED TO THE CAP, not taken at the ceiling. With no rate measured
+            # yet it assumes a disk faster than any here, which is the assumption that fails SAFE: it
+            # looks too early rather than too late.
+            cap_tick = (
+                _cap_next_delay(cap_limit - cap_used0, 0.0, cap_cost0)
+                if (cap_limit is not None and self._ws and cap_used0 is not None)
+                else None
+            )
             we_timed_out = not _wait_for_exit(proc, timeout_s, cap_tick, _cap_tick)
             if we_timed_out:
                 # BEFORE THE KILL, and that ordering IS the measurement. Our teardown kills kern, every
@@ -5847,10 +5950,10 @@ class Sandbox:
             fd = self._open_nofollow(full, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         except PermissionError as e:
             if not self._shared:
-                raise _path_refusal("write", path, e, writing=True) from e
+                raise _path_refusal("write", path, e, full, writing=True) from e
             closed = e
         except OSError as e:
-            raise _path_refusal("write", path, e, writing=True) from e
+            raise _path_refusal("write", path, e, full, writing=True) from e
         else:
             with os.fdopen(fd, "wb") as f:
                 f.write(payload)
@@ -5948,10 +6051,10 @@ class Sandbox:
             fd = self._open_nofollow(full, os.O_RDONLY)
         except PermissionError as e:
             if not self._shared:
-                raise _path_refusal("read", path, e, writing=False) from e
+                raise _path_refusal("read", path, e, full, writing=False) from e
             closed = e
         except OSError as e:
-            raise _path_refusal("read", path, e, writing=False) from e
+            raise _path_refusal("read", path, e, full, writing=False) from e
         if closed is not None:
             # A FILE THE BOX USER CLOSED TO US (0600, or inside its 0700): the helper reads it as its owner.
             data = self._helper_read(path, full, max_bytes)
@@ -6163,10 +6266,8 @@ class Sandbox:
             what the caller used to get for all of them."""
             if not self._shared:
                 raise SandboxError(
-                    f"snapshot: cannot read {rel!r}, so the archive would be short. A directory of "
-                    f"ours has its owner bits put back and is retried, so this is either not ours, or "
-                    f"a file the box left at mode 0, or a directory it closed again while this walk "
-                    f"ran: {e}"
+                    f"snapshot: cannot read {rel!r}, so the archive would be short. "
+                    f"{_CLOSED_PATH_CAUSES} - here, while this walk ran: {e}"
                 ) from e
             blind.append(rel)
 
@@ -8311,8 +8412,8 @@ class _WarmPool:
         self._ready: "list[_WarmBox]" = []
         self._starting = 0
         self._closed = False
-        # Quante box questo pool ha FATTO PARTIRE. Serve solo a decidere se la reclamazione finale
-        # vale un sottoprocesso: un pool che non ha mai avviato nulla non ha scratch da recuperare.
+        # How many boxes this pool has STARTED. Used only to decide whether the final reclaim is
+        # worth a subprocess: a pool that never started anything has no scratch to recover.
         self._started_total = 0
         self._orders: "queue.Queue" = queue.Queue()
         self._worker: "threading.Thread | None" = None
@@ -8532,6 +8633,17 @@ def _exec_failure_binary(stderr: str) -> "tuple[str, str] | None":
     return (m.group(1), m.group(2).strip()) if m else None
 
 
+#: WHY A PATH IN OUR OWN WORKSPACE CAN STILL BE CLOSED TO US, in one spelling for every surface that
+#: has to say it. `snapshot` had this right and the single-file refusals did not: it ENUMERATES, and
+#: they asserted the first cause as if it were the only one, which named a directory for a mode-0 file
+#: and somebody else's account for a file owned by this uid. One constant, so a reader who meets the
+#: sentence in a snapshot error and searches for it finds the same words on the read and write paths.
+_CLOSED_PATH_CAUSES = (
+    "A directory of ours has its owner bits put back and is retried, so this is either not ours (a "
+    "`user=` session's box account owns it, and only a helper box running as that account can read "
+    "it), or a file the box left at mode 0, or a directory it closed again afterwards"
+)
+
 # One row per errno the boundary produces, so the shared prefix is written once and the next one is a
 # row rather than a branch.
 _PATH_REFUSALS = {
@@ -8595,7 +8707,51 @@ def _path_refusal(
     # review found it in both bindings at once. `writing` is keyword-only and has NO DEFAULT so a new
     # call site cannot forget to decide, which is the part the string could not enforce.
     if e.errno == errno.EACCES:
-        if writing:
+        # ⛔ THE SUBJECT IS LOOKED AT BEFORE IT IS NAMED, when the caller handed us the full path. Both
+        # sentences below are about a DIRECTORY on the path, because that is the shape the repair walk
+        # produces - and a mode-0 FILE reaches exactly the same errno. MEASURED 2026-10-16: a file the
+        # cell closed with `chmod 0` was refused with "a directory on that path is closed to this
+        # process and its owner bits could not be restored - it is not ours (a `user=` session's box
+        # account owns it)", on a file owned by uid 1000 reading as uid 1000. Three claims, all false:
+        # the subject, the ownership, and the `/proc` hint it ends with. The write arm had the same
+        # defect on the same file and was not reported, which is what a shared cause looks like.
+        #
+        # `snapshot` was already right about this case because it ENUMERATES instead of asserting, so
+        # its wording is now one constant both paths read. Here there is more to go on: `lstat` says
+        # which of the three it is, and the file's own rule two branches up is that the caller is ASKED
+        # rather than assumed when the caller can be asked.
+        # ⛔ "IT IS A REGULAR FILE" IS NOT THE QUESTION - "is the FILE what denies us" is. A parent at
+        # `0o500` (exactly what the repair leaves) refuses a write while the target file itself is a
+        # perfectly writable `0o644`: naming the file there would replace one wrong sentence with
+        # another, and this one would quote a mode that contradicts the refusal. So the file is only
+        # named when the kernel agrees it is the obstacle, which is one `access(2)` on a path we have
+        # already lstat'd as not-a-symlink. It races a box that is writing, and all that is at stake is
+        # which sentence gets printed - the same trade the ENOTDIR branch above documents.
+        looked_file = None
+        if full is not None:
+            try:
+                st = os.lstat(full)
+                if stat.S_ISREG(st.st_mode) and not os.access(
+                    full, os.W_OK if writing else os.R_OK
+                ):
+                    looked_file = st
+            except OSError:
+                looked_file = None  # it raced us; fall back to the enumeration
+        if looked_file is not None:
+            mine = looked_file.st_uid == os.getuid()
+            why = (
+                f"it is a FILE this process cannot "
+                f"{'write' if writing else 'read'}, at mode "
+                f"{oct(stat.S_IMODE(looked_file.st_mode))} and owned by uid {looked_file.st_uid}"
+                f"{' - which is this process' if mine else ''}. kern leaves a mode-0 FILE exactly as "
+                f"the box wrote it, because for a file the mode can be the data, and it never re-opens "
+                f"what the workload shut: `chmod {'u+w' if writing else 'u+r'}` it "
+                # Only when the uid was MEASURED as ours, because on a `user=` session it is the box
+                # account's file and a host `chmod` is an EPERM that reads as a second defect.
+                f"{'from the host, since it is yours, or ' if mine else ''}from inside the box, or "
+                f"name another path"
+            )
+        elif writing:
             why = (
                 "a directory on that path is readable but NOT WRITABLE by this process. That is what a "
                 "repair leaves behind: when code in the box closes a workspace directory with "
@@ -8606,10 +8762,9 @@ def _path_refusal(
             )
         else:
             why = (
-                "a directory on that path is closed to this process and its owner bits could not be "
-                "restored - it is not ours (a `user=` session's box account owns it, and only a helper "
-                "box running as that account can read it), or there is no `/proc` to reach the pinned "
-                "descriptor through"
+                f"a directory on that path is closed to this process and its owner bits could not be "
+                f"restored, or there is no `/proc` to reach the pinned descriptor through. "
+                f"{_CLOSED_PATH_CAUSES}"
             )
     else:
         why = _PATH_REFUSALS.get(e.errno)
