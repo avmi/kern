@@ -19,7 +19,7 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
-## Unreleased
+## v0.33.0 - 2026-10-17
 
 **`kern image inspect` emits the labels and the healthcheck it had already read.** Both are parsed
 out of the image's own record and both were dropped before anything was printed: `Config.Labels`
@@ -80,6 +80,45 @@ reclaimed is no longer left behind here. Measured end to end on a cache of 20 su
 **`gc` and the `kern top` Images tab say what they could not reclaim**, with the bytes still on disk
 and the layer key, where a failed removal used to be dropped in silence. It is a note and not an
 error: the sweep removed everything it could, and the exit code still reports that.
+
+**A pull that could not be read reported a private repository.** `manifest_error` decided the cause by
+looking for words anywhere in the response body, so an EMPTY body - what a dropped, timed-out or
+proxy-filtered connection leaves - was reported as "cannot access '<repo>' ... it may be private (run
+`kern login`)". Running the suite under load reproduced it against `library/alpine`, the most public
+image there is. The arm now says what arrived and puts the credential-free action first, and every
+other cause is read from `errors[].code`, the field the distribution spec defines for it, instead of
+from a substring of the whole document: a body carrying `"code":"DENIED"` in an annotation or a label
+no longer sends a reader at a credential they do not need.
+
+**`kern exec` inside a user namespace no longer waits 25 seconds to fail.** The host-shape fix above
+decided whether an exec can join a box's cgroup from `getuid()`, and a user namespace remaps ids while
+leaving the cgroup alone: inside `unshare -Ur` the caller reads uid 0 over a path that still says
+`user@1000.service`, so kern concluded it was outside a tree it was plainly inside and asked for a
+transient scope from a manager with no `user@0.service` to put it in. A remapped uid is not a different
+tree. The predicate also asks whether the ancestor's `cgroup.procs` is ours to write, which is the
+kernel's own delegation rule, so a tree that belongs to somebody else routes to the scope instead of
+losing the box's resource cap silently.
+
+**`kern doctor` stopped contradicting itself in one sentence.** One row named the cgroup it had probed
+and said "user manager delegates: none readable" about the same path, 10 out of 10 runs, because the
+runtime and the doctor spelled the delegated root independently. There is one owner now. The same row
+also recommended enabling a delegation it had just reported as present, which is a reboot for nothing;
+it says where the cause is instead.
+
+**Nine documented claims said more than the code does, and a gate now refuses the second one.** The
+README's lede, both package READMEs, `docs/MCP.md`, `docs/SANDBOX.md`, `docs/CVE-POSTURE.md`,
+`docs/RESOURCES.md`, `docs/FAQ.md` and `SECURITY.md`'s in-scope list each promised something the
+implementation does not keep - a sandbox that "cannot touch your machine" while the documented
+`workspace=` is a host directory the box writes, an allowlist that is "always on" against the
+`KERN_SECCOMP=denylist` opt-out, credentials that are "never in it" three lines above "only what you
+pass with `env=`". `scripts/retired-claims.py` reads only the text a user meets and refuses an exact
+string the code has moved past, each with the date it stopped being true. It carries no general rule
+about absolutes: the first version had one and flagged 49 sentences of which 47 were true, and a gate
+with that false-positive rate is turned off within a month.
+
+## kern-sandbox 0.2.49 - 2026-10-17
+
+**It carries the kern v0.33.0 binary.** Both bindings move together, as always.
 
 **`workspace_max_bytes` is overshot by far less, and by an amount that depends on what the workspace
 costs to MEASURE.** The in-call poller looked once a second whatever the limit was, so what got past it
