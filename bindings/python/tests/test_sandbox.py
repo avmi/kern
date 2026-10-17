@@ -3401,6 +3401,71 @@ def test_prewarm_key_is_pure_and_folds_in_every_posture_option():
     assert pool._key(False) != first, "a mount must change the key"
 
 
+def test_the_cap_poll_interval_is_scaled_to_the_headroom_not_to_the_clock():
+    """The in-call workspace cap polled at a flat one-second floor, so what got past it was whatever the
+    disk could write in a second. MEASURED 2026-10-16 against a 50 MiB cap: 5,964,300,288 bytes on disk,
+    113.8x the cap, and an independent report measured ~933 MB of the same thing on a ~1 GB/s disk. The
+    interval is now the time the box would need to spend half the remaining headroom, so the overshoot
+    is a function of the CAP and the same measurement lands at 1.4x.
+
+    THE REGRESSION THIS PINS IS THE FIRST FIX, not the original defect. Scaling the interval to the
+    OBSERVED rate measured 67x - worse than the 30x it replaced - because the early look landed while
+    the box was still starting, saw an empty workspace, called it idle and went back to the ceiling. So
+    an `observed_rate` of zero must NOT buy the ceiling while the headroom is small."""
+    CEIL, FLOOR = kern._CAP_POLL_S, kern._CAP_POLL_MIN_S
+    cap = 50 << 20
+
+    # A QUIET BOX WITH A SMALL CAP IS STILL WATCHED CLOSELY. This is the assertion the 67x version fails.
+    idle = kern._cap_next_delay(cap, 0.0, 0.0, cap)
+    assert idle < CEIL / 10, f"a zero observed rate bought the ceiling again: {idle}"
+    assert idle == pytest.approx(cap * kern._CAP_HEADROOM_FRAC / kern._CAP_FILL_RATE), idle
+
+    # The ceiling still applies when the headroom is large enough to be worth a full second.
+    assert kern._cap_next_delay(100 << 30, 0.0, 0.0, 100 << 30) == CEIL
+
+    # A box writing FASTER than the planning floor pulls the next look in; one writing slower cannot
+    # push it out. The rate is a floor, not a measurement.
+    fast = kern._cap_next_delay(cap, 20e9, 0.0, cap)
+    assert fast < idle, f"a faster box must be looked at sooner: {fast} !< {idle}"
+    assert kern._cap_next_delay(cap, 1.0, 0.0, cap) == idle, "a slow box must not relax the interval"
+
+    # THE SELF-LIMIT WINS OVER THE ARITHMETIC, which is the half that keeps a 500k-file workspace from
+    # spending more of the call in the poller than in the workload.
+    assert kern._cap_next_delay(cap, 20e9, 0.4, cap) == pytest.approx(4.0), "cost * 10 must dominate"
+
+    # And a headroom of a few bytes asks for a busy loop, which the floor refuses.
+    assert kern._cap_next_delay(1, 20e9, 0.0, cap) == FLOOR
+
+    # ⛔ AND THE SELF-LIMIT MUST YIELD IN THE LAST QUARTER, which an outside review falsified this
+    # test for. `cost * 10` sits in the outer `max`, so on a workspace that is expensive to measure it
+    # set the interval alone and the overshoot went back to being a function of the DISK: MEASURED
+    # with the headroom held at 50 MiB and only the file count varied, 1.20x at 0 files, 1.28x at
+    # 1,000, 18.54x at 10,000, 23.98x at 50,000. The assertion above used `cap` as both headroom and
+    # limit - a FULL budget - which is the one shape where the self-limit is the right answer, so it
+    # could not see this. 10,000 files cost 14.35 ms to walk.
+    walk = 0.01435
+    plenty = kern._cap_next_delay(cap, 0.0, walk, cap)
+    assert plenty == pytest.approx(walk * kern._CAP_COST_MULT), f"with room to spare, 10x: {plenty}"
+    near = kern._cap_next_delay(int(cap * 0.1), 0.0, walk, cap)
+    assert near == pytest.approx(walk), f"in the last quarter the multiplier is 1: {near}"
+    assert near < plenty / 5, "yielding must buy most of the order of magnitude back"
+    # The boundary is the fraction, not a hard-coded size.
+    assert kern._cap_next_delay(int(cap * kern._CAP_NEAR_FRAC) - 1, 0.0, walk, cap) == pytest.approx(walk)
+    assert kern._cap_next_delay(int(cap * kern._CAP_NEAR_FRAC) + 1, 0.0, walk, cap) == pytest.approx(
+        walk * kern._CAP_COST_MULT
+    )
+    # A limit of zero (no cap) must not divide or yield: the poller is not armed then, and a caller
+    # that asks anyway gets the self-limit rather than a crash.
+    assert kern._cap_next_delay(cap, 0.0, walk, 0) == pytest.approx(walk * kern._CAP_COST_MULT)
+
+    # POSITIVE CONTROL on the claim itself: the OLD policy, inlined here, is what the numbers above
+    # came from. If this ever stops differing, the test is measuring one formula twice.
+    def old_policy(headroom: float, rate: float, cost: float) -> float:
+        return max(CEIL, cost * 10.0)
+
+    assert old_policy(cap, 0.0, 0.0) == CEIL > idle, "the old policy was the flat ceiling"
+
+
 def test_prewarm_dry_argv_writes_no_env_file(tmp_path):
     """`_base_argv` also WRITES the box's private env file. Keying on it created `.kern-env.` once per
     comparison and then collided with itself, which is why `dry` exists. The live write goes to the
@@ -5975,3 +6040,95 @@ def test_open_figures_come_back_in_figure_number_order(tmp_path):
     assert subprocess.run([_sys.executable, "-c", src], capture_output=True, timeout=120).returncode == 0
     one_w = widths(json.loads(res.read_text()))
     assert one_w == kernel_w, (one_w, kernel_w)
+
+
+def test_a_mode_0_file_is_refused_as_a_file_and_as_ours(tmp_path):
+    """A refusal that names the wrong SUBJECT sends the reader to the wrong fix.
+
+    MEASURED 2026-10-16 on `read_file` against a file a cell had closed with `chmod 0`: "a directory on
+    that path is closed to this process and its owner bits could not be restored - it is not ours (a
+    `user=` session's box account owns it)". It was a file, not a directory; it was owned by this uid,
+    not by a box account; and the `/proc` hint it ended with was a third dead end. `write_file` had the
+    same defect on the same file and nobody reported that one, which is what a shared cause looks like.
+
+    `_path_refusal` had NO test in either binding - the code comment above it even says the verb-parsing
+    defect was "found in both bindings at once, with no test on it" - so this covers the arms, not just
+    the one that was reported."""
+    import errno as _errno
+
+    eacces = OSError(_errno.EACCES, os.strerror(_errno.EACCES))
+    f = tmp_path / "shut.txt"
+    f.write_text("x")
+    os.chmod(f, 0)
+    if os.getuid() == 0:
+        pytest.skip("root bypasses access(2), so the file arm cannot be reached here")
+
+    for writing, bit in ((False, "u+r"), (True, "u+w")):
+        said = str(kern._path_refusal("read", "shut.txt", eacces, str(f), writing=writing))
+        assert "it is a FILE" in said, said
+        assert "mode 0o0" in said, said
+        assert f"owned by uid {os.getuid()} - which is this process" in said, said
+        assert f"chmod {bit}" in said, said
+        # THE THREE FALSE CLAIMS, named so a future edit cannot quietly bring one back.
+        assert "a directory on that path" not in said, said
+        assert "not ours" not in said, said
+        assert "/proc" not in said, said
+
+    # WITH NOTHING TO LOOK AT the enumeration stands, in the ONE spelling `snapshot` also uses: a caller
+    # that cannot hand over a full path gets the honest list of causes instead of a guess at one.
+    blind = str(kern._path_refusal("read", "shut.txt", eacces, None, writing=False))
+    assert kern._CLOSED_PATH_CAUSES in blind, blind
+    assert "a file the box left at mode 0" in blind, blind
+
+    # ⛔ AND A PARENT THAT DENIES MUST NOT BE REPORTED AS THE FILE. A directory at `0o500` is exactly
+    # what the repair leaves, and it refuses a NEW file while the target itself would be a writable
+    # `0o644`: naming the file here would quote a mode that contradicts the refusal.
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / "ok.txt").write_text("y")
+    os.chmod(d, 0o500)
+    try:
+        parent = str(kern._path_refusal("write", "d/new.txt", eacces, str(d / "new.txt"), writing=True))
+        assert "a directory on that path is readable but NOT WRITABLE" in parent, parent
+        assert "it is a FILE" not in parent, parent
+        # The file INSIDE it is readable, so a read refusal there is a parent's too, not the file's.
+        inside = str(kern._path_refusal("read", "d/ok.txt", eacces, str(d / "ok.txt"), writing=False))
+        assert "it is a FILE" not in inside, inside
+    finally:
+        os.chmod(d, 0o700)  # or pytest cannot clean the tmp dir up
+
+
+def test_every_path_refusal_call_site_hands_over_the_path():
+    """A refusal can only name its SUBJECT if the call site passes the path, and most did not.
+
+    An outside review found `read_file` naming a mode-0 FILE as "a directory on that path"; the same
+    message was reachable through `write_file`, `restore` and the snapshot/restore open, because those
+    call sites never handed over the path either - and `restore` was worse, re-raising a bare
+    `PermissionError` with no subject at all. Asserting one fixed site would not stop the next one, so
+    this walks the module's own AST: every `_path_refusal` call must pass four positionals.
+
+    THE ONE EXEMPTION IS NAMED, not implied: `_helper_refusal` turns a helper box's exit code into a
+    refusal and FABRICATES the `OSError` to do it. There is no path on disk for `access(2)` to ask
+    about, so a call whose third argument is a constructed `OSError` is allowed three."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(kern))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_path_refusal"
+    ]
+    assert len(calls) >= 6, f"the call sites moved or were renamed: found {len(calls)}"
+    bare = []
+    for c in calls:
+        if len(c.args) >= 4:
+            continue
+        third = c.args[2] if len(c.args) > 2 else None
+        fabricated = isinstance(third, ast.Call) and getattr(third.func, "id", None) == "OSError"
+        if not fabricated:
+            bare.append(c.lineno)
+    assert not bare, (
+        f"{len(bare)} `_path_refusal` call(s) pass no path, so they cannot name their subject and "
+        f"will say 'a directory on that path' for a mode-0 file: line(s) {bare}"
+    )

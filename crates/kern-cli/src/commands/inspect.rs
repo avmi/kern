@@ -139,7 +139,17 @@ pub(crate) fn network_ports_json(ports: &str) -> String {
 /// sentence about the two readers differing was left behind. The claim to check first, if it ever
 /// reads oddly again, is WHO CALLS THIS, because that is the part that keeps moving.
 pub(crate) fn label_pairs(field: &str) -> Vec<(String, String)> {
-    registry::decode_labels(field)
+    label_pairs_of(registry::decode_labels(field))
+}
+
+/// The same rule applied to segments that are ALREADY decoded, which is the shape an image's config
+/// carries them in (`config.Labels`, a list of `k=v`) as opposed to the registry's encoded field.
+///
+/// SPLIT OUT RATHER THAN COPIED, and the comment above says why in its own words: the bare-key rule
+/// has had two readers disagree about exactly one input before, and `kern image inspect` is now a
+/// third reader of it. A second spelling here would be the same defect with a new caller.
+pub(crate) fn label_pairs_of(segments: impl IntoIterator<Item = String>) -> Vec<(String, String)> {
+    segments
         .into_iter()
         .filter_map(|l| {
             // Docker and podman both accept a BARE KEY (`--label x`) and store an empty value,
@@ -161,12 +171,54 @@ pub(crate) fn label_pairs(field: &str) -> Vec<(String, String)> {
 /// `null` there, and this is the one place the shape deliberately differs, because the value a
 /// script reads is the same and the failure mode is not.
 pub(crate) fn labels_json(field: &str) -> String {
+    labels_object(registry::decode_labels(field))
+}
+
+/// Decoded label segments as Docker's `Config.Labels` object. The rendering half of
+/// [`labels_json`], shared with `kern image inspect`, whose labels never passed through the
+/// registry's encoding and so have nothing to decode.
+pub(crate) fn labels_object(segments: impl IntoIterator<Item = String>) -> String {
     let mut out = String::from("{");
-    for (i, (k, v)) in label_pairs(field).into_iter().enumerate() {
+    for (i, (k, v)) in label_pairs_of(segments).into_iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
         out.push_str(&format!("{}:{}", json_str(&k), json_str(&v)));
+    }
+    out.push('}');
+    out
+}
+
+/// An image's `HEALTHCHECK` as Docker's `Config.Healthcheck` object, or `null`.
+///
+/// THE DURATIONS ARE ALREADY NANOSECONDS, which is the unit Docker's document uses, so this is a
+/// rename and not a conversion - there is no factor here to get wrong. Each optional field is
+/// emitted only when the image set it, because a `"Interval":0` would read as "probe continuously"
+/// to a consumer that trusts the number, and this file's rule is that a plausible answer is worse
+/// than none.
+///
+/// `null` for an image with no check, rather than omitting the key, which is what Docker does. The
+/// same trade [`labels_json`] documents for `{}`: a consumer reading `.Config.Healthcheck` gets
+/// "absent" either way, and kern's own document stays uniform with the other optionals beside it
+/// (`WorkingDir`, `User`, `StopSignal` are all spelled `null` here when unset).
+pub(crate) fn healthcheck_json(h: Option<&kern_oci::ImageHealthcheck>) -> String {
+    let Some(h) = h else {
+        return "null".into();
+    };
+    let test: Vec<String> = h.test.iter().map(|t| json_str(t)).collect();
+    let mut out = format!("{{\"Test\":[{}]", test.join(","));
+    for (name, v) in [
+        ("Interval", h.interval_ns),
+        ("Timeout", h.timeout_ns),
+        ("StartPeriod", h.start_period_ns),
+        ("StartInterval", h.start_interval_ns),
+    ] {
+        if let Some(ns) = v {
+            out.push_str(&format!(",\"{name}\":{ns}"));
+        }
+    }
+    if let Some(r) = h.retries {
+        out.push_str(&format!(",\"Retries\":{r}"));
     }
     out.push('}');
     out
@@ -1163,7 +1215,13 @@ fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
             .collect();
         let opt = |o: &Option<String>| o.as_deref().map(json_str).unwrap_or_else(|| "null".into());
         println!(
-            "[{{\"RepoTags\":[{}],\"Os\":\"linux\",\"Architecture\":{},\"Size\":{},\"Config\":{{\"Entrypoint\":{},\"Cmd\":{},\"Env\":{},\"WorkingDir\":{},\"User\":{},\"ExposedPorts\":{{{}}},\"StopSignal\":{}}}}}]",
+            // `Labels` AND `Healthcheck` WERE PARSED AND THEN NOT EMITTED. Both are read out of the
+            // `.image` sidecar into `cfg` a few lines up and both were dropped on the floor here:
+            // the human output below prints the healthcheck, so the two renderings of one image
+            // disagreed about what kern knows, and `Labels` appeared in neither. An image's labels
+            // are where `org.opencontainers.image.*` lives - source commit, version, licence - so a
+            // consumer asking kern for them was told the image has none.
+            "[{{\"RepoTags\":[{}],\"Os\":\"linux\",\"Architecture\":{},\"Size\":{},\"Config\":{{\"Entrypoint\":{},\"Cmd\":{},\"Env\":{},\"WorkingDir\":{},\"User\":{},\"ExposedPorts\":{{{}}},\"StopSignal\":{},\"Labels\":{},\"Healthcheck\":{}}}}}]",
             json_str(name),
             // DOCKER'S SPELLING FOR THIS FIELD, which is the Go one: `docker image inspect` says
             // `amd64` where `docker info` says `x86_64`, and a consumer compares against a fixed
@@ -1181,6 +1239,8 @@ fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
             opt(&cfg.user),
             ports.join(","),
             opt(&cfg.stop_signal),
+            labels_object(cfg.labels.iter().cloned()),
+            healthcheck_json(cfg.healthcheck.as_ref()),
         );
         return Ok(());
     }
@@ -1213,6 +1273,16 @@ fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
     }
     if let Some(h) = &cfg.healthcheck {
         row("healthcheck", &h.test.join(" "));
+    }
+    // THE LABELS, which this rendering did not have either. One per line and counted first, the same
+    // shape `env` above uses and for the same reason: an image can carry a dozen
+    // `org.opencontainers.image.*` entries, and a reader greps them.
+    let labels = label_pairs_of(cfg.labels.iter().cloned());
+    if !labels.is_empty() {
+        println!("  {:<14} {} label(s)", "labels", labels.len());
+        for (k, v) in &labels {
+            println!("    {k}={v}");
+        }
     }
     Ok(())
 }

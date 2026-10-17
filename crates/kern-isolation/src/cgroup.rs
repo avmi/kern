@@ -946,6 +946,88 @@ fn manager_live_from(
     private_live || (bus_live() && manager_runs())
 }
 
+/// Is THIS process inside the user manager's own tree (`user@<uid>.service`)?
+///
+/// WHY IT DECIDES WHETHER AN EXEC CAN JOIN A BOX. cgroup v2 delegation containment lets an
+/// unprivileged process move another into a cgroup only with write access to the `cgroup.procs` of
+/// the COMMON ANCESTOR of the source and the destination. A box lives under the user's delegated
+/// tree, so from inside `user@<uid>.service` that ancestor is in the delegated tree and is ours to
+/// write; from OUTSIDE it the ancestor is the ROOT cgroup, which is not, and the move is EPERM
+/// whatever kern does. The two host shapes that land outside it are not exotic: a shell in
+/// `/init.scope`, which is how WSL starts every terminal, and an ordinary `ssh` session, which is
+/// outside the user manager on Ubuntu 24.04, Fedora 44, Debian 13 and Rocky 10.2 alike.
+///
+/// ONE SPELLING, because this is a DERIVED CONDITION and this repository's recurring defect is
+/// computing one of those in two places. `kern doctor` read the same file with the same `contains`
+/// and reported the same fact for its scope-toll row; it calls this now, so a sentence in the doctor
+/// and a decision in `kern exec` cannot come to disagree about the same host.
+///
+/// Read-only and allocation-light: one `read` of one procfs file, no bus round-trip. An unreadable
+/// `/proc/self/cgroup` answers `false`, which routes the caller to the cautious branch (take the
+/// scope) rather than to the one that assumes a permission it may not have.
+/// ⛔ THE UID IS NOT PART OF THE QUESTION, and asking it was this predicate's first spelling and its
+/// first defect. A user namespace remaps ids and leaves the CGROUP namespace alone, so inside
+/// `unshare -Ur` the caller reads `uid=0` over a `/proc/self/cgroup` that still says
+/// `/user.slice/user-1000.slice/user@1000.service/...` - MEASURED on this host. Building the needle
+/// from `getuid()` meant hunting for `/user@0.service/`, not finding it, and answering "outside"
+/// about a tree the process was plainly inside. The cost was not cosmetic: `kern exec` then asked for
+/// a transient scope it did not need, from a manager with no `user@0.service` to put it in, and the
+/// request sat 25 seconds before timing out where the command had worked before. A remapped uid is
+/// NOT a different tree, and [`delegation_root_above`] already knew that: it matches any
+/// `user@*.service` SEGMENT, which is why the direct-cap path never had this bug.
+///
+/// So this asks that exact function rather than re-deciding it. Reusing it also fixes a second thing
+/// the string spelling got wrong: `delegation_root_above` walks path SEGMENTS of the `0::` line, while
+/// a `contains` over the whole file could match a `user@1000.service` sitting on a v1 line of a hybrid
+/// host, which answers about the wrong hierarchy. `ancestors()` includes the path itself, so being the
+/// manager cgroup counts as inside - correctly, since then that cgroup IS the common ancestor.
+pub fn inside_user_manager_tree() -> bool {
+    let Some(cur) = current_v2_cgroup() else {
+        return false;
+    };
+    // NAMING A DELEGATED TREE IS NECESSARY AND NOT SUFFICIENT, and the second half already has an
+    // owner in this file. `delegation_root_above` does not ask WHOSE tree it found: a process of uid A
+    // sitting in uid B's tree (what `machinectl shell` and a setuid drop can produce) would read as
+    // "inside" and then skip a transient scope that would have worked, leaving the exec in the
+    // caller's cgroup instead of the box's. The namespace and seccomp confinement is unaffected; what
+    // is lost is the box's RESOURCE cap, reported as `Unbounded` and warned about only when the box
+    // carries explicit caps, so it is exactly the kind of weakening that goes unnoticed.
+    //
+    // `cgroup_procs_writable` and not [`placement_into_is_permitted`] only to avoid reading
+    // `/proc/self/cgroup` a second time: the root this found is an ANCESTOR of `cur` by construction,
+    // so `common_cgroup_ancestor(cur, root)` is `root` itself and the two calls are the same question.
+    //
+    // ⛔ `access(2)` AND `write(2)` CAN DISAGREE IN THIS SUBSYSTEM, and an outside review was right to
+    // ask whether that breaks this. MEASURED here: a cgroup with a child and controllers in its
+    // `subtree_control` answers `access(W_OK)` YES on its own `cgroup.procs` and REFUSES the write -
+    // cgroup v2's "no internal processes" rule - while the same write into a childless leaf succeeds.
+    // The divergence is real and reproducible.
+    //
+    // It does not reach this predicate, and the reason is which file each rule is about. On the common
+    // ANCESTOR the kernel checks a PERMISSION, which is what `access` answers, and no pid is ever
+    // written there. The pid goes into the box's own leaf, which kern creates and which has no
+    // children, so the structural rule cannot fire on it - that is the arm that succeeded in the
+    // measurement. What remains is the gap between the REAL uid `access` uses and the credentials the
+    // kernel checks at write time, which needs a caller that has dropped its effective uid; kern is
+    // not setuid, and `as_root` branches on the real uid for the same reason. A failed placement is
+    // reported as `Unbounded` and warned about when the box carries explicit caps, so what is left of
+    // this is visible rather than silent.
+    inside_user_manager_tree_at(&cur)
+}
+
+/// The decision of [`inside_user_manager_tree`] over a cgroup path handed in, so BOTH arms can be
+/// measured on one host.
+///
+/// Split out because the refusal arm is otherwise unreachable here: it fires when the delegated tree
+/// above us belongs to somebody else, which needs a second uid to build. MEASURED - with the two
+/// halves asserted separately and the composition taken on trust, dropping the writability check
+/// entirely left 382 tests GREEN, which is the state that ships a predicate answering a question it
+/// was not asked. Over a path argument a test can lay out `…/user@1000.service/app.slice/x` in a temp
+/// directory and chmod its `cgroup.procs`, and the refusal becomes an assertion instead of a comment.
+fn inside_user_manager_tree_at(cur: &Path) -> bool {
+    delegation_root_above(Some(cur)).is_some_and(|root| cgroup_procs_writable(&root))
+}
+
 /// Is `systemd --user` RUNNING for this uid, read from the cgroup systemd puts it in
 /// (`user@<uid>.service/init.scope`)? One read of one file, no bus round-trip, and it answers the
 /// half of [`manager_live_under`] that a bare session bus cannot.
@@ -1732,14 +1814,37 @@ fn kern_slice_path() -> Option<PathBuf> {
     // and every `kern run` there took the per-invocation systemd scope: 11.5 ms against the 1.0 ms
     // the same host reaches with `KERN_NO_SCOPE=1`. The delegated tree was there the whole time,
     // one directory away, and kern could not name it because it was looking UP instead of AT it.
+    Some(user_delegation_root()?.join(KERN_SLICE_NAME))
+}
+
+/// The delegated tree kern caps in when it is not root: the `user@<n>.service` AT or above our own
+/// cgroup, else the canonical layout for our uid IF that directory is really there. `None` means
+/// there is no delegated tree here and the caller falls back to a per-box scope.
+///
+/// ONE OWNER, because two readers of this had already drifted. `kern doctor` spelled the canonical
+/// path itself to read `cgroup.controllers`, which built it from `getuid()` alone and skipped the
+/// "look AT our cgroup" branch the runtime takes first. MEASURED inside `unshare -Ur`: the row named
+/// `user@1000.service/app.slice/...` as the probe site and said "user manager delegates: none
+/// readable" in the same sentence, because the remapped uid 0 sent the second half looking in
+/// `user@0.service`, which does not exist. One row, two answers about one host.
+///
+/// ⛔ NOT the same question as [`inside_user_manager_tree`], and merging them would be a regression.
+/// This one accepts a tree that exists but is NOT our ancestor, which is right for "where would a cap
+/// go" (kern creates its slice there) and WRONG for "can an exec move a process in" - with the tree
+/// beside us rather than above us the common ancestor is the ROOT cgroup, and the move is EPERM
+/// whatever kern does. That is the WSL `/init.scope` shape, where a delegated tree is one directory
+/// away and still unusable for a move.
+pub fn user_delegation_root() -> Option<PathBuf> {
+    // THE DELEGATION ROOT IS NOT ALWAYS AN ANCESTOR OF THE CALLER, so this looks AT our cgroup
+    // first and only then at the canonical layout. See the measurement in [`kern_slice_path`].
     if let Some(root) = delegation_root_above(current_v2_cgroup().as_deref()) {
-        return Some(root.join(KERN_SLICE_NAME));
+        return Some(root);
     }
     // The canonical layout, built from the REAL uid, and taken ONLY if it is really there. This is
     // where systemd puts a user manager on every host that has one, and it is the same tree
     // `systemd-run --user --scope` lands a transient unit in, so a box capped here is capped exactly
-    // where the scope path would have put it. `getuid` and not `geteuid`, matching `as_root` above:
-    // the manager belongs to the real user, not to a setuid binary's effective one.
+    // where the scope path would have put it. `getuid` and not `geteuid`, matching `as_root`: the
+    // manager belongs to the real user, not to a setuid binary's effective one.
     //
     // FAILS TO `None` IF THE DIRECTORY IS ABSENT, which is the whole safety of it: on a host with no
     // user manager, or one laid out some other way, this answers exactly what it answered before and
@@ -1747,7 +1852,7 @@ fn kern_slice_path() -> Option<PathBuf> {
     // because `ensure_kern_slice` still has to create and cap a child under it before anything is
     // used, and `slice_can_cap` checks that the controllers actually arrived.
     let canonical = canonical_delegation_root(unsafe { libc::getuid() });
-    canonical.is_dir().then(|| canonical.join(KERN_SLICE_NAME))
+    canonical.is_dir().then_some(canonical)
 }
 
 /// The `user@<uid>.service` ancestor of `cur`, if there is one. Split out from [`kern_slice_path`]
@@ -6577,6 +6682,109 @@ mod tests {
         }
     }
 
+    /// A REMAPPED UID DOES NOT MOVE A PROCESS OUT OF ITS CGROUP, which is the fact
+    /// [`inside_user_manager_tree`] got wrong the first time it was written and the reason it now
+    /// asks [`delegation_root_above`] instead of comparing against `getuid()`.
+    ///
+    /// MEASURED on this host: inside `unshare -Ur` the caller reads `uid=0` while `/proc/self/cgroup`
+    /// is untouched and still says `user@1000.service`. The uid-pinned spelling hunted for
+    /// `/user@0.service/`, concluded "outside", and sent `kern exec` to ask for a transient scope that
+    /// timed out after 25 seconds - caught by
+    /// `a_recycled_pid_does_not_let_exec_into_a_strangers_namespaces`, which runs in exactly that
+    /// namespace. This asserts the decision at the altitude it is made, and asserts WHICH root comes
+    /// back, since that is the cgroup whose `cgroup.procs` the caller is counting on being able to
+    /// write.
+    #[test]
+    fn a_remapped_uid_is_not_a_different_tree() {
+        let u1000 = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service";
+        for (cur, want) in [
+            // The shape inside `unshare -Ur`: uid 0, cgroup still 1000's.
+            (format!("{u1000}/app.slice/app-foo-9683.scope"), u1000),
+            // Deeper still, and through kern's own slice.
+            (format!("{u1000}/kern.slice/kern-box-db-193325"), u1000),
+            // AT the manager cgroup: it is then itself the common ancestor, so it counts.
+            (u1000.to_string(), u1000),
+            // ANY instance number, not just this host's. A real root session is `user@0.service`, the
+            // literal path the broken spelling went looking for while standing somewhere else.
+            (
+                "/sys/fs/cgroup/user.slice/user-0.slice/user@0.service/app.slice/x.scope"
+                    .to_string(),
+                "/sys/fs/cgroup/user.slice/user-0.slice/user@0.service",
+            ),
+        ] {
+            assert_eq!(
+                delegation_root_above(Some(Path::new(&cur))),
+                Some(PathBuf::from(want)),
+                "{cur} sits under a delegated user manager tree, and {want} is the ancestor to write"
+            );
+        }
+        // THE REFUSALS, which are the half that routes a caller to the scope path, so they need a
+        // positive control of their own and not just the accepts.
+        for outside in [
+            "/sys/fs/cgroup/init.scope", // every WSL terminal with systemd=true
+            "/sys/fs/cgroup/user.slice/user-1000.slice", // ssh on Ubuntu 24.04, Fedora 44, Debian 13, Rocky 10.2
+            "/sys/fs/cgroup",                            // the root cgroup
+            "/sys/fs/cgroup/system.slice/sshd.service",  // a system unit
+            "/sys/fs/cgroup/foo/user@1000.slice/bar",    // a slice, not the manager service
+            "/sys/fs/cgroup/foo/user@1000.servicex/bar", // the segment has to END at `.service`
+            "/sys/fs/cgroup/foo/xuser@1000.service/bar", // and START at `user@`
+        ] {
+            assert_eq!(
+                delegation_root_above(Some(Path::new(outside))),
+                None,
+                "{outside} has no user manager tree above it, so the caller must pay the scope"
+            );
+        }
+        // An unreadable `/proc/self/cgroup` (v1-only host, unusual mount) reaches here as `None` and
+        // must answer "outside": that is the cautious branch, not the one that assumes a permission.
+        assert_eq!(delegation_root_above(None), None);
+    }
+
+    /// A DELEGATED TREE THAT IS NOT OURS MUST NOT READ AS "inside", and until this test existed that
+    /// half of the predicate was decoration: with the writability check deleted, 382 tests stayed
+    /// green. The shape it protects needs a second uid on a real host (`machinectl shell`, a setuid
+    /// drop), so it is built here out of a temp directory instead, which is the only way it gets
+    /// measured on one machine.
+    #[test]
+    fn a_delegated_tree_that_is_not_ours_to_write_is_not_inside() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("kern-nottree-{}", std::process::id()));
+        let root = base.join("user@1000.service");
+        let cur = root.join("app.slice/x.scope");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&cur).expect("temp cgroup tree");
+        let procs = root.join("cgroup.procs");
+        fs::write(&procs, "").expect("cgroup.procs");
+
+        // ACCEPT: the tree is named AND writable, which is the pair the kernel's rule asks for.
+        assert!(
+            inside_user_manager_tree_at(&cur),
+            "a writable user@<n>.service above us is the delegated tree, and placement is ours"
+        );
+        // REFUSE: same name, same shape, not ours to write. Root bypasses `W_OK`, so say so rather
+        // than assert a law that does not hold for root.
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skip: the refusal arm needs a non-root uid (root bypasses W_OK)");
+        } else {
+            fs::set_permissions(&procs, PermissionsExt::from_mode(0o444)).expect("chmod 0444");
+            assert!(
+                !inside_user_manager_tree_at(&cur),
+                "somebody else's delegated tree must route the caller to the transient scope, or an \
+                 exec lands in the caller's cgroup and silently escapes the box's resource caps"
+            );
+        }
+        // And a tree with no `user@<n>.service` at all is outside whatever its permissions are: the
+        // WSL `/init.scope` shape, where the name is what is missing and not the access.
+        let no_tree = base.join("init.scope");
+        fs::create_dir_all(&no_tree).expect("init.scope");
+        fs::write(no_tree.join("cgroup.procs"), "").expect("cgroup.procs");
+        assert!(
+            !inside_user_manager_tree_at(&no_tree),
+            "a writable cgroup with no user manager above it is still outside the tree"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn parse_box_cgroup_line_extracts_only_kern_box_leaves() {
         // The eager-reap path resolves a box's exact dir from `/proc/<pid1>/cgroup` (v2 `0::<path>`).
@@ -6602,6 +6810,19 @@ mod tests {
             Some(PathBuf::from(
                 "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/kern-box-1815.scope"
             ))
+        );
+        // THE SCOPE `kern exec` ASKS FOR IS NOT A BOX, and the name is what keeps it that way. On a
+        // host outside the user manager's tree an exec cannot be placed in the box's cgroup at all,
+        // so kern re-runs itself inside a transient `kern-exec-<pid>.scope` first. That scope holds
+        // the exec'd command, never a box, and it must fail this gate for the same reason an ambient
+        // one must: a leaf kern records is a leaf a later reap may `cgroup.kill`, and killing an
+        // exec's scope would take down a command the box is still serving. The `kern-box-` prefix is
+        // the proof of ownership, and `kern-exec-` deliberately is not it.
+        assert_eq!(
+            parse_box_cgroup_line(
+                "0::/user.slice/user-1000.slice/user@1000.service/kern-exec-4242.scope\n"
+            ),
+            None
         );
         // An AMBIENT scope kern did not create stays unrecorded, whatever it holds. This is the case
         // `kern doctor` tells users to create (`systemd-run --user --scope bash`): recording it would

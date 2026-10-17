@@ -2912,6 +2912,25 @@ pub fn exec(
             name.as_str()
         )));
     }
+    // THE HOST SHAPE IS ANSWERED HERE, before anything forks, and deliberately AFTER the two errors
+    // that need no scope to be reported: a box that does not exist and a box that is paused are
+    // answered without paying a systemd round trip. Everything below this point is the command
+    // actually running, which is the only case where the placement matters.
+    //
+    // On the host this suite runs on, and on every ordinary desktop, `inside_user_manager_tree()` is
+    // true and this is four reads and no fork. It fires on the shapes where an exec is otherwise
+    // IMPOSSIBLE, not merely slower.
+    if exec_wants_scope(
+        kern_isolation::inside_user_manager_tree(),
+        kern_common::env_flag("KERN_SCOPE"),
+        kern_common::env_flag("KERN_NO_SCOPE"),
+        kern_isolation::user_systemd_present,
+    ) {
+        reexec_exec_in_bare_scope();
+        // Returning means the scope could not be arranged after all - the manager went away between
+        // the decision and the execve. Fall through: the placement refusal downstream then says so
+        // in kern's own words, which is what the reader got before this path existed.
+    }
     // PID 1 of the box. Older entries (or a race before the supervisor recorded it) → fall back
     // to the supervisor's sole child.
     let pid1 = match inst.live_pid1() {
@@ -4439,6 +4458,59 @@ fn fork_workload_under_caps(
     // `--collect` used to perform, and it is the whole justification for the direct path.
     drop(guard);
     std::process::exit(code);
+}
+
+/// Re-run this invocation inside a BARE transient user scope, so the command it is about to run can
+/// be placed in the box's cgroup. Returns only if that could not be arranged, leaving the caller on
+/// the path it was already taking.
+///
+/// WHY THIS EXISTS, and why the answer used to be a sentence instead of code. `kern exec` refused
+/// outright on every host that runs kern outside the tree it delegates - a shell in `/init.scope`,
+/// which is how WSL starts every terminal, and an ordinary `ssh` session on Ubuntu 24.04, Fedora 44,
+/// Debian 13 and Rocky 10.2 alike. The refusal told the reader to re-enter with
+/// `systemd-run --user --scope bash` and run kern in that shell, which works and keeps the caps
+/// enforced. kern now does that for them, for one invocation, instead of asking.
+///
+/// ⛔ A BARE SCOPE, WITH NO RESOURCE PROPERTIES, and that is the difference from the box path.
+/// `kern box` puts its caps ON the scope because there the scope IS the enforcement. An exec has no
+/// caps of its own: it inherits the box's the moment it is placed in the box's cgroup, which is the
+/// whole point of getting here. A `MemoryMax=` on this scope would cap the command at a number the
+/// box never asked for, and the cap would not even be the box's.
+///
+/// The unit is named `kern-exec-<pid>.scope`: not `kern-box-*`, which the registry records as a
+/// box's own cgroup, and ending in `<pid>.scope` so `sweep_orphan_boxes`, which reads the last `-`
+/// field as a pid, never parses it as one. `--collect` reaps it when the command exits.
+fn reexec_exec_in_bare_scope() {
+    use std::os::unix::process::CommandExt;
+
+    let Ok(self_exe) = std::env::current_exe() else {
+        return;
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let systemd_run = kern_isolation::trusted_helper("systemd-run")
+        .unwrap_or_else(|| std::path::PathBuf::from("systemd-run"));
+    let unit = format!("--unit=kern-exec-{}.scope", std::process::id());
+    let mut cmd = std::process::Command::new(systemd_run);
+    cmd.arg(kern_isolation::systemd_scope_mode())
+        .args(["--scope", "--quiet", "--collect"])
+        .arg(&unit)
+        .arg("--")
+        .arg(self_exe)
+        .args(&args)
+        .env("KERN_SCOPE", "1");
+    // The same TOCTOU floor the box path keeps, and for the same reason: `current_exe`,
+    // `trusted_helper` and the arg building above are a gap in which a session teardown could take
+    // the user manager with it. Re-probe ADJACENT to the execve, with no blocking I/O between. If it
+    // vanished, return and let the caller refuse in kern's own words rather than replace kern with a
+    // `systemd-run` that is about to fail and speak for it.
+    if !kern_isolation::user_systemd_present() {
+        return;
+    }
+    // REPLACE, not fork-and-wait. `kern exec` exits with the command's own status - that contract is
+    // older than this path and `compose exec` depends on it - and `systemd-run --scope` propagates
+    // the status of what it runs, so an `exec()` keeps it exactly. A proxy process in the middle
+    // would also sit between a `-it` session and its terminal, which is a cost with no gain here.
+    let _ = cmd.exec();
 }
 
 fn reexec_in_scope_if_possible(p: ScopeReexec) {

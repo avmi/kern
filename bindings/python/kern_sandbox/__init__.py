@@ -98,7 +98,10 @@ _RESIDENT_GONE = "no running box named"
 
 
 def _workspace_usage(
-    root: str, blind: "list[str] | None" = None, regranted: "list[str] | None" = None
+    root: str,
+    blind: "list[str] | None" = None,
+    regranted: "list[str] | None" = None,
+    biggest: "list | None" = None,
 ) -> int:
     """Bytes the workspace occupies ON DISK, or 0 when it cannot be read.
 
@@ -133,6 +136,29 @@ def _workspace_usage(
     total = 0
     seen: set = set()
     unreadable: "list[str]" = []
+    # The biggest REGULAR file, for a caller that wants to re-check the one entry most likely to be
+    # growing without walking the tree again. Free here: the walk already has every `st`.
+    top: "list[tuple[str, int]]" = []
+    # And every directory's FINGERPRINT: mtime, size and link count, all three from the one `stat` the
+    # probe already pays for. A write does not change any of them; CREATING or removing an entry moves
+    # the mtime, and on the filesystems that grow a directory it moves the size too.
+    #
+    # ⛔ THREE FIELDS, AND WHAT EACH ONE ACTUALLY CATCHES IS MEASURED, not assumed. A second review
+    # round pointed out that an earlier version of this comment claimed more than the fields deliver,
+    # so they were measured on ext4 here:
+    #
+    #   mtime  moves on EVERY create and unlink - but `lazytime` defers the visible timestamp, and a
+    #          coarse filesystem (FAT, some network mounts, 1-2 second ticks) leaves two creates inside
+    #          one tick indistinguishable.
+    #   size   moves only when the directory needs another block: one file in a directory with room
+    #          left it at 4096, three hundred took it to 12288. It catches a BURST, not one file.
+    #   nlink  moves only for a SUBDIRECTORY (2 to 3), never for a regular file.
+    #
+    # So the three together are strictly better than the timestamp alone and they do NOT close the
+    # coarse-mtime case: a single file created in a directory with room, on a mount whose timestamp is
+    # deferred or coarse, moves none of them. The full walk is the backstop for that, and it is no
+    # weaker than what came before the probe existed.
+    dirs: "dict[str, tuple[int, int, int]]" = {}
     try:
         base_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError as e:
@@ -222,6 +248,12 @@ def _workspace_usage(
                 if closed:
                     unreadable.append(current)
                     continue
+                if biggest is not None:
+                    try:
+                        dst = os.fstat(fd)
+                        dirs[current] = (dst.st_mtime_ns, dst.st_size, dst.st_nlink)
+                    except OSError:
+                        pass  # it raced us; the next full walk takes it
                 subdirs = []
                 for name, st in stats:
                     if stat.S_ISDIR(st.st_mode):  # from the lstat already taken: no second syscall
@@ -232,7 +264,17 @@ def _workspace_usage(
                     if key in seen:
                         continue
                     seen.add(key)
-                    total += getattr(st, "st_blocks", 0) * 512
+                    chunk = getattr(st, "st_blocks", 0) * 512
+                    total += chunk
+                    if biggest is not None and stat.S_ISREG(st.st_mode):
+                        # The K biggest, kept in descending order. The sort only runs for a file that
+                        # QUALIFIES, so a tree of equal-sized files pays for it exactly K times.
+                        if len(top) < _CAP_WATCH_K:
+                            top.append((os.path.join(current, name), chunk))
+                            top.sort(key=lambda t: -t[1])
+                        elif chunk > top[-1][1]:
+                            top[-1] = (os.path.join(current, name), chunk)
+                            top.sort(key=lambda t: -t[1])
                 if subdirs:
                     if fd != base_fd:
                         stack.append((None, fd))
@@ -246,6 +288,8 @@ def _workspace_usage(
             if current is None and fd != base_fd:
                 os.close(fd)
         os.close(base_fd)
+    if biggest is not None:
+        biggest[:] = [top, dirs]
     if unreadable:
         if blind is None:
             raise SandboxError(
@@ -2855,10 +2899,126 @@ class ExecutionResult:
         return self.success
 
 
-#: The first interval between two in-call workspace measurements. It is only the FIRST: the poller
-#: multiplies it by how long the measurement took, so the walk can never cost more than about a tenth
-#: of the call's wall time on a workspace with many files.
+#: The SLOWEST the in-call workspace poller goes while there is headroom left. A quiet workspace is
+#: looked at once a second; a workspace being filled is looked at sooner, because the interval is
+#: scaled to the headroom (see :func:`_cap_next_delay`).
 _CAP_POLL_S = 1.0
+
+#: The FASTEST the poller goes, whatever the arithmetic asks for, and 1 ms because that is the
+#: granularity the waits themselves have: ``_wait_for_exit`` rounds its slice UP to whole milliseconds
+#: for ``poll(2)``, and Node's ``setTimeout`` is no finer, so asking for less buys nothing.
+#:
+#: THIS IS THE ONLY THING THAT BOUNDS THE OVERSHOOT ON A SMALL CAP, and it was 2 ms for the wrong
+#: reason - a guess that ``cost * 10`` would dominate anyway. MEASURED 2026-10-16: walking a workspace
+#: of a few files costs **0.003 ms**, so ``cost * 10`` is 0.03 ms and 60x below the floor, which binds
+#: alone for every cap under ~32 MiB. The duty cycle there is 0.3%, so the floor was paying nothing for
+#: the overshoot it caused: a 1 MiB cap was crossed at 14x while a 1024 MiB one was crossed at 1.01x.
+#: At 10,000 files the walk costs 13.5 ms and ``cost * 10`` takes over at 135 ms, which is the half that
+#: keeps a large workspace from being walked into the ground - so the floor can be small safely.
+#:
+#: ⛔ AND IT CANNOT GO BELOW THE PRODUCT OF THE TIMER AND THE DISK. One millisecond at the 5.6 GB/s
+#: measured here is ~5 MB that no poller can see coming, so a cap of a few MiB on a fast disk is still
+#: crossed by a multiple of itself. A caller who needs a tight bound needs a filesystem whose size they
+#: chose, which is what the fault message says.
+_CAP_POLL_MIN_S = 0.001
+
+#: Bytes per second the poller PLANS against, whatever the box is observed writing. Above the fastest
+#: thing measured here (5.6 GB/s through the page cache, 2026-10-16), because this is the assumption
+#: that has to fail safe: a box can go from idle to full speed between two looks, so planning on the
+#: rate it is currently writing at is planning on the past. ⛔ THAT WAS THE FIRST FIX AND IT WAS WORSE
+#: THAN THE DEFECT - the poller looked early, saw an empty workspace while the box was still starting,
+#: concluded "nothing is being written" and went back to the one-second ceiling, which measured 67x the
+#: cap against the 30x it replaced. The observed rate is used only when it is HIGHER than this.
+_CAP_FILL_RATE = 8e9
+
+#: How much of the remaining headroom the box may be allowed to write between two looks. At 0.5 the
+#: poller aims to look again with half the headroom still unspent, which is what turns the overshoot
+#: into a function of the CAP instead of a function of the disk's bandwidth.
+_CAP_HEADROOM_FRAC = 0.5
+
+#: How many times the last measurement's own cost the poller waits, while there is room to spare. The
+#: self-limit: a walk that takes 88 ms is not repeated more often than every 880 ms, so the poller
+#: cannot spend more of the call than the workload does.
+_CAP_COST_MULT = 10.0
+
+#: How many of the biggest regular files the cheap probe re-checks. ONE was not enough and a second
+#: review round said so: the probe watched the single biggest file, so a box growing several OTHER
+#: files was invisible to it until the next full walk. Eight `stat` calls are ~10 us against a walk
+#: that costs 15 ms on a 10,000-file tree, so the K is bounded by taste rather than by cost.
+#:
+#: ⛔ IT DOES NOT CLOSE THE CLASS, it moves the line. A box inflating ten thousand small files is
+#: still only caught by the full walk, which is the backstop and is no weaker than what came before.
+_CAP_WATCH_K = 8
+
+#: Below this fraction of the cap still unspent, the self-limit YIELDS to the cap and the multiplier
+#: drops to 1 - one walk per walk's duration, a 50% duty cycle, for as long as the box is inside the
+#: last quarter of its budget.
+#:
+#: ⛔ BECAUSE THE SELF-LIMIT WAS SILENTLY THE BOUND, AND IT IS A FUNCTION OF THE DISK. An outside
+#: review falsified the claim that the overshoot is bounded by the cap, and the measurement agreed:
+#: with the headroom held at 50 MiB and only the file COUNT varied, `cost * 10` takes over from the
+#: headroom arithmetic at about a thousand files and then sets the interval alone -
+#:
+#:     files     walk     interval     overshoot
+#:         0  0.01 ms      3.3 ms         1.20x
+#:     1,000  1.28 ms     12.8 ms         1.28x
+#:    10,000 14.35 ms    143.5 ms        18.54x
+#:    50,000 88.04 ms    880.4 ms        23.98x
+#:
+#: My own test used an EMPTY workspace, which is the one shape that flatters this policy. Yielding in
+#: the last quarter costs a visible duty cycle exactly when the alternative is gigabytes, and it does
+#: not make the bound a function of the cap again: an interval can never be shorter than one walk, so
+#: on a large tree the floor is still `walk cost x write rate`. The only thing that closes that is a
+#: measurement that is not O(files), and it would have to keep every property this one has (hard links
+#: counted once, symlinks refused, a closed directory refusing the call) or it defeats the cap for
+#: good. That is not a same-session change, and the fault message no longer claims otherwise.
+_CAP_NEAR_FRAC = 0.25
+
+
+def _cap_next_delay(headroom: float, observed_rate: float, cost: float, limit: float) -> float:
+    """Seconds until the next in-call workspace measurement.
+
+    ⛔ THE OVERSHOOT USED TO BE A FUNCTION OF THE DISK, NOT OF THE CAP, and that is the defect this
+    exists to close. The first interval was the one-second floor and nothing scaled it: MEASURED on
+    2026-10-16, a 50 MiB ``workspace_max_bytes`` stopped the box at 5,668,601,856 bytes - 108x the cap -
+    because this disk writes 5.6 GB/s and the first look is also the only one a one-second call gets.
+    An independent report measured the same mechanism at ~933 MB on a ~1 GB/s disk. A cap that a faster
+    disk overshoots further is not a cap, it is a lagging indicator.
+
+    So the interval is the time the box would need to spend HALF the remaining headroom at the PLANNING
+    rate: as the workspace fills, the looks get closer together on their own, and the overshoot is
+    bounded by the CAP instead of by the disk. That rate is ``_CAP_FILL_RATE`` raised to
+    ``observed_rate``, so what the box was JUST doing can make the poller look sooner and never later.
+    A box that is quiet right now says nothing about the next two milliseconds, and treating it as idle
+    is how the first version of this fix measured 67x the cap - WORSE than the 30x it replaced, because
+    the early look landed while the box was still starting, found an empty workspace, and went back to
+    the one-second ceiling.
+
+    SIMULATED against the controller itself, worst-case aligned (the box starts writing immediately
+    after a look), and the model reproduces both field measurements before it is trusted: planning on
+    the observed rate gives 953 MiB on a 1 GB/s disk against the ~933 MB reported, and 107x on this
+    5.6 GB/s one against the 108x measured. The same model puts this policy at 1.00-1.17x the cap.
+
+    Bounded at BOTH ends, and the bounds are the two costs that are not negotiable:
+
+    * ``cost * 10`` - the walk is synchronous, so a measurement that takes 400 ms on a 500k-file
+      workspace must not be repeated more often than every 4 s, or the poller spends more of the call
+      than the workload does. This is the self-limit that was already here.
+    * ``_CAP_POLL_MIN_S`` - a floor under the arithmetic, so a headroom of a few bytes cannot ask for a
+      busy loop.
+
+    Pure, so both bindings can assert the same table of intervals without a disk.
+    """
+    # THE FLOOR UNDER THE RATE LIVES HERE AND NOT AT THE CALL SITE, because the call site got it wrong
+    # once already and the next one cannot be asked to remember the trap. `_CAP_FILL_RATE` is always
+    # positive, so there is no zero-rate branch and no division to guard.
+    plan = max(_CAP_FILL_RATE, observed_rate)
+    want = headroom * _CAP_HEADROOM_FRAC / plan
+    # THE SELF-LIMIT YIELDS IN THE LAST QUARTER, because it was the bound and nobody had measured it
+    # being the bound: see `_CAP_NEAR_FRAC` for the table that falsified the claim.
+    near = limit > 0 and headroom <= limit * _CAP_NEAR_FRAC
+    mult = 1.0 if near else _CAP_COST_MULT
+    return max(max(_CAP_POLL_MIN_S, cost * mult), min(want, _CAP_POLL_S))
 
 
 def _wait_by_backoff(
@@ -4126,8 +4286,8 @@ class Sandbox:
                 "domain allowlist for run_code, network=True gives the full host network"
             )
         self._kern = _find_kern()
-        self._resident: str | None = None  # nome del box residente adottato (`persist=True`)
-        self._resident_calls = 0  # chiamate servite dal box residente corrente
+        self._resident: str | None = None  # name of the adopted resident box (`persist=True`)
+        self._resident_calls = 0  # calls served by the current resident box
         self._kern_version = _verify_is_kern(self._kern)
 
     # -- lifecycle -----------------------------------------------------------------------------------
@@ -5120,11 +5280,20 @@ class Sandbox:
         # cap it is one `scandir` pass per call, the same order as the `track_files` snapshot the line
         # below already pays when tracking is on - and the MCP server, the one caller that runs this
         # hottest, turns tracking off and sets no cap.
+        # The pre-call walk is also the poller's SAMPLE ZERO: it is the only measurement taken before
+        # the box can write anything, so timing it costs nothing and lets the first in-call interval be
+        # scaled to the real headroom instead of starting from a guess about the workspace's size.
+        cap_used0: "int | None" = None
+        cap_cost0 = 0.0
+        cap_seed: "list" = []
         if self.workspace_max_bytes is not None and self._ws:
             blind: list[str] = []
             regranted: list[str] = []
+            cap_t0 = time.monotonic()
             try:
-                used = _workspace_usage(self._ws, blind if self._shared else None, regranted)
+                used = _workspace_usage(
+                    self._ws, blind if self._shared else None, regranted, cap_seed
+                )
             except SandboxError as e:
                 # A SESSION WITH NO BOX USER TO ASK. There is no helper box to size what this process
                 # cannot read (the helper runs AS the box user, and here that user is this process),
@@ -5153,6 +5322,7 @@ class Sandbox:
                     head = line.split("\t", 1)[0].strip()
                     if head.isdigit():
                         used += int(head) * 1024
+            cap_used0, cap_cost0 = used, time.monotonic() - cap_t0
             if used > self.workspace_max_bytes:
                 raise SandboxError(
                     f"workspace holds {used} bytes, over the {self.workspace_max_bytes}-byte "
@@ -5299,21 +5469,120 @@ class Sandbox:
             cap_overrun: "int | None" = None
             cap_limit = self.workspace_max_bytes
 
+            # The previous sample, so the poller can see the RATE the box is writing at. It starts at
+            # the pre-call walk, which is the one measurement taken before the box existed.
+            cap_prev = (time.monotonic(), cap_used0)
+            # WHAT THE LAST FULL WALK SAW, and the one file worth re-checking without repeating it.
+            #
+            # ⛔ MEASURING COSTS O(FILES), AND THAT WAS THE REAL BOUND ON THE OVERSHOOT. An outside
+            # review falsified the claim that the cap bounds it, and instrumenting the poller showed
+            # why: on a 10,000-file workspace the walk costs 15 ms, so the FIRST in-call interval was
+            # `10 x cost` = 155 ms, and there was exactly ONE look during the call - it arrived at
+            # 188 ms having already measured 847 MiB against a 50 MiB headroom, 17x past. No policy
+            # over the WAITING fixes that, because the cost of looking is what sets it.
+            #
+            # So the tree is walked on the self-limited cadence and, in between, ONE `stat` re-checks
+            # the biggest file: a box filling a disk is writing to a file, and that file growing is
+            # what the cheap probe sees. MEASURED: 15 ms for the walk against 5.6 us for the stat.
+            #
+            # A NEW file is invisible to the probe until the next full walk, which is the backstop and
+            # is no weaker than what was there before.
+            cap_total, cap_cost = cap_used0, cap_cost0
+            # SEEDED FROM THE PRE-CALL WALK, which already looked at every file. Without it the probe
+            # has nothing to re-check until the first in-call walk, and that walk is the one that
+            # arrives too late: instrumented, there was exactly ONE look per call, at 191 ms, having
+            # already measured 20x the headroom.
+            cap_watch: "list[tuple[str, int]]" = list(cap_seed[0]) if cap_seed else []
+            cap_dirs: "dict[str, tuple[int, int, int]]" = (
+                dict(cap_seed[1]) if len(cap_seed) > 1 else {}
+            )
+            cap_next_full = time.monotonic() + max(_CAP_POLL_MIN_S, cap_cost0 * _CAP_COST_MULT)
+
             def _cap_tick() -> "float | None":
                 # No `cap_limit is None` test: the tick is only installed when it is set, and
                 # `_wait_for_exit` only consults a tick it was given.
-                nonlocal cap_overrun
+                nonlocal cap_overrun, cap_prev, cap_total, cap_cost, cap_watch, cap_next_full
+                nonlocal cap_dirs
                 t0 = time.monotonic()
-                try:
-                    used = _workspace_usage(self._ws, None, None)
-                except (SandboxError, OSError):
-                    return _CAP_POLL_S  # cannot measure right now: keep waiting, never kill on unknown
+                est = None
+                if t0 < cap_next_full:
+                    # A NEW FILE IS THE SHAPE A RUNAWAY ACTUALLY HAS - it creates one and fills it -
+                    # and watching the biggest EXISTING file cannot see it. A directory's mtime moves
+                    # when an entry is created or removed and not when one is written, so one `stat`
+                    # per DIRECTORY says "something arrived" for the price of 1 syscall on a flat
+                    # workspace instead of 10,000. MEASURED: 12 us against a 3.62 ms walk, 314x.
+                    fresh = False
+                    for d, sig in cap_dirs.items():
+                        try:
+                            dst = os.stat(d)
+                            if (dst.st_mtime_ns, dst.st_size, dst.st_nlink) != sig:
+                                fresh = True
+                                break
+                        except OSError:
+                            fresh = True  # gone or closed: the walk decides
+                            break
+                    if not fresh and cap_watch:
+                        delta = 0
+                        for path_w, was in cap_watch:
+                            try:
+                                now_b = os.stat(path_w, follow_symlinks=False)
+                            except OSError:
+                                delta = None  # one is gone: the walk decides, not an estimate
+                                break
+                            delta += getattr(now_b, "st_blocks", 0) * 512 - was
+                        if delta is not None:
+                            est = cap_total + delta
+                # ⛔ THE PROBE TRIGGERS, THE WALK DECIDES. The estimate carries a total that is as old
+                # as the last walk, so a box that DELETED a large file and kept writing would look
+                # over the cap while being under it - and a false `workspace_full` on a healthy box is
+                # worse than a late one. So "the probe says we may be over" only buys an immediate
+                # full walk, never a kill.
+                if est is None or est > cap_limit or t0 >= cap_next_full:
+                    top: "list" = []
+                    try:
+                        used = _workspace_usage(self._ws, None, None, top)
+                    except (SandboxError, OSError):
+                        # CANNOT MEASURE RIGHT NOW: keep waiting, never kill on unknown - and pay
+                        # for the attempt at the same tenth-of-the-call rate a successful one does.
+                        # Re-arming at the flat floor is the one path with no backoff at all, and on
+                        # a `user=` session the failure is permanent (the box account owns a directory
+                        # the repair refuses by design, and there is no helper to ask mid-call), so it
+                        # is a full useless walk every second for the rest of the call - measured at a
+                        # 40% duty cycle on a 500k-file workspace. The cap stays alive, which stopping
+                        # would give up.
+                        return max(_CAP_POLL_S, (time.monotonic() - t0) * 10.0)
+                    now = time.monotonic()
+                    cap_total, cap_cost = used, now - t0
+                    cap_watch = list(top[0]) if top else []
+                    cap_dirs = dict(top[1]) if len(top) > 1 else {}
+                    cap_next_full = now + max(_CAP_POLL_MIN_S, cap_cost * _CAP_COST_MULT)
+                else:
+                    used, now = est, time.monotonic()
                 if used > cap_limit:
                     cap_overrun = used
                     return None
-                return max(_CAP_POLL_S, (time.monotonic() - t0) * 10.0)
+                prev_t, prev_used = cap_prev
+                rate = (used - prev_used) / (now - prev_t) if now > prev_t else 0.0
+                cap_prev = (now, used)
+                # ⛔ PLANNED AGAINST THE PROBE'S COST, NEVER THE WALK'S, because the next thing this
+                # tick does is a probe. Passing the walk's cost here is what made the self-limit the
+                # bound: after a 15 ms walk the next look was 150 ms away, so the walk's own cost
+                # decided how far past the cap a box could get. The self-limit still exists and still
+                # bounds what the WALKS cost - it lives in `cap_next_full` alone now.
+                return _cap_next_delay(cap_limit - used, rate, 0.0, cap_limit)
 
-            cap_tick = _CAP_POLL_S if (cap_limit is not None and self._ws) else None
+            # THE FIRST INTERVAL IS THE PROBE'S, NOT THE WALK'S. Planning it against the pre-call
+            # walk's cost put the self-limit in charge of the first look - `10 x 16 ms` = 160 ms - and
+            # that single number WAS the whole overshoot: instrumenting the poller showed exactly one
+            # look per call, arriving at 191 ms having already measured 20x the headroom. The next
+            # thing the tick does is one `stat`, so it is planned against a stat's cost and the
+            # headroom arithmetic decides. With no rate measured yet the policy assumes a disk faster
+            # than any here, which fails SAFE: it looks too early rather than too late.
+            cap_tick = (
+                _cap_next_delay(cap_limit - cap_used0, 0.0, 0.0, cap_limit)
+                if (cap_limit is not None and self._ws and cap_used0 is not None)
+                else None
+            )
             we_timed_out = not _wait_for_exit(proc, timeout_s, cap_tick, _cap_tick)
             if we_timed_out:
                 # BEFORE THE KILL, and that ordering IS the measurement. Our teardown kills kern, every
@@ -5391,11 +5660,14 @@ class Sandbox:
             fault = SandboxFault(
                 "workspace_full",
                 f"the workspace reached {cap_overrun} bytes, over the {cap_limit}-byte "
-                f"workspace_max_bytes, so the box was stopped mid-call. The cap is measured while the "
-                f"call runs, so it bounds ONE call and not only what accumulates across them; the "
-                f"overshoot is whatever the box wrote between two measurements. The box writes to a "
-                f"host directory ({self._ws}), so this is still not a kernel boundary: put the "
-                f"workspace on a filesystem whose size you chose and the kernel answers ENOSPC instead",
+                f"workspace_max_bytes, so the box was stopped mid-call. The cap is measured while "
+                f"the call runs, so it bounds ONE call and not only what accumulates across them. "
+                f"HOW FAR PAST IT A BOX GETS depends on what the workspace costs to MEASURE: the "
+                f"interval between two looks is scaled to the headroom, and can never be shorter "
+                f"than one walk of the tree - measured on a fast disk, a workspace of a few files "
+                f"is crossed by ~1.2x and one of 50,000 files by ~10x. The box writes to a host "
+                f"directory ({self._ws}), so this is still not a kernel boundary: put the workspace "
+                f"on a filesystem whose size you chose and the kernel answers ENOSPC instead",
             )
         # IDENTIFYING ITSELF IS NOT BEHAVING, and this is the layer that says so. `_verify_is_kern`
         # refuses a binary that does not answer `kern <version>`; a stub that DOES answer it and then
@@ -5847,10 +6119,10 @@ class Sandbox:
             fd = self._open_nofollow(full, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         except PermissionError as e:
             if not self._shared:
-                raise _path_refusal("write", path, e, writing=True) from e
+                raise _path_refusal("write", path, e, full, writing=True) from e
             closed = e
         except OSError as e:
-            raise _path_refusal("write", path, e, writing=True) from e
+            raise _path_refusal("write", path, e, full, writing=True) from e
         else:
             with os.fdopen(fd, "wb") as f:
                 f.write(payload)
@@ -5948,10 +6220,10 @@ class Sandbox:
             fd = self._open_nofollow(full, os.O_RDONLY)
         except PermissionError as e:
             if not self._shared:
-                raise _path_refusal("read", path, e, writing=False) from e
+                raise _path_refusal("read", path, e, full, writing=False) from e
             closed = e
         except OSError as e:
-            raise _path_refusal("read", path, e, writing=False) from e
+            raise _path_refusal("read", path, e, full, writing=False) from e
         if closed is not None:
             # A FILE THE BOX USER CLOSED TO US (0600, or inside its 0700): the helper reads it as its owner.
             data = self._helper_read(path, full, max_bytes)
@@ -6020,7 +6292,11 @@ class Sandbox:
                 os.close(fd)
             except PermissionError as e:
                 if not self._shared:
-                    raise _path_refusal("list", subdir, e, writing=False) from e
+                    # `root` is in scope and passing it costs nothing: the open is `O_DIRECTORY`, so a
+                    # mode-0 FILE here answers ENOTDIR and never reaches the EACCES arm, and the
+                    # `access(2)` test refuses to name a directory as a file. Uniform, so no reader has
+                    # to work out which call sites can be asked and which cannot.
+                    raise _path_refusal("list", subdir, e, root, writing=False) from e
                 # The same check, by the box user: a directory, no symlink on the way.
                 r = self._ws_helper(_HELPER_ISDIR, *self._helper_parts(root))
                 if r.returncode != 0:
@@ -6163,10 +6439,8 @@ class Sandbox:
             what the caller used to get for all of them."""
             if not self._shared:
                 raise SandboxError(
-                    f"snapshot: cannot read {rel!r}, so the archive would be short. A directory of "
-                    f"ours has its owner bits put back and is retried, so this is either not ours, or "
-                    f"a file the box left at mode 0, or a directory it closed again while this walk "
-                    f"ran: {e}"
+                    f"snapshot: cannot read {rel!r}, so the archive would be short. "
+                    f"{_CLOSED_PATH_CAUSES} - here, while this walk ran: {e}"
                 ) from e
             blind.append(rel)
 
@@ -6470,10 +6744,25 @@ class Sandbox:
                     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
                     try:
                         out = os.open(parts[-1], flags, 0o600, dir_fd=fd)
-                    except PermissionError:
-                        raise
+                    except PermissionError as e:
+                        # ⛔ RE-RAISED ONLY WHERE SOMETHING UPSTREAM ACTS ON IT. The caller catches
+                        # `PermissionError` to route a SHARED session to the helper box, which extracts
+                        # the same vetted members as the box user, so that path must still see the raw
+                        # error. With no box user to ask there is nothing upstream to do with it and
+                        # `raise` handed the caller a bare `[Errno 13] Permission denied` with no
+                        # subject at all - worse than the wrong-subject message an outside review found
+                        # on `read_file`, because there was no message. The full path is passed, so a
+                        # target file the archive is overwriting that the box left at mode 0 is named as
+                        # a FILE rather than as "a directory on that path".
+                        if self._shared:
+                            raise
+                        raise _path_refusal(
+                            "restore", m.name, e, os.path.join(self._ws, *parts), writing=True
+                        ) from e
                     except OSError as e:
-                        raise _path_refusal("restore", m.name, e, writing=True) from e
+                        raise _path_refusal(
+                            "restore", m.name, e, os.path.join(self._ws, *parts), writing=True
+                        ) from e
                     try:
                         if not stat.S_ISREG(os.fstat(out).st_mode):
                             raise SandboxError(f"refusing to restore {m.name!r}: not a regular file in the workspace")
@@ -8311,8 +8600,8 @@ class _WarmPool:
         self._ready: "list[_WarmBox]" = []
         self._starting = 0
         self._closed = False
-        # Quante box questo pool ha FATTO PARTIRE. Serve solo a decidere se la reclamazione finale
-        # vale un sottoprocesso: un pool che non ha mai avviato nulla non ha scratch da recuperare.
+        # How many boxes this pool has STARTED. Used only to decide whether the final reclaim is
+        # worth a subprocess: a pool that never started anything has no scratch to recover.
         self._started_total = 0
         self._orders: "queue.Queue" = queue.Queue()
         self._worker: "threading.Thread | None" = None
@@ -8532,6 +8821,17 @@ def _exec_failure_binary(stderr: str) -> "tuple[str, str] | None":
     return (m.group(1), m.group(2).strip()) if m else None
 
 
+#: WHY A PATH IN OUR OWN WORKSPACE CAN STILL BE CLOSED TO US, in one spelling for every surface that
+#: has to say it. `snapshot` had this right and the single-file refusals did not: it ENUMERATES, and
+#: they asserted the first cause as if it were the only one, which named a directory for a mode-0 file
+#: and somebody else's account for a file owned by this uid. One constant, so a reader who meets the
+#: sentence in a snapshot error and searches for it finds the same words on the read and write paths.
+_CLOSED_PATH_CAUSES = (
+    "A directory of ours has its owner bits put back and is retried, so this is either not ours (a "
+    "`user=` session's box account owns it, and only a helper box running as that account can read "
+    "it), or a file the box left at mode 0, or a directory it closed again afterwards"
+)
+
 # One row per errno the boundary produces, so the shared prefix is written once and the next one is a
 # row rather than a branch.
 _PATH_REFUSALS = {
@@ -8595,7 +8895,51 @@ def _path_refusal(
     # review found it in both bindings at once. `writing` is keyword-only and has NO DEFAULT so a new
     # call site cannot forget to decide, which is the part the string could not enforce.
     if e.errno == errno.EACCES:
-        if writing:
+        # ⛔ THE SUBJECT IS LOOKED AT BEFORE IT IS NAMED, when the caller handed us the full path. Both
+        # sentences below are about a DIRECTORY on the path, because that is the shape the repair walk
+        # produces - and a mode-0 FILE reaches exactly the same errno. MEASURED 2026-10-16: a file the
+        # cell closed with `chmod 0` was refused with "a directory on that path is closed to this
+        # process and its owner bits could not be restored - it is not ours (a `user=` session's box
+        # account owns it)", on a file owned by uid 1000 reading as uid 1000. Three claims, all false:
+        # the subject, the ownership, and the `/proc` hint it ends with. The write arm had the same
+        # defect on the same file and was not reported, which is what a shared cause looks like.
+        #
+        # `snapshot` was already right about this case because it ENUMERATES instead of asserting, so
+        # its wording is now one constant both paths read. Here there is more to go on: `lstat` says
+        # which of the three it is, and the file's own rule two branches up is that the caller is ASKED
+        # rather than assumed when the caller can be asked.
+        # ⛔ "IT IS A REGULAR FILE" IS NOT THE QUESTION - "is the FILE what denies us" is. A parent at
+        # `0o500` (exactly what the repair leaves) refuses a write while the target file itself is a
+        # perfectly writable `0o644`: naming the file there would replace one wrong sentence with
+        # another, and this one would quote a mode that contradicts the refusal. So the file is only
+        # named when the kernel agrees it is the obstacle, which is one `access(2)` on a path we have
+        # already lstat'd as not-a-symlink. It races a box that is writing, and all that is at stake is
+        # which sentence gets printed - the same trade the ENOTDIR branch above documents.
+        looked_file = None
+        if full is not None:
+            try:
+                st = os.lstat(full)
+                if stat.S_ISREG(st.st_mode) and not os.access(
+                    full, os.W_OK if writing else os.R_OK
+                ):
+                    looked_file = st
+            except OSError:
+                looked_file = None  # it raced us; fall back to the enumeration
+        if looked_file is not None:
+            mine = looked_file.st_uid == os.getuid()
+            why = (
+                f"it is a FILE this process cannot "
+                f"{'write' if writing else 'read'}, at mode "
+                f"{oct(stat.S_IMODE(looked_file.st_mode))} and owned by uid {looked_file.st_uid}"
+                f"{' - which is this process' if mine else ''}. kern leaves a mode-0 FILE exactly as "
+                f"the box wrote it, because for a file the mode can be the data, and it never re-opens "
+                f"what the workload shut: `chmod {'u+w' if writing else 'u+r'}` it "
+                # Only when the uid was MEASURED as ours, because on a `user=` session it is the box
+                # account's file and a host `chmod` is an EPERM that reads as a second defect.
+                f"{'from the host, since it is yours, or ' if mine else ''}from inside the box, or "
+                f"name another path"
+            )
+        elif writing:
             why = (
                 "a directory on that path is readable but NOT WRITABLE by this process. That is what a "
                 "repair leaves behind: when code in the box closes a workspace directory with "
@@ -8606,10 +8950,9 @@ def _path_refusal(
             )
         else:
             why = (
-                "a directory on that path is closed to this process and its owner bits could not be "
-                "restored - it is not ours (a `user=` session's box account owns it, and only a helper "
-                "box running as that account can read it), or there is no `/proc` to reach the pinned "
-                "descriptor through"
+                f"a directory on that path is closed to this process and its owner bits could not be "
+                f"restored, or there is no `/proc` to reach the pinned descriptor through. "
+                f"{_CLOSED_PATH_CAUSES}"
             )
     else:
         why = _PATH_REFUSALS.get(e.errno)

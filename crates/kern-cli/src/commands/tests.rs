@@ -911,6 +911,95 @@ mod ps_exited_tests {
         );
     }
 
+    /// AN IMAGE'S LABELS WENT IN AND NEVER CAME OUT EITHER, which is the same defect one surface
+    /// later. `kern image inspect` parsed `config.Labels` out of the `.image` sidecar and emitted it
+    /// in neither rendering, so a consumer asking kern where an image came from - its
+    /// `org.opencontainers.image.source`, its version, its licence - was told it carries none.
+    ///
+    /// The rendering is SHARED with the box path rather than written twice, so the bare-key rule has
+    /// one reader and not three: the comment on `label_pairs` records that two readers disagreeing
+    /// about exactly one input has already cost this repository a defect.
+    #[test]
+    fn an_images_label_segments_render_as_dockers_object() {
+        use crate::commands::inspect::labels_object;
+        let of = |v: &[&str]| labels_object(v.iter().map(|s| (*s).to_string()));
+        assert_eq!(of(&[]), "{}", "no labels is an empty object, never null");
+        assert_eq!(
+            of(&["org.opencontainers.image.version=1.2.3"]),
+            r#"{"org.opencontainers.image.version":"1.2.3"}"#
+        );
+        // A BARE KEY is a label with an empty value, the same rule the box path follows, and an
+        // image really can carry one: `LABEL bare` in a Dockerfile produces exactly this.
+        assert_eq!(of(&["bare="]), r#"{"bare":""}"#);
+        assert_eq!(of(&["bare"]), r#"{"bare":""}"#);
+        // A VALUE CONTAINING `=` splits on the FIRST one only, or `withequals=a=b=c` loses its tail.
+        assert_eq!(of(&["withequals=a=b=c"]), r#"{"withequals":"a=b=c"}"#);
+        // Quotes and backslashes are escaped, not emitted raw into the document.
+        assert_eq!(of(&[r#"a=x"y"#]), r#"{"a":"x\"y"}"#);
+        // An empty segment has no key and is dropped rather than becoming `"":""`.
+        assert_eq!(of(&["", "a=1"]), r#"{"a":"1"}"#);
+        assert_eq!(
+            of(&["a=1", "b=2"]),
+            r#"{"a":"1","b":"2"}"#,
+            "order follows the image's own list"
+        );
+    }
+
+    /// THE HEALTHCHECK WAS IN THE HUMAN OUTPUT AND NOT IN THE JSON, so the two renderings of one
+    /// image disagreed about what kern knows. A script reading `.Config.Healthcheck` got nothing from
+    /// an image whose check kern had parsed, stored and was printing two lines away.
+    ///
+    /// The durations are already nanoseconds in kern's own record, which is the unit Docker's
+    /// document uses, so this is a rename and there is no factor to get wrong - asserted against the
+    /// numbers a `HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3` produces.
+    #[test]
+    fn the_healthcheck_renders_in_dockers_shape_or_null() {
+        use crate::commands::inspect::healthcheck_json;
+        assert_eq!(
+            healthcheck_json(None),
+            "null",
+            "an image with no check says so, rather than an empty object that reads as a check"
+        );
+        let full = kern_oci::ImageHealthcheck {
+            test: vec!["CMD-SHELL".into(), "wget -q -O- http://localhost/".into()],
+            interval_ns: Some(30_000_000_000),
+            timeout_ns: Some(3_000_000_000),
+            start_period_ns: Some(5_000_000_000),
+            start_interval_ns: None,
+            retries: Some(3),
+        };
+        assert_eq!(
+            healthcheck_json(Some(&full)),
+            r#"{"Test":["CMD-SHELL","wget -q -O- http://localhost/"],"Interval":30000000000,"Timeout":3000000000,"StartPeriod":5000000000,"Retries":3}"#
+        );
+        // AN ABSENT FIELD IS OMITTED, never zero: `"Interval":0` reads as "probe continuously" to a
+        // consumer that trusts the number, and this file's rule is that a plausible answer is worse
+        // than none.
+        let bare = kern_oci::ImageHealthcheck {
+            test: vec!["NONE".into()],
+            interval_ns: None,
+            timeout_ns: None,
+            start_period_ns: None,
+            start_interval_ns: None,
+            retries: None,
+        };
+        assert_eq!(healthcheck_json(Some(&bare)), r#"{"Test":["NONE"]}"#);
+        // Docker 25+'s `StartInterval` is carried too: missing it is a 60x delay on an image that
+        // ships `Interval 300s, StartInterval 5s`, which is why kern parses it at all.
+        let si = kern_oci::ImageHealthcheck {
+            test: vec!["CMD".into(), "true".into()],
+            interval_ns: Some(300_000_000_000),
+            timeout_ns: None,
+            start_period_ns: None,
+            start_interval_ns: Some(5_000_000_000),
+            retries: None,
+        };
+        assert_eq!(
+            healthcheck_json(Some(&si)),
+            r#"{"Test":["CMD","true"],"Interval":300000000000,"StartInterval":5000000000}"#
+        );
+    }
+
     /// Labels went IN and never came out: the box carried them, `--filter label=` matched them, and
     /// no surface printed them. These pin the two readers against the filter's own splitting rule.
     #[test]
@@ -4293,6 +4382,38 @@ mod compose_action_tests {
         }
     }
 
+    /// THE NAME COMES BACK FROM THE ONE TABLE, which is what keeps a note from naming a verb the
+    /// reader did not type. `compose start` and `compose restart` reach the same line `up` does and
+    /// were handed `up`'s sentence, with a `-d` flag they cannot pass and a claim of parity with
+    /// `docker compose up`. Deriving the word rather than listing it again is the rule the verb
+    /// table states about itself, after the same list was written out three times by hand.
+    #[test]
+    fn every_verb_name_round_trips_through_the_one_table() {
+        for (word, action) in COMPOSE_VERBS {
+            // `kill` is a second spelling of `Stop`, so it is the one entry whose word does not come
+            // back - the table's order decides, and `stop` is listed first because it is documented.
+            if *word == "kill" {
+                assert_eq!(
+                    action.name(),
+                    "stop",
+                    "`kill` resolves to the documented spelling"
+                );
+                continue;
+            }
+            assert_eq!(action.name(), *word, "verb {word}");
+            assert_eq!(
+                ComposeAction::from_verb(action.name()),
+                Some(*action),
+                "the name must parse back to the action it came from: {word}"
+            );
+        }
+        // The three that reach the terminal note, named explicitly: a table-driven loop would pass
+        // if all three silently became the same word.
+        assert_eq!(ComposeAction::Up.name(), "up");
+        assert_eq!(ComposeAction::Start.name(), "start");
+        assert_eq!(ComposeAction::Restart.name(), "restart");
+    }
+
     #[test]
     fn unknown_verb_is_none_not_a_guess() {
         // A typo must NOT silently resolve to something (the caller turns `None` into a message that
@@ -7499,4 +7620,433 @@ fn a_mount_carries_a_source_a_dash_v_cannot_express_and_the_refusal_says_which()
         opt.contains("unknown mount option"),
         "a real typo must still read as a typo: {opt}"
     );
+}
+
+#[cfg(test)]
+mod layer_sweep_tests {
+    use crate::commands::*;
+
+    /// A cache holding ONE orphaned build layer: `L/<key>/` with a payload file, its `<key>.ok`
+    /// sentinel, and no `.layers` manifest naming it. The key is a valid `<32hex>`, which is the only
+    /// shape the sweep will touch.
+    fn orphaned_layer(tag: &str, payload: usize) -> (std::path::PathBuf, String) {
+        let cache = std::env::temp_dir().join(format!("kern-sweep-{tag}-{}", std::process::id()));
+        let _ = remove_tree_forced(&cache);
+        let key = String::from("0123456789abcdef0123456789abcdef");
+        let dir = cache.join("L").join(&key);
+        std::fs::create_dir_all(&dir).expect("mkdir layer");
+        std::fs::write(dir.join("payload"), vec![0u8; payload]).expect("write payload");
+        std::fs::write(cache.join("L").join(format!("{key}.ok")), b"").expect("write sentinel");
+        (cache, key)
+    }
+
+    /// THE DEFECT, in the state an outside report measured it in against v0.32.0.
+    ///
+    /// A build layer can hold a directory with no owner write bit: `dr-xr-xr-x` is ordinary in
+    /// Fedora-based images, and a layer built around a non-root user leaves worse. Unlinking a child
+    /// needs write ON ITS PARENT, so `std::fs::remove_dir_all` stops at the first such directory,
+    /// removes everything it reached on the way, and returns an error. The sweep's old shape was
+    /// `if remove_dir_all(..).is_ok() { count += 1 }` with no other arm, so that layer was left on
+    /// disk, uncounted and unnamed, while its `<key>.ok` sentinel could survive the same pass - and
+    /// `layer_cached` reads sentinel-plus-directory as a HIT. The next build then treated a
+    /// half-emptied layer as complete: measured from outside, a layer from `RUN useradd -m -u 10001
+    /// app` kept `home/app` and `sys/` while `etc/passwd` was gone, `compose build` printed `built`,
+    /// and the box died with "user 'app' has no account in the image's /etc/passwd".
+    ///
+    /// The control is armed deliberately and it doubles as the fixture: the failed `remove_dir_all`
+    /// IS the partial removal, so the sweep below runs against the exact state that was reported.
+    #[test]
+    fn the_sweep_reclaims_a_layer_a_plain_remove_dir_all_cannot() {
+        use std::os::unix::fs::PermissionsExt;
+        let (cache, key) = orphaned_layer("ro", 4096);
+        let lc = cache.join("L");
+        let dir = lc.join(&key);
+        let ro = dir.join("proc");
+        std::fs::create_dir_all(&ro).expect("mkdir ro");
+        std::fs::write(ro.join("kmsg"), b"x").expect("write kmsg");
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+
+        if crate::commands::tests::permission_bits_block_unlink() {
+            assert!(
+                std::fs::remove_dir_all(&dir).is_err(),
+                "remove_dir_all unexpectedly succeeded - the fixture no longer reproduces the bug"
+            );
+            assert!(
+                dir.is_dir(),
+                "the partial layer must still be a directory - that is what makes the hit false"
+            );
+            assert!(
+                layer_cached(&lc, &key),
+                "and before the sweep it still reads as a cache HIT, which is the defect itself"
+            );
+        } else {
+            // Said out loud rather than skipped silently: as root `CAP_DAC_OVERRIDE` walks straight
+            // through a 0o555 directory, so the control cannot be armed. The sweep is still asserted.
+            eprintln!(
+                "SKIP(partial): running as root, so a 0o555 directory does not block the unlink and \
+                 the positive control cannot be armed; the sweep below is still asserted"
+            );
+        }
+
+        let swept = sweep_orphan_layers_charged(&cache, None);
+        assert_eq!(swept.removed, 1, "the orphaned layer must be reclaimed");
+        assert!(
+            swept.freed > 0,
+            "and its bytes charged, got {}",
+            swept.freed
+        );
+        assert_eq!(
+            swept.stuck.len(),
+            0,
+            "nothing should be stuck on a tree this user owns"
+        );
+        assert!(!dir.exists(), "the layer directory must be gone");
+        assert!(
+            !lc.join(format!("{key}.ok")).exists(),
+            "its sentinel must be gone with it"
+        );
+        assert!(
+            !layer_cached(&lc, &key),
+            "and the key must no longer read as a cache hit"
+        );
+        let _ = remove_tree_forced(&cache);
+    }
+
+    /// THE SENTINEL GOES FIRST, so a key the sweep considered is never hittable afterwards - whatever
+    /// happened to its directory. Here the directory is already absent, which is the one shape an
+    /// unprivileged test can construct: the lone `<key>.ok` must go, and it must be counted as
+    /// nothing, because no bytes were reclaimed.
+    #[test]
+    fn a_sentinel_with_no_layer_is_removed_and_charged_nothing() {
+        let (cache, key) = orphaned_layer("lone", 0);
+        let lc = cache.join("L");
+        std::fs::remove_dir_all(lc.join(&key)).expect("drop the layer dir");
+        assert!(
+            lc.join(format!("{key}.ok")).exists(),
+            "fixture: the sentinel outlives the directory"
+        );
+
+        let swept = sweep_orphan_layers_charged(&cache, None);
+        assert_eq!(swept.removed, 0, "there was no directory to remove");
+        assert_eq!(swept.freed, 0, "so nothing can have been freed");
+        assert!(swept.stuck.is_empty(), "and nothing is stuck");
+        assert!(
+            !lc.join(format!("{key}.ok")).exists(),
+            "the orphaned sentinel must still be taken"
+        );
+        let _ = remove_tree_forced(&cache);
+    }
+
+    /// THE BLAST RADIUS, pinned. The loop was restructured to read every key before deleting any of
+    /// them, and a reference set that is consulted one entry later than it used to be is exactly the
+    /// kind of change that quietly widens what a sweep takes. A layer named by a `.layers` manifest
+    /// is live, shared, and must survive untouched - sentinel included.
+    #[test]
+    fn a_referenced_layer_is_left_alone() {
+        let (cache, key) = orphaned_layer("ref", 2048);
+        let lc = cache.join("L");
+        // The manifest's first line is the base ref; every line after it is a layer key.
+        std::fs::write(
+            cache.join("app_latest-abc.layers"),
+            format!("alpine:3.19\n{key}\n"),
+        )
+        .expect("write manifest");
+
+        let swept = sweep_orphan_layers_charged(&cache, None);
+        assert_eq!(swept.removed, 0, "a referenced layer is not an orphan");
+        assert_eq!(swept.freed, 0, "and nothing of it may be charged");
+        assert!(
+            swept.stuck.is_empty(),
+            "nothing was attempted, so nothing stuck"
+        );
+        assert!(lc.join(&key).is_dir(), "the layer must still be there");
+        assert!(
+            layer_cached(&lc, &key),
+            "and it must still read as a cache hit"
+        );
+        let _ = remove_tree_forced(&cache);
+    }
+
+    /// A PLANTED `...ok` MUST NOT STEER THE SWEEP, and this repository has already paid for that
+    /// exact shape once: a file literally named `...ok` has `Path::file_stem() == ".."`, which an
+    /// unchecked `join` turns into the cache's PARENT. The guard here is the key test itself -
+    /// `strip_suffix(".ok")` leaves `..`, which is two characters and not thirty-two hex - and a
+    /// guard nobody exercises is a guard nobody can trust.
+    #[test]
+    fn a_planted_dotdot_sentinel_steers_nothing() {
+        let (cache, key) = orphaned_layer("dotdot", 64);
+        let lc = cache.join("L");
+        // A sibling of the cache that the `..` stem would reach if the key check ever went away.
+        let bystander = cache
+            .join("..")
+            .join(format!("kern-sweep-bystander-{}", std::process::id()));
+        std::fs::create_dir_all(&bystander).expect("mkdir bystander");
+        std::fs::write(bystander.join("keep"), b"x").expect("write bystander");
+        std::fs::write(lc.join("...ok"), b"evil:latest").expect("plant");
+
+        let swept = sweep_orphan_layers_charged(&cache, None);
+        assert_eq!(swept.removed, 1, "only the real orphan is reclaimed");
+        assert!(
+            lc.join("...ok").exists(),
+            "the planted sentinel is not a `<32hex>` key, so the sweep must leave it alone"
+        );
+        assert!(
+            bystander.join("keep").exists(),
+            "and nothing outside the layer store may be touched"
+        );
+        assert!(!lc.join(&key).exists(), "the genuine orphan still goes");
+        let _ = remove_tree_forced(&bystander);
+        let _ = remove_tree_forced(&cache);
+    }
+
+    /// A SYMLINK AT `L/<key>` IS UNLINKED, NEVER FOLLOWED. `is_dir()` follows links, so a link to a
+    /// directory outside the cache passes the sweep's own test for "this is a layer"; what stops it
+    /// from becoming a recursive delete of someone's home directory is that the remover underneath
+    /// stats with `symlink_metadata` and unlinks a non-directory instead of descending it. That is a
+    /// property of `remove_tree_forced` rather than of this loop, which is exactly why it is pinned
+    /// from here: this is the caller that can hand it such a path.
+    #[test]
+    fn a_symlinked_layer_loses_only_the_link() {
+        let (cache, key) = orphaned_layer("symlink", 32);
+        let lc = cache.join("L");
+        std::fs::remove_dir_all(lc.join(&key)).expect("drop the real layer");
+        let outside = cache
+            .join("..")
+            .join(format!("kern-sweep-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::fs::write(outside.join("precious"), b"x").expect("write precious");
+        std::os::unix::fs::symlink(&outside, lc.join(&key)).expect("plant the symlink");
+        assert!(
+            lc.join(&key).is_dir(),
+            "fixture: the link reads as a directory, which is what makes it dangerous"
+        );
+
+        let _ = sweep_orphan_layers_charged(&cache, None);
+        assert!(
+            outside.join("precious").exists(),
+            "the target of the link must be untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(lc.join(&key)).is_err(),
+            "and the link itself must be gone"
+        );
+        let _ = remove_tree_forced(&outside);
+        let _ = remove_tree_forced(&cache);
+    }
+
+    /// The sentence a stuck sweep prints, pinned where it is BUILT rather than where it is printed.
+    /// The real cause of a stuck layer is a subuid-owned file, which an unprivileged test cannot
+    /// create, so the filesystem half of that path is not reproducible here - the wording is, and it
+    /// is the half a reader depends on: a note that omits the key leaves them grepping a cache for
+    /// the one directory that blocked it.
+    #[test]
+    fn the_stuck_note_names_the_count_the_bytes_the_key_and_the_reason() {
+        let quiet = LayerSweep {
+            removed: 3,
+            freed: 4096,
+            stuck: Vec::new(),
+        };
+        assert!(
+            quiet.stuck_note("build layer").is_none(),
+            "an ordinary sweep says nothing extra"
+        );
+
+        let swept = LayerSweep {
+            removed: 1,
+            freed: 1024,
+            stuck: vec![
+                StuckLayer {
+                    key: String::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    bytes: 2 * 1024 * 1024,
+                    why: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Permission denied at /c/L/aaaa/home/app is owned by uid 100999, not you",
+                    ),
+                },
+                StuckLayer {
+                    key: String::from("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                    bytes: 1024 * 1024,
+                    why: std::io::Error::other("whatever"),
+                },
+            ],
+        };
+        assert_eq!(swept.stuck_bytes(), 3 * 1024 * 1024, "both are counted");
+        let note = swept
+            .stuck_note("build layer")
+            .expect("a sweep with stuck layers has something to say");
+        assert!(
+            note.contains("2 orphaned build layers could not be removed"),
+            "the count and the plural: {note}"
+        );
+        // `human_bytes` renders exactly 3 MiB as `3M`, with no decimal: asserted against what it
+        // actually prints, not against what the shape of the number suggested.
+        assert!(note.contains("3M still on disk"), "the bytes: {note}");
+        assert!(
+            note.contains("L/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "the key, as a path the reader can look at: {note}"
+        );
+        assert!(
+            note.contains("uid 100999"),
+            "and the reason, unabridged: {note}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod exec_scope_decision_tests {
+    use crate::commands::*;
+
+    /// THE BRANCH NO DEVELOPER MACHINE EXERCISES, which is why it is a pure function and why this
+    /// test exists at all.
+    ///
+    /// `kern exec` refused outright on every host that runs kern outside the cgroup tree it
+    /// delegates: a shell in `/init.scope`, which is how WSL starts every terminal, and an ordinary
+    /// `ssh` session on Ubuntu 24.04, Fedora 44, Debian 13 and Rocky 10.2. A desktop session is
+    /// INSIDE that tree, so the interesting half of this decision is the half that never runs where
+    /// the suite runs, and a test that only drove the real predicate would assert the no-op.
+    #[test]
+    fn the_scope_is_taken_only_where_an_exec_is_otherwise_impossible() {
+        // Outside the tree, a manager to ask, not already scoped, not opted out: the one case.
+        assert!(
+            exec_wants_scope(false, false, false, || true),
+            "outside the user manager's tree an exec cannot be placed at all, and a transient \
+             scope is the only way in"
+        );
+
+        // INSIDE the tree nothing is wrong, so nothing is paid - whatever the other three say. This
+        // is every ordinary desktop, and it is the case that must stay free.
+        for manager in [false, true] {
+            for scoped in [false, true] {
+                for opted_out in [false, true] {
+                    assert!(
+                        !exec_wants_scope(true, scoped, opted_out, || manager),
+                        "inside the tree the placement already works: no scope, no systemd round \
+                         trip (manager={manager}, scoped={scoped}, opted_out={opted_out})"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            !exec_wants_scope(false, false, false, || false),
+            "with no user manager there is nobody to create a scope, so the refusal stands and the \
+             message must say so rather than suggesting a shell that cannot be made"
+        );
+        assert!(
+            !exec_wants_scope(false, true, false, || true),
+            "already inside kern's own scope: taking another would recurse forever"
+        );
+        assert!(
+            !exec_wants_scope(false, false, true, || true),
+            "KERN_NO_SCOPE means skip the systemd round trip, the same as it does for box and run"
+        );
+    }
+
+    /// THE EXPENSIVE FACT IS NOT ASKED WHEN THE CHEAP ONES ALREADY DECIDE, and that is a cost
+    /// contract rather than a style note. Three of the four inputs are an environment read or one
+    /// procfs read; the fourth opens a socket to the user manager. Evaluated eagerly it would run on
+    /// every `kern exec` on every host, including the overwhelming majority that are inside the tree
+    /// and will not take a scope whatever it answers.
+    #[test]
+    fn the_manager_probe_is_not_run_when_the_cheap_facts_settle_it() {
+        use std::cell::Cell;
+        let asked = Cell::new(0u32);
+        let probe = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        assert!(!exec_wants_scope(true, false, false, probe));
+        assert_eq!(
+            asked.get(),
+            0,
+            "inside the tree the answer is already known: the manager must not be probed"
+        );
+
+        let asked = Cell::new(0u32);
+        let probe = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        assert!(!exec_wants_scope(false, true, false, probe));
+        assert_eq!(asked.get(), 0, "already scoped: no probe either");
+
+        let asked = Cell::new(0u32);
+        let probe = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        assert!(exec_wants_scope(false, false, false, probe));
+        assert_eq!(
+            asked.get(),
+            1,
+            "and where it IS the deciding fact it must be asked, exactly once"
+        );
+    }
+
+    /// THE NAME IS THE SAFETY PROPERTY, so it is pinned where it is written.
+    ///
+    /// `is_kern_box_leaf` accepts a leaf iff it starts with `kern-box-`, and a leaf kern accepts is
+    /// one a later reap may `cgroup.kill`. The transient scope `kern exec` asks for holds the exec'd
+    /// command, never a box: naming it `kern-box-…` would hand a reap the right to kill a command
+    /// the box is still serving. The isolation crate pins the PARSER's answer for this name; this
+    /// pins that the name kern actually asks systemd for is that one, which a rename would otherwise
+    /// change while both halves kept passing.
+    #[test]
+    fn the_exec_scope_unit_is_not_named_like_a_box() {
+        let src = std::fs::read_to_string("src/commands/start.rs")
+            .or_else(|_| std::fs::read_to_string("crates/kern-cli/src/commands/start.rs"))
+            .expect("the start source sits next to this test");
+        let anchor = "--unit=kern-exec-";
+        assert!(
+            src.contains(anchor),
+            "the exec scope must be named `kern-exec-<pid>.scope`: anything starting with \
+             `kern-box-` is a leaf a reap may kill"
+        );
+        assert!(
+            !src.contains("--unit=kern-box-exec"),
+            "a `kern-box-` prefix on the exec scope would make it reapable as a box"
+        );
+    }
+
+    /// ONE SPELLING OF A DERIVED CONDITION, pinned at the source.
+    ///
+    /// "Am I inside `user@<uid>.service`?" decides a doctor ROW and an exec DECISION. Two places
+    /// computing one derived condition is this repository's recurring defect, and here the two
+    /// outputs are read together: a row saying the host caps directly while `exec` acts as though it
+    /// cannot would be a contradiction a reader has no way to resolve. The doctor called
+    /// `inside_user_manager_tree` when this was written; if a later edit inlines the read again,
+    /// this fails rather than letting the two drift.
+    #[test]
+    fn the_user_slice_question_is_asked_in_one_place() {
+        let doctor = std::fs::read_to_string("src/doctor.rs")
+            .or_else(|_| std::fs::read_to_string("crates/kern-cli/src/doctor.rs"))
+            .expect("the doctor source sits next to this test");
+        assert!(
+            doctor.contains("inside_user_manager_tree()"),
+            "the doctor must ASK the shared predicate rather than carry its own copy"
+        );
+        for line in doctor.lines() {
+            assert!(
+                !(line.contains("/proc/self/cgroup") && line.contains("user@")),
+                "the doctor is computing the user-slice condition itself again: {line}"
+            );
+        }
+    }
+
+    /// The real predicate must agree with what this very process can read, which is the only
+    /// statement about it that holds on every host this runs on. On a desktop both are true; in a
+    /// container or a session outside the manager both are false. What is asserted is the AGREEMENT,
+    /// never a particular answer, because a test that demanded `true` would fail on exactly the
+    /// hosts the change is for.
+    #[test]
+    fn the_predicate_answers_what_this_process_cgroup_says() {
+        let uid = unsafe { libc::getuid() };
+        let raw = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let expected = raw.contains(&format!("/user@{uid}.service/"));
+        assert_eq!(
+            kern_isolation::inside_user_manager_tree(),
+            expected,
+            "the predicate and this process's own cgroup line must not disagree: {raw:?}"
+        );
+    }
 }

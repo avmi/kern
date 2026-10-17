@@ -462,8 +462,11 @@ class _Server:
             # cap could only be checked BETWEEN calls, because that bounds nothing a runaway cell does in
             # ONE call - measured: 8,115 MB on disk in ten seconds. The SDK now measures it WHILE the
             # call runs and stops the box, so this knob bounds a single cell and the fault names the cap.
-            # ⛔ Still not a kernel boundary: the box writes to a host directory, so the overshoot is
-            # whatever it wrote between two measurements.
+            # ⛔ Still not a kernel boundary: the box writes to a host directory, and how far past the
+            # cap it gets depends on what the workspace costs to MEASURE - the interval scales to the
+            # headroom but can never be shorter than one walk of the tree, so a few files are crossed
+            # by ~1.2x and 50,000 by ~10x. This was the third copy of a sentence that claimed a
+            # tighter bound than the code has; an outside review found two of them.
             #
             # NO SENTINEL HERE, unlike the memory, tmpfs and prewarm knobs, and the difference is that
             # their default is a VALUE while this one's default is OFF: `0` is simply what unset means,

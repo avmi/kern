@@ -1881,17 +1881,28 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //     the user meant to build locally.
     // `run`'s stdout is the WORKLOAD'S. Every other verb here narrates to a terminal and its stdout
     // is kern's to use. See `resolve_builds_narrating`.
-    crate::commands::resolve_builds_for(
-        &mut boxes,
-        file,
-        &self_exe,
-        action != ComposeAction::Run,
-        // `run --no-deps <svc>` starts exactly one service, so exactly one image can be needed.
-        // Without `--no-deps` the dependencies start too and every one of them may need building,
-        // which is the whole-file case.
-        (action == ComposeAction::Run && no_deps && !services.is_empty()).then_some(services),
-        build_args,
-    )?;
+    //
+    // ⛔ `exec` BUILDS NOTHING, which is what Docker does and what the verb means. It enters a box
+    // that is ALREADY RUNNING - the arm below refuses with "is not running" otherwise - so every
+    // image it could need exists by definition, and an image it does not need cannot make the
+    // difference. Before this, `kern compose exec web sh` ran the whole `build:` section of the file
+    // first and printed all of it, so entering a running container cost a rebuild and buried the
+    // command's own output under it. There is nothing after this call that exec consumes from a
+    // build: it reads the service's name, its workdir and its user, and finds the box in the
+    // registry.
+    if action != ComposeAction::Exec {
+        crate::commands::resolve_builds_for(
+            &mut boxes,
+            file,
+            &self_exe,
+            action != ComposeAction::Run,
+            // `run --no-deps <svc>` starts exactly one service, so exactly one image can be needed.
+            // Without `--no-deps` the dependencies start too and every one of them may need building,
+            // which is the whole-file case.
+            (action == ComposeAction::Run && no_deps && !services.is_empty()).then_some(services),
+            build_args,
+        )?;
+    }
     // Docker resolves a RELATIVE bind source (`./certs:/dst`, `.:/app`) against the compose file's
     // directory. kern's `-v` needs an absolute path or a named volume, so rewrite relative binds here
     // to absolute (confined under the compose dir - traversal guard, like a build context). A `named:`
@@ -1900,9 +1911,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
 
     // `run` DIVERGES HERE, after the builds and the bind resolution and before the bring-up: it
     // needs a service's fully resolved definition and none of the stack-wide launch that follows.
-    // `exec` DIVERGES HERE for the same reason `run` does: it needs a service resolved to its box
-    // and none of the stack-wide launch below. It is answered before the bring-up, not in the
-    // terminal-verb function, because that function has no access to `run_cmd`.
+    // `exec` diverges at the same point but NOT for the same reason, and the difference is the one
+    // above: `run` starts a new box and may need an image built for it, while `exec` enters one that
+    // is already running and the build above is skipped for it entirely. Both are answered before the
+    // bring-up, and not in the terminal-verb function, because that function has no access to
+    // `run_cmd`.
     if action == ComposeAction::Exec {
         let Some(target) = services.first() else {
             return Err(Error::Compose(format!(
@@ -3307,11 +3320,24 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // 124, and so does a plain redirect and a run with stdin closed; only `-d` exits 0), so
         // this line is where kern says it did something else and why the reader may not have
         // noticed.
-        eprintln!(
-            "kern: note: stdout is not a terminal, so `up` returned instead of streaming the \
-             stack. `-d` says so explicitly; on a terminal it follows the logs and Ctrl-C stops \
-             the stack, as `docker compose up` does."
-        );
+        //
+        // ⛔ IT NAMES THE VERB THAT RAN, and before this it always said `up`. Three verbs reach this
+        // line - `up`, `start` and `restart` - and the two that are not `up` were handed a sentence
+        // about a command they did not type, pointing at a `-d` flag they cannot pass and claiming
+        // parity with `docker compose up`, which is not what they are. The mechanism the note
+        // describes is the same for all three; the words around it were only ever true for one.
+        match action {
+            ComposeAction::Up => eprintln!(
+                "kern: note: stdout is not a terminal, so `up` returned instead of streaming the \
+                 stack. `-d` says so explicitly; on a terminal it follows the logs and Ctrl-C stops \
+                 the stack, as `docker compose up` does."
+            ),
+            other => eprintln!(
+                "kern: note: stdout is not a terminal, so `{}` returned instead of streaming the \
+                 stack. On a terminal it follows the logs and Ctrl-C stops the stack.",
+                other.name()
+            ),
+        }
     }
     Ok(())
 }

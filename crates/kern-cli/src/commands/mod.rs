@@ -2469,6 +2469,37 @@ struct ScopeReexec<'a> {
     allow_uncapped: bool,
 }
 
+/// Should `kern exec` replace itself with a copy running inside a transient user scope?
+///
+/// A PURE DECISION OVER FOUR FACTS, separated from the world so it can be tested on a host that does
+/// not have the shape it is about. Every machine that runs this suite is INSIDE the user manager's
+/// tree, which is the branch where nothing happens, so the branch that matters would otherwise be
+/// asserted by nobody.
+///
+/// * `inside_user_tree` - the only fact that makes an exec impossible rather than merely slower. A
+///   box's cgroup lives under the user's delegated tree; from outside `user@<uid>.service` the common
+///   ancestor of this process and that cgroup is the ROOT, and cgroup v2 delegation containment needs
+///   write access THERE to move a process across. No implementation can grant itself that.
+/// * `manager_present` - a scope has to be created by someone, and that someone is the user manager.
+///   Without one there is no way in, and the refusal stands.
+/// * `already_scoped` - the recursion guard. The scope kern creates re-runs this same argv.
+/// * `scope_opted_out` - `KERN_NO_SCOPE`, which already means "skip the systemd round trip" for
+///   `kern box` and `kern run`; it means the same thing here, with the same consequence stated.
+fn exec_wants_scope(
+    inside_user_tree: bool,
+    already_scoped: bool,
+    scope_opted_out: bool,
+    manager_present: impl FnOnce() -> bool,
+) -> bool {
+    // ⛔ THE ORDER IS THE COST, and the manager probe is LAST because it is the only one that is not
+    // free. The first two read an environment variable, the third reads one procfs file, and the
+    // fourth opens a socket to the user manager. Passed as a value, that probe would run on EVERY
+    // `kern exec` on EVERY host - including the overwhelming majority, which are inside the tree and
+    // will not take a scope whatever it answers. A closure costs nothing when it is not called, and
+    // `manager_live_from` in the isolation crate already takes its expensive halves this way.
+    !already_scoped && !scope_opted_out && !inside_user_tree && manager_present()
+}
+
 /// The ceiling the per-box SCOPE gets, in bytes: the box's own `--memory` (or the default) plus kern's
 /// supervisor headroom.
 ///
@@ -3415,18 +3446,26 @@ pub(crate) fn image_entries_in(
 /// tagged image is kept; only dangling layers are freed. Invoked from the `kern top` Images tab (`p`);
 /// the CLI equivalent is `kern gc` (which also prunes dead-box sidecars).
 pub(crate) fn image_prune() -> Result<(), Error> {
-    let (n, freed) = sweep_orphan_layers(&cache_dir());
+    let swept = sweep_orphan_layers(&cache_dir());
     let p = crate::ui::Palette::detect();
-    if n == 0 {
+    if swept.removed == 0 {
         println!("{}nothing to prune - no orphaned layers{}", p.d, p.z);
     } else {
         println!(
-            "{}pruned{} {n} orphaned layer{}, freed {}",
+            "{}pruned{} {} orphaned layer{}, freed {}",
             p.g,
             p.z,
-            if n == 1 { "" } else { "s" },
-            human_bytes(freed)
+            swept.removed,
+            if swept.removed == 1 { "" } else { "s" },
+            human_bytes(swept.freed)
         );
+    }
+    // The same sentence `gc` prints, for the same reason: a layer the sweep could not remove is
+    // bytes nobody will reclaim, and saying nothing about it is how it stays unfound. This path is
+    // reached from the `kern top` Images tab, where "nothing to prune" over a cache that did not
+    // shrink is exactly the report a reader cannot argue with and should not have to.
+    if let Some(note) = swept.stuck_note("layer") {
+        eprintln!("{note}");
     }
     Ok(())
 }
@@ -5275,6 +5314,24 @@ pub const COMPOSE_VERBS: &[(&str, ComposeAction)] = &[
 ];
 
 impl ComposeAction {
+    /// The word that selects this verb on the command line, read from the ONE table that defines
+    /// them.
+    ///
+    /// DERIVED, NEVER RE-LISTED, which is the rule the table above states about itself after the
+    /// same list was written out three times by hand and `systemd` shipped working but undocumented.
+    /// The one place this is read is a note printed TO the user, and naming a verb they did not type
+    /// is exactly the defect it exists to prevent: that note said `up` for every verb that reached
+    /// it, including `start` and `restart`.
+    ///
+    /// `kill` and `stop` are one action and the table's order decides which word comes back: `stop`
+    /// is listed first, and it is the documented spelling.
+    pub fn name(self) -> &'static str {
+        COMPOSE_VERBS
+            .iter()
+            .find(|(_, a)| *a == self)
+            .map_or("up", |(n, _)| *n)
+    }
+
     /// Parse a compose sub-verb. `None` for an unknown word, so the caller can report it with the
     /// full list rather than guessing.
     pub fn from_verb(v: &str) -> Option<Self> {

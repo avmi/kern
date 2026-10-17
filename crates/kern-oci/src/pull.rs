@@ -799,6 +799,39 @@ fn valid_path_component(c: &str) -> bool {
 /// at `kern login` rather than the opaque "no layers"; otherwise the tag is malformed or absent.
 fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
     let low = manifest.to_ascii_lowercase();
+    // ⛔ THE CAUSE IS READ FROM THE FIELD THE SPEC DEFINES FOR IT, not from a substring of the whole
+    // body. The distribution spec answers an error with `{"errors":[{"code":"...","message":"..."}]}`,
+    // so `errors[].code` is the registry DECLARING what happened; `manifest.contains("denied")` is a
+    // guess that fires on any body that happens to carry the word - a proxy's HTML interstitial, a
+    // `message` quoting a policy, a repository literally named `denied`. An outside review flagged
+    // exactly that, and the consequence was the sharpest possible: a reader sent to `kern login` for a
+    // repository that is public.
+    //
+    // No code field means the body is NOT an error document, and then nothing here claims to know the
+    // cause: the last arm quotes what arrived. That is the honest answer for HTML from a load balancer
+    // or a truncated response, and it is one the reader can act on, because the text is in front of
+    // them. Codes are uppercased for comparison because the spec's are uppercase and registries have
+    // been seen lowercasing them.
+    // ⛔ AND THE HUNT IS RESTRICTED TO `errors[]`, not run over the whole document. A second review
+    // round caught this: `all_str_values(manifest, "code")` finds the key ANYWHERE, so a body that
+    // embeds `"code":"DENIED"` in some unrelated object - an annotation, a nested policy, a vendor
+    // extension - still took the auth arm, which is the same defect one level down from the substring
+    // scan it replaced. The spec puts the cause in `errors[].code` and nowhere else, so the array is
+    // located first and each of its objects is read on its own.
+    //
+    // No `errors` array means no declared cause, and `codes` is then empty: every `declared(...)` test
+    // answers false and the last arm quotes what arrived, which is the honest end for a document that
+    // is not an error document.
+    let codes: Vec<String> = array_after(manifest, "errors")
+        .map(|arr| {
+            split_objects(arr)
+                .into_iter()
+                .filter_map(|o| first_str(o, "code"))
+                .map(|c| c.to_ascii_uppercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let declared = |want: &str| codes.iter().any(|c| c == want);
 
     // RATE LIMIT first, because it is the one a working setup hits and the one the old wording sent
     // people furthest from. Docker Hub answers an over-quota anonymous pull with HTTP 429 and
@@ -808,7 +841,10 @@ fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
     // perfectly correct. Measured against Docker Hub on 2026-08-01 after a burst of pulls across six
     // machines. The registry's own `message` is quoted rather than paraphrased: it is the field the
     // distribution spec provides for exactly this, and it carries the current limit and its URL.
-    if low.contains("toomanyrequests") || low.contains("rate limit") {
+    // `rate limit` in the prose is kept as a SECOND chance on purpose, unlike the auth arm below: the
+    // advice it produces (authenticate or wait) is correct for any body that says a rate limit was
+    // reached, and wrong for nothing - it never sends the reader at a credential they do not need.
+    if declared("TOOMANYREQUESTS") || low.contains("rate limit") {
         let said = first_str(manifest, "message").unwrap_or_default();
         let said = if said.is_empty() {
             String::new()
@@ -821,8 +857,8 @@ fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
              retry - the image name and tag are not the problem"
         ));
     }
-    // The tag or the repository genuinely does not exist: the registry says which.
-    if low.contains("manifest_unknown") || low.contains("name_unknown") {
+    // The tag or the repository genuinely does not exist, and the registry DECLARED it.
+    if declared("MANIFEST_UNKNOWN") || declared("NAME_UNKNOWN") {
         let said = first_str(manifest, "message").unwrap_or_default();
         return OciError::Registry(format!(
             "{registry} has no such manifest for '{repo}'{}",
@@ -833,11 +869,28 @@ fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
             }
         ));
     }
-    let auth_ish = manifest.trim().is_empty()
-        || low.contains("unauthorized")
-        || low.contains("denied")
-        || low.contains("authentication");
-    if auth_ish {
+    // ⛔ AN EMPTY BODY IS NOT EVIDENCE OF A PRIVATE REPO, and reading it as one sent a reader to
+    // `kern login` for a problem no login fixes. It used to be folded into `auth_ish` because a bare
+    // 401 looks like this - true, and so does a connection that was reset, timed out, or was cut by a
+    // proxy, and this function is handed the BODY without the status that would tell them apart.
+    //
+    // MEASURED 2026-10-16: the suite's cache-path test, run under load average 11, failed with
+    // "cannot access 'library/alpine' on registry-1.docker.io - it may be private (run `kern login`)
+    // or the tag may not exist" - for the most public image there is, which the same run had pulled
+    // successfully moments earlier. Nothing was private and no tag was missing. So the arm says what
+    // arrived (nothing) and names both causes, with the one that needs no credentials first, because
+    // a reader who runs `kern login` and retries learns nothing from the second failure either.
+    if manifest.trim().is_empty() {
+        return OciError::Registry(format!(
+            "nothing came back from {registry} for '{repo}': the response body was EMPTY. That is \
+             what a dropped, timed-out or proxy-filtered connection looks like, and also what a bare \
+             `401` looks like - retry first, and if it is reproducible and the repo is private, \
+             `kern login {registry}`"
+        ));
+    }
+    // AUTH IS THE ONE ARM THAT MUST NOT GUESS, because `kern login` is the one action that costs the
+    // reader a credential and fixes nothing when the diagnosis is wrong.
+    if declared("UNAUTHORIZED") || declared("DENIED") {
         OciError::Registry(format!(
             "cannot access '{repo}' on {registry} - it may be private (run `kern login {registry}`) \
              or the tag may not exist"
@@ -1046,7 +1099,7 @@ fn download_blobs_oneconn(
         ));
     }
     if blobs.len() < 2 {
-        return; // 0–1 blobs: no second request to share a connection with - nothing to save.
+        return; // 0-1 blobs: no second request to share a connection with - nothing to save.
     }
     // Build one `curl` command, a `--next`-separated segment per blob. curl RESETS per-request options
     // at `--next`, so the TLS pin + size cap + `-o` + Bearer header MUST be repeated on every segment
@@ -3912,14 +3965,85 @@ mod tests {
 
     #[test]
     fn manifest_error_points_at_login_for_auth_failures() {
-        // An empty body (a bare 401) or a registry auth-error body → the `kern login` hint.
+        // A registry that DECLARES an auth code gets the `kern login` hint, in either case.
         for body in [
-            "",
             "{\"errors\":[{\"code\":\"UNAUTHORIZED\"}]}",
-            "{\"errors\":[{\"code\":\"DENIED\"}]}",
+            "{\"errors\":[{\"code\":\"DENIED\",\"message\":\"access denied\"}]}",
+            "{\"errors\":[{\"code\":\"unauthorized\"}]}",
         ] {
             let e = manifest_error(body, "ghcr.io", "org/app").to_string();
             assert!(e.contains("kern login ghcr.io"), "got: {e}");
+            assert!(e.contains("it may be private"), "got: {e}");
+        }
+        // ⛔ AND A BODY THAT MERELY CONTAINS THE WORD MUST NOT. Deciding by substring over the whole
+        // document sent a reader at a credential for a public repository: an outside review flagged
+        // it, and these are the shapes that produce it. A proxy's HTML, a `message` that quotes a
+        // policy, a repository whose NAME carries the word - none of them is the registry saying
+        // "unauthorized", and `errors[].code` is the field that would have.
+        // A SECOND ROUND CAUGHT THE HUNT ITSELF: `code` found ANYWHERE in the document was enough, so
+        // a body that carries the key in an unrelated object took the auth arm - the same defect one
+        // level below the substring scan. The cause lives in `errors[].code` and nowhere else.
+        for elsewhere in [
+            "{\"annotations\":{\"code\":\"DENIED\"},\"schemaVersion\":2}",
+            "{\"policy\":[{\"code\":\"UNAUTHORIZED\",\"note\":\"vendor extension\"}]}",
+            "{\"config\":{\"Labels\":{\"code\":\"denied\"}}}",
+        ] {
+            let e = manifest_error(elsewhere, "ghcr.io", "org/app").to_string();
+            assert!(
+                !e.contains("it may be private"),
+                "a `code` outside `errors[]` is not the registry declaring a cause: {e}"
+            );
+        }
+        for innocent in [
+            "<html><body>403 Forbidden: access denied by policy</body></html>",
+            "{\"schemaVersion\":2,\"annotations\":{\"note\":\"unauthorized use prohibited\"}}",
+            "{\"errors\":[{\"code\":\"UNKNOWN\",\"message\":\"authentication service is down\"}]}",
+        ] {
+            let e = manifest_error(innocent, "ghcr.io", "org/app").to_string();
+            assert!(
+                !e.contains("it may be private"),
+                "a body that only MENTIONS auth must not be reported as a private repo: {e}"
+            );
+            assert!(
+                !e.contains("kern login"),
+                "and it must not send the reader at a credential: {e}"
+            );
+        }
+        // The structured codes still beat the prose for the other two arms.
+        let rate = manifest_error(
+            "{\"errors\":[{\"code\":\"toomanyrequests\",\"message\":\"quota\"}]}",
+            "registry-1.docker.io",
+            "library/alpine",
+        )
+        .to_string();
+        assert!(rate.contains("rate-limiting"), "got: {rate}");
+        let unknown = manifest_error(
+            "{\"errors\":[{\"code\":\"NAME_UNKNOWN\"}]}",
+            "ghcr.io",
+            "org/app",
+        )
+        .to_string();
+        assert!(unknown.contains("no such manifest"), "got: {unknown}");
+        // ⛔ AN EMPTY BODY IS A DIFFERENT CLAIM, and asserting the auth one for it sent a reader to
+        // `kern login` for a dropped connection. CAUGHT 2026-10-16 when the suite, run under load
+        // average 11, reported exactly this for `library/alpine` - public, and pulled successfully in
+        // the same run. The arm must name what arrived and put the credential-free action first.
+        for empty in ["", "   ", "\n\t "] {
+            let e = manifest_error(empty, "ghcr.io", "org/app").to_string();
+            assert!(e.contains("body was EMPTY"), "got: {e}");
+            assert!(e.contains("retry first"), "got: {e}");
+            assert!(
+                !e.contains("it may be private"),
+                "an empty body does not make a repo private: {e}"
+            );
+            // The login is still REACHABLE, as the second step and named as conditional: a bare 401
+            // really does look like this, and a reader whose repo IS private must still find it.
+            assert!(e.contains("kern login ghcr.io"), "got: {e}");
+            let (private_at, retry_at) = (
+                e.find("kern login").expect("login hint"),
+                e.find("retry first").expect("retry hint"),
+            );
+            assert!(retry_at < private_at, "the retry must come first: {e}");
         }
         // A genuinely layerless-but-valid manifest keeps the plain message.
         let e =

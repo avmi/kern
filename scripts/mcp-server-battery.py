@@ -269,10 +269,25 @@ else:
     txt, is_err = text_of(res[-1])
     check("immagine #9: language=node", not is_err and "node v" in txt, f"{txt.strip()[:60]!r}")
 
-# 9. Il rifiuto di node sull'immagine PREDEFINITA, che l'MCP deve riferire come errore leggibile.
-res, err = session("node default", [call("console.log(1)", language="node")])
+# 9. Il rifiuto di node su un'immagine SENZA node, che l'MCP deve riferire come errore leggibile.
+#
+# ⛔ L'IMMAGINE SI NOMINA, non si eredita dal default. Questo controllo diceva "sull'immagine
+# PREDEFINITA" e non passava l'immagine: il default dell'SDK e' `python:3.12-slim`, che node non ce
+# l'ha, ma il default dell'MCP e' `_DEFAULT_MCP_IMAGE`, l'immagine sandwich di questo repo, che node
+# ce l'ha. Il giorno che quel default e' cambiato (`a781a44`, 4 settembre) l'attesa e' diventata falsa
+# e il controllo ha cominciato a fallire con `isError=False '1\n\n[exit 0 ...]'` - cioe' node che gira.
+#
+# E' lo stesso errore, a specchio, che il commento di `_DEFAULT_IMAGE_HAS_NODE` nell'SDK mette in
+# guardia: "un rifiuto che si basasse su «e' questa l'immagine predefinita?» continuerebbe, il giorno
+# che il default cambia, a rifiutare un percorso che ha iniziato a funzionare". Li' il rischio era nel
+# codice, qui era nell'ATTESA del test. Il soggetto di questo controllo e' "l'MCP riferisce il rifiuto
+# in modo leggibile", quindi l'immagine che non ha node si nomina, e il fatto su cosa contiene resta
+# dove l'SDK lo tiene.
+NO_NODE_IMAGE = "python:3.12-slim"  # == kern_sandbox._DEFAULT_IMAGE, con _DEFAULT_IMAGE_HAS_NODE=False
+res, err = session("node default", [call("console.log(1)", language="node")],
+                   env={"KERN_MCP_IMAGE": NO_NODE_IMAGE}, timeout=600)
 txt, is_err = text_of(res[-1])
-check("node sull'immagine predefinita e' rifiutato", is_err and "node" in txt.lower(),
+check("node su un'immagine senza node e' rifiutato", is_err and "node" in txt.lower(),
       f"isError={is_err} {txt.strip()[:80]!r}")
 
 # 10. L'interprete caldo (KERN_MCP_KERNEL=1): lo stato persiste fra le celle.

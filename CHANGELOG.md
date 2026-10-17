@@ -19,6 +19,107 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
+## Unreleased
+
+**`kern image inspect` emits the labels and the healthcheck it had already read.** Both are parsed
+out of the image's own record and both were dropped before anything was printed: `Config.Labels`
+appeared in neither rendering, and `Config.Healthcheck` appeared in the human one and not in the
+JSON, so the two renderings of one image disagreed about what kern knows. An image's labels are where
+`org.opencontainers.image.*` lives, so a consumer asking kern for an image's source, version or
+licence was told it carries none. Both now use Docker's shapes: `Labels` as an object, `Healthcheck`
+with `Test`, `Interval`, `Timeout`, `StartPeriod`, `StartInterval` and `Retries`, in the nanoseconds
+Docker's document uses, with each optional field omitted when the image did not set it.
+
+**`kern compose exec` no longer builds.** It entered a box that is already running - it refuses with
+"is not running" otherwise - and ran the file's whole `build:` section first, printing all of it, so
+entering a running container cost a rebuild and buried the command's own output. It builds nothing
+now, as `docker compose exec` does.
+
+**`kern compose start` and `restart` stop printing `up`'s note.** Three verbs reach the line that
+announces a stack returned instead of streaming, and all three were handed a sentence naming `up`,
+pointing at a `-d` flag they cannot pass and claiming parity with `docker compose up`. The note names
+the verb that ran, taken from the one table that defines them rather than a second list.
+
+**`kern exec` works on hosts where it used to refuse outright.** With an allowlist of host shapes
+that is not exotic at all - a shell in `/init.scope`, which is how WSL starts every terminal, and an
+ordinary `ssh` session on Ubuntu 24.04, Fedora 44, Debian 13 and Rocky 10.2 - kern runs outside the
+cgroup tree it delegates, and a process there cannot be moved into a box's cgroup: cgroup v2
+delegation containment needs write access to the common ancestor, which is the root. `kern exec` and
+`kern compose exec` therefore refused with 126, on hosts where the box itself was up and correctly
+capped. The refusal told the reader to re-enter with `systemd-run --user --scope bash` and run kern
+in that shell, which works; kern now does that itself, once per command, when a user manager exists
+to create the scope. The command keeps the box's caps, not the scope's: measured against a box capped
+at 128 MiB, the exec reads `memory.max = 134217728` through the scope exactly as it does without one,
+and the command's exit status is preserved.
+
+The scope carries no resource properties of its own and is named `kern-exec-<pid>.scope`, which is
+deliberately not the `kern-box-` prefix that marks a cgroup kern may reap. Where no user manager
+exists there is nobody to create a scope and the refusal stands, saying so; `KERN_NO_SCOPE` skips it
+as it already does for `kern box` and `kern run`. Hosts inside the user manager's tree, which is every
+ordinary desktop, pay nothing: measured over 20 alternating pairs, the difference is -0.03 ms with a
+95% interval of [-0.06, +0.03] ms against an A/A floor of ±0.33 ms.
+
+`kern doctor`'s scope-toll row said `kern exec` refuses on such a host. It no longer does, so the row
+no longer says it.
+
+**A build could reuse a layer that had been half-deleted, and say `built`.** `kern gc` reclaims build
+layers no image references, and it did that with `remove_dir_all`, which stops at the first directory
+it has no write permission on: a layer carrying a subuid-owned file, or any read-only directory, was
+left on disk, uncounted and unnamed, while the pass could still take its `.ok` sentinel. Where the
+sentinel survived instead, the build cache read a partially emptied directory as a complete layer.
+Measured from outside against v0.32.0: a layer from `RUN useradd -m -u 10001 app` kept `home/app`
+while `etc/passwd` was gone, the next `compose build` printed `built`, and the box failed with "user
+'app' has no account in the image's /etc/passwd" - an error naming a subsystem that was not at fault.
+
+The sweep now removes the sentinel BEFORE it touches the directory, so any removal that cannot finish
+leaves a layer with no sentinel, which is a cache MISS and costs a rebuild. It removes the directory
+with the same forced, id-mapped remover `rmi` and `volume rm` already use, so a layer they would have
+reclaimed is no longer left behind here. Measured end to end on a cache of 20 such layers: before,
+`gc` swept 0 and left 20 directories; after, it swept 20 and left none.
+
+**`gc` and the `kern top` Images tab say what they could not reclaim**, with the bytes still on disk
+and the layer key, where a failed removal used to be dropped in silence. It is a note and not an
+error: the sweep removed everything it could, and the exit code still reports that.
+
+**`workspace_max_bytes` is overshot by far less, and by an amount that depends on what the workspace
+costs to MEASURE.** The in-call poller looked once a second whatever the limit was, so what got past it
+was whatever the disk could write in that second: a 50 MiB cap stopped a box at 5,964,300,288 bytes,
+113.8x the cap, and a report from a slower disk measured ~933 MB of the same thing. The interval is now
+scaled to the remaining headroom, floored at 1 ms, and between two walks of the tree a cheap probe
+re-checks the eight biggest files and every directory's fingerprint instead of walking it again.
+
+⛔ IT IS NOT BOUNDED BY THE CAP, and an earlier draft of this entry said it was. Measured with the
+headroom held at 50 MiB and only the pre-existing file count varied:
+
+| files  | Python  | Node    |
+|--------|---------|---------|
+| 0      | 1.26x   | 1.30x   |
+| 1,000  | 1.32x   | 1.80x   |
+| 10,000 | 4.12x   | 8.40x   |
+| 50,000 | 12.88x  | 12.80x  |
+
+An interval can never be shorter than one walk of the tree, so on a large workspace the bound is the
+walk's duration times the write rate, and Node pays more per walk (19.85 ms against 13.17 ms on the
+same 10,000-file tree). The `workspace_full` fault says this and gives the figures. Closing it needs a
+measurement that is not O(files), which would have to keep hard links counted once, symlinks refused
+and a closed directory refusing the call, or it defeats the cap for good. The cap remains a measurement
+and a kill on a host directory, not a refusal from the filesystem.
+
+In Node the backoff that bounds the poller's own cost had never run: its timer was started after the
+walk returned instead of before it, so it measured the comparison that follows and always came out at
+zero. The sentence promising it was true in Python and false there.
+
+**A file the box left at mode 0 is refused as a FILE, and as yours.** `read_file` answered "a directory
+on that path is closed to this process and its owner bits could not be restored - it is not ours (a
+`user=` session's box account owns it)" for a file owned by the caller's own uid: the subject, the
+ownership and the `/proc` hint it ended with were all wrong, and the reader was sent to three dead ends.
+`write_file` had the same defect and had not been reported. Both now name what they looked at - that it
+is a file, its mode, its owner, and whether that owner is this process - and say that kern leaves a
+mode-0 file exactly as the box wrote it because for a file the mode can be the data. A refusal that
+really is a closed DIRECTORY is unchanged, and keeps `snapshot`'s wording, which was already right
+because it enumerates the causes instead of asserting one; that sentence is now one spelling shared by
+every surface that has to say it.
+
 ## kern-sandbox 0.2.48 - 2026-10-13
 
 **It carries the kern v0.32.0 binary**, so `--egress-allow` on a sandbox refuses a plain-HTTP head
