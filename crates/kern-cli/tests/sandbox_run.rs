@@ -14355,7 +14355,29 @@ fn a_cache_path_with_special_characters_still_pulls_builds_and_stacks_layers() {
         );
 
         // -- LAYERED HALF: needs a registry ------------------------------------------------------
-        if registry_up {
+        //
+        // ⛔ THE CAPABILITY IS PROBED IN THE CACHE THE SUBJECT WILL USE, and that is what this test
+        // was missing. `registry_up` above pulls `alpine:3.19` into a cache of its OWN, so the build
+        // below still had to reach the registry itself - six network pulls per run of this test, five
+        // of them after a probe that proved nothing about them. CAUGHT 2026-10-16 by running the suite
+        // three times under load average 11: run 2 failed here with "registry: cannot access
+        // 'library/alpine' on registry-1.docker.io", on a public image that had just been pulled
+        // successfully, in a test whose subject is CACHE PATHS and not the network.
+        //
+        // So the base image is pulled into THIS cache first, and the build that follows reaches no
+        // registry at all. A failure of that pull is a capability statement and skips; a failure of
+        // the BUILD is a regression and still fails, which is the distinction the comment on
+        // `registry_up` insists on ("a skip decided by a build's own failure turns every regression
+        // that breaks builds into a green test") and which only holds if the skip is decided by a
+        // `pull`.
+        let base_cached = registry_up && {
+            let (said, ok) = run(&["pull", "alpine:3.19"]);
+            if !ok {
+                eprintln!("skip (layered half, {label}): the registry went away mid-test:\n{said}");
+            }
+            ok
+        };
+        if base_cached {
             let tag2 = format!("kern-sp-{label}-l:1");
             let (said2, ok2) = run(&["build", "-t", &tag2, ctx2.to_str().expect("ctx2 utf8")]);
             {

@@ -833,10 +833,27 @@ fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
             }
         ));
     }
-    let auth_ish = manifest.trim().is_empty()
-        || low.contains("unauthorized")
-        || low.contains("denied")
-        || low.contains("authentication");
+    // ⛔ AN EMPTY BODY IS NOT EVIDENCE OF A PRIVATE REPO, and reading it as one sent a reader to
+    // `kern login` for a problem no login fixes. It used to be folded into `auth_ish` because a bare
+    // 401 looks like this - true, and so does a connection that was reset, timed out, or was cut by a
+    // proxy, and this function is handed the BODY without the status that would tell them apart.
+    //
+    // MEASURED 2026-10-16: the suite's cache-path test, run under load average 11, failed with
+    // "cannot access 'library/alpine' on registry-1.docker.io - it may be private (run `kern login`)
+    // or the tag may not exist" - for the most public image there is, which the same run had pulled
+    // successfully moments earlier. Nothing was private and no tag was missing. So the arm says what
+    // arrived (nothing) and names both causes, with the one that needs no credentials first, because
+    // a reader who runs `kern login` and retries learns nothing from the second failure either.
+    if manifest.trim().is_empty() {
+        return OciError::Registry(format!(
+            "nothing came back from {registry} for '{repo}': the response body was EMPTY. That is \
+             what a dropped, timed-out or proxy-filtered connection looks like, and also what a bare \
+             `401` looks like - retry first, and if it is reproducible and the repo is private, \
+             `kern login {registry}`"
+        ));
+    }
+    let auth_ish =
+        low.contains("unauthorized") || low.contains("denied") || low.contains("authentication");
     if auth_ish {
         OciError::Registry(format!(
             "cannot access '{repo}' on {registry} - it may be private (run `kern login {registry}`) \
@@ -1046,7 +1063,7 @@ fn download_blobs_oneconn(
         ));
     }
     if blobs.len() < 2 {
-        return; // 0–1 blobs: no second request to share a connection with - nothing to save.
+        return; // 0-1 blobs: no second request to share a connection with - nothing to save.
     }
     // Build one `curl` command, a `--next`-separated segment per blob. curl RESETS per-request options
     // at `--next`, so the TLS pin + size cap + `-o` + Bearer header MUST be repeated on every segment
@@ -3912,14 +3929,35 @@ mod tests {
 
     #[test]
     fn manifest_error_points_at_login_for_auth_failures() {
-        // An empty body (a bare 401) or a registry auth-error body → the `kern login` hint.
+        // A registry auth-error BODY says so, so the `kern login` hint leads.
         for body in [
-            "",
             "{\"errors\":[{\"code\":\"UNAUTHORIZED\"}]}",
             "{\"errors\":[{\"code\":\"DENIED\"}]}",
         ] {
             let e = manifest_error(body, "ghcr.io", "org/app").to_string();
             assert!(e.contains("kern login ghcr.io"), "got: {e}");
+            assert!(e.contains("it may be private"), "got: {e}");
+        }
+        // ⛔ AN EMPTY BODY IS A DIFFERENT CLAIM, and asserting the auth one for it sent a reader to
+        // `kern login` for a dropped connection. CAUGHT 2026-10-16 when the suite, run under load
+        // average 11, reported exactly this for `library/alpine` - public, and pulled successfully in
+        // the same run. The arm must name what arrived and put the credential-free action first.
+        for empty in ["", "   ", "\n\t "] {
+            let e = manifest_error(empty, "ghcr.io", "org/app").to_string();
+            assert!(e.contains("body was EMPTY"), "got: {e}");
+            assert!(e.contains("retry first"), "got: {e}");
+            assert!(
+                !e.contains("it may be private"),
+                "an empty body does not make a repo private: {e}"
+            );
+            // The login is still REACHABLE, as the second step and named as conditional: a bare 401
+            // really does look like this, and a reader whose repo IS private must still find it.
+            assert!(e.contains("kern login ghcr.io"), "got: {e}");
+            let (private_at, retry_at) = (
+                e.find("kern login").expect("login hint"),
+                e.find("retry first").expect("retry hint"),
+            );
+            assert!(retry_at < private_at, "the retry must come first: {e}");
         }
         // A genuinely layerless-but-valid manifest keeps the plain message.
         let e =
