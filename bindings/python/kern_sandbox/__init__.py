@@ -4950,7 +4950,7 @@ class Sandbox:
 
         AS THE BOX USER, NOT AS ROOT OF THE RANGE, and that choice is the boundary. The helper reaches
         what the host was refused because the account OWNS what it closed (its 0600, its 0700, its
-        tarball's 0755), not because it can override anything. Root of the range could, and an
+        tarball's 0755), not because it can override anything. Root of the range could, and a
         later pass showed what that buys a box: its scripts check a path and then open it, so
         a box racing them could have root read a root-only file of the image and hand it to the
         caller. As the account, a race reaches only what the account reaches already. No network, the

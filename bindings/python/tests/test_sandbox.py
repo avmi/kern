@@ -2151,7 +2151,7 @@ def test_kerns_own_state_is_refused_as_a_mount_source(monkeypatch, tmp_path):
     with pytest.raises(MountRefused):
         kern._validate_mount(str(other / "kern"), "/x")
     # THE DEFAULT LOCATION STAYS REFUSED WHILE THE VARIABLE POINTS ELSEWHERE. Measured by the same
-    # later pass, in one process: with `XDG_DATA_HOME=/tmp/xdh2`, `~/.local/share/kern` was ACCEPTED and
+    # pass, in one process: with `XDG_DATA_HOME=/tmp/xdh2`, `~/.local/share/kern` was ACCEPTED and
     # still held `builds` and `volumes`, because the guard protected the CONFIGURED directory while the
     # data a previous run wrote sat at the default one. Both spellings are in the list now.
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "elsewhere"))
@@ -4053,7 +4053,7 @@ def test_a_signal_death_is_reported_as_128_plus_n_not_as_minus_n():
     """`exit_code` for a killed process must be 137, the value every other tool a reader compares
     against reports: a shell, kern's own CLI, docker, and the Node binding.
 
-    FOUND BY AN A LATER PASS running one timeout through both bindings: Python answered `-9` (the
+    FOUND BY A LATER PASS running one timeout through both bindings: Python answered `-9` (the
     `subprocess` convention, negative meaning "killed by signal N") and Node answered `137`. Same
     event, two numbers, so a caller branching on `exit_code == 137` saw the timeout in one binding and
     missed it in the other.

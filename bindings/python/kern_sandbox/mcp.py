@@ -264,7 +264,7 @@ _STATE_RESIDENT = (
 _TOOLS = [
     {
         "name": "run_code",
-        # WHAT THIS SENTENCE IS FOR, and why it no longer opens with "on the user's own machine". An
+        # WHAT THIS SENTENCE IS FOR, and why it no longer opens with "on the user's own machine". A
         # later pass wired this server into Cursor correctly and the agent answered
         # "The sandbox run completed successfully. Output: 45" from its OWN python, never calling the
         # tool: the workspace was untouched for eleven days. The client already owns the word "sandbox"

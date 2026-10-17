@@ -2505,7 +2505,7 @@ function kernExecReportsItsStart(version) {
 
 /** Refuse a binary that does not IDENTIFY ITSELF as kern. Throws `SandboxError` if it does not.
  *
- * MEASURED, and found by a later pass running the positive control this project wrote for him:
+ * MEASURED, and found by a later pass running the positive control this project wrote for it:
  * with `KERN_BIN=/bin/true` a call returned `success: true, exitCode: 0, fault: null` and an empty
  * stdout. The code never ran and the caller was told it had. Any `kern` earlier in `PATH` that is not
  * kern does this: a leftover wrapper, a shim, a no-op. An agent loop reads `success` and every

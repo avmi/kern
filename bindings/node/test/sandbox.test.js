@@ -1720,7 +1720,7 @@ test("a reply without a usable exit code is a fault, not a success", () => {
 });
 
 test("a binary that is not kern is refused before any code runs", async () => {
-  // MEASURED, and found by a later pass running the positive control this project wrote for him:
+  // MEASURED, and found by a later pass running the positive control this project wrote for it:
   // with `KERN_BIN=/bin/true` a call returned `success: true, exitCode: 0, fault: null` and an empty
   // stdout. The code never ran and the caller was told it had. Both bindings did it.
   const prev = process.env.KERN_BIN;
@@ -2451,7 +2451,7 @@ test("the setup leaves bytecode behind, so the default costs nothing", exec, asy
   });
 });
 
-// kern and the workload share ONE stderr, so the raw field carries the launcher's own voice. An
+// kern and the workload share ONE stderr, so the raw field carries the launcher's own voice. A
 // later pass found kern's `note:` lines inside a LangChain tool result, spending a model's
 // context on the runtime's housekeeping where they can be misread as the program's own errors.
 // `codeStderr` and `runtimeNotes` are the two halves.
@@ -2752,7 +2752,7 @@ test("kern's own state is refused as a mount source", () => {
       }
     }
     // THE DEFAULT LOCATION STAYS REFUSED WHILE THE VARIABLE POINTS ELSEWHERE. Measured by the same
-    // later pass, in one process: with `XDG_DATA_HOME` pointed at a scratch dir, `~/.local/share/kern`
+    // pass, in one process: with `XDG_DATA_HOME` pointed at a scratch dir, `~/.local/share/kern`
     // was ACCEPTED and still held `builds` and `volumes`. Both spellings are in the list now, so the
     // guard covers where kern WILL write and where a previous run already did.
     {
