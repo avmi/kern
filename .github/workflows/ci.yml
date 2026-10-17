@@ -65,7 +65,7 @@ jobs:
         # AND A SKIP HERE IS INVISIBLE, which is why the suite is told to REQUIRE its fixtures on this
         # runner. `cargo test` hides the stderr of a test that passes, so a file whose fixtures are
         # missing skips most of itself and still reports 133/133, and nobody reads a log to find out.
-        # A later pass measured exactly that on his own machine: 96 of 133 skipped for a
+        # A later pass measured exactly that on another machine: 96 of 133 skipped for a
         # missing busybox, green. MEASURED here rather than assumed: this runner ships
         # `busybox-static` (the webstack job's apt output says it REMOVES it to install `busybox`), so
         # `/bin/busybox` is present and this variable asserts a property that already holds. The day a
@@ -98,7 +98,7 @@ jobs:
           # AND THE BLOCKS THEMSELVES, because a reader pastes them. The LangChain block used
           # `create_agent(model, ...)` with neither name imported nor assigned, under an install
           # line that pulls `langchain-core` only, so the import would not have existed either. An
-          # later passer found it by pasting all thirteen, which is what a launch audience
+          # it was found by pasting all thirteen, which is what a launch audience
           # does and what nobody here had done. Static (undefined names, in reading order with an
           # accumulating scope) so it needs no binary, no network and no image pull: milliseconds.
           python3 scripts/readme-blocks-complete.py

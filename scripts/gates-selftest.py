@@ -211,7 +211,7 @@ CASES: list[Case] = [
     #
     # The rule is enforced at RUNTIME (an assertion in the chokepoints) and its perimeter by CLIPPY
     # (`disallowed-methods` in clippy.toml); this gate watches the EXEMPTIONS, which is the part a
-    # person widens in one line with nothing else noticing. The four cases are the four ways an
+    # person widens in one line with nothing else noticing. The four cases are the four ways a
     # later pass disarmed it after the first version shipped: `expect` rather than `allow`, a
     # second lint in the same list, the GROUP that contains this lint (which never names it, so no
     # regex keyed on the name can see it), and the lint removed from clippy.toml altogether.
