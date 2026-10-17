@@ -911,6 +911,95 @@ mod ps_exited_tests {
         );
     }
 
+    /// AN IMAGE'S LABELS WENT IN AND NEVER CAME OUT EITHER, which is the same defect one surface
+    /// later. `kern image inspect` parsed `config.Labels` out of the `.image` sidecar and emitted it
+    /// in neither rendering, so a consumer asking kern where an image came from - its
+    /// `org.opencontainers.image.source`, its version, its licence - was told it carries none.
+    ///
+    /// The rendering is SHARED with the box path rather than written twice, so the bare-key rule has
+    /// one reader and not three: the comment on `label_pairs` records that two readers disagreeing
+    /// about exactly one input has already cost this repository a defect.
+    #[test]
+    fn an_images_label_segments_render_as_dockers_object() {
+        use crate::commands::inspect::labels_object;
+        let of = |v: &[&str]| labels_object(v.iter().map(|s| (*s).to_string()));
+        assert_eq!(of(&[]), "{}", "no labels is an empty object, never null");
+        assert_eq!(
+            of(&["org.opencontainers.image.version=1.2.3"]),
+            r#"{"org.opencontainers.image.version":"1.2.3"}"#
+        );
+        // A BARE KEY is a label with an empty value, the same rule the box path follows, and an
+        // image really can carry one: `LABEL bare` in a Dockerfile produces exactly this.
+        assert_eq!(of(&["bare="]), r#"{"bare":""}"#);
+        assert_eq!(of(&["bare"]), r#"{"bare":""}"#);
+        // A VALUE CONTAINING `=` splits on the FIRST one only, or `withequals=a=b=c` loses its tail.
+        assert_eq!(of(&["withequals=a=b=c"]), r#"{"withequals":"a=b=c"}"#);
+        // Quotes and backslashes are escaped, not emitted raw into the document.
+        assert_eq!(of(&[r#"a=x"y"#]), r#"{"a":"x\"y"}"#);
+        // An empty segment has no key and is dropped rather than becoming `"":""`.
+        assert_eq!(of(&["", "a=1"]), r#"{"a":"1"}"#);
+        assert_eq!(
+            of(&["a=1", "b=2"]),
+            r#"{"a":"1","b":"2"}"#,
+            "order follows the image's own list"
+        );
+    }
+
+    /// THE HEALTHCHECK WAS IN THE HUMAN OUTPUT AND NOT IN THE JSON, so the two renderings of one
+    /// image disagreed about what kern knows. A script reading `.Config.Healthcheck` got nothing from
+    /// an image whose check kern had parsed, stored and was printing two lines away.
+    ///
+    /// The durations are already nanoseconds in kern's own record, which is the unit Docker's
+    /// document uses, so this is a rename and there is no factor to get wrong - asserted against the
+    /// numbers a `HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3` produces.
+    #[test]
+    fn the_healthcheck_renders_in_dockers_shape_or_null() {
+        use crate::commands::inspect::healthcheck_json;
+        assert_eq!(
+            healthcheck_json(None),
+            "null",
+            "an image with no check says so, rather than an empty object that reads as a check"
+        );
+        let full = kern_oci::ImageHealthcheck {
+            test: vec!["CMD-SHELL".into(), "wget -q -O- http://localhost/".into()],
+            interval_ns: Some(30_000_000_000),
+            timeout_ns: Some(3_000_000_000),
+            start_period_ns: Some(5_000_000_000),
+            start_interval_ns: None,
+            retries: Some(3),
+        };
+        assert_eq!(
+            healthcheck_json(Some(&full)),
+            r#"{"Test":["CMD-SHELL","wget -q -O- http://localhost/"],"Interval":30000000000,"Timeout":3000000000,"StartPeriod":5000000000,"Retries":3}"#
+        );
+        // AN ABSENT FIELD IS OMITTED, never zero: `"Interval":0` reads as "probe continuously" to a
+        // consumer that trusts the number, and this file's rule is that a plausible answer is worse
+        // than none.
+        let bare = kern_oci::ImageHealthcheck {
+            test: vec!["NONE".into()],
+            interval_ns: None,
+            timeout_ns: None,
+            start_period_ns: None,
+            start_interval_ns: None,
+            retries: None,
+        };
+        assert_eq!(healthcheck_json(Some(&bare)), r#"{"Test":["NONE"]}"#);
+        // Docker 25+'s `StartInterval` is carried too: missing it is a 60x delay on an image that
+        // ships `Interval 300s, StartInterval 5s`, which is why kern parses it at all.
+        let si = kern_oci::ImageHealthcheck {
+            test: vec!["CMD".into(), "true".into()],
+            interval_ns: Some(300_000_000_000),
+            timeout_ns: None,
+            start_period_ns: None,
+            start_interval_ns: Some(5_000_000_000),
+            retries: None,
+        };
+        assert_eq!(
+            healthcheck_json(Some(&si)),
+            r#"{"Test":["CMD","true"],"Interval":300000000000,"StartInterval":5000000000}"#
+        );
+    }
+
     /// Labels went IN and never came out: the box carried them, `--filter label=` matched them, and
     /// no surface printed them. These pin the two readers against the filter's own splitting rule.
     #[test]
@@ -4291,6 +4380,38 @@ mod compose_action_tests {
         ] {
             assert_eq!(ComposeAction::from_verb(word), Some(want), "verb {word}");
         }
+    }
+
+    /// THE NAME COMES BACK FROM THE ONE TABLE, which is what keeps a note from naming a verb the
+    /// reader did not type. `compose start` and `compose restart` reach the same line `up` does and
+    /// were handed `up`'s sentence, with a `-d` flag they cannot pass and a claim of parity with
+    /// `docker compose up`. Deriving the word rather than listing it again is the rule the verb
+    /// table states about itself, after the same list was written out three times by hand.
+    #[test]
+    fn every_verb_name_round_trips_through_the_one_table() {
+        for (word, action) in COMPOSE_VERBS {
+            // `kill` is a second spelling of `Stop`, so it is the one entry whose word does not come
+            // back - the table's order decides, and `stop` is listed first because it is documented.
+            if *word == "kill" {
+                assert_eq!(
+                    action.name(),
+                    "stop",
+                    "`kill` resolves to the documented spelling"
+                );
+                continue;
+            }
+            assert_eq!(action.name(), *word, "verb {word}");
+            assert_eq!(
+                ComposeAction::from_verb(action.name()),
+                Some(*action),
+                "the name must parse back to the action it came from: {word}"
+            );
+        }
+        // The three that reach the terminal note, named explicitly: a table-driven loop would pass
+        // if all three silently became the same word.
+        assert_eq!(ComposeAction::Up.name(), "up");
+        assert_eq!(ComposeAction::Start.name(), "start");
+        assert_eq!(ComposeAction::Restart.name(), "restart");
     }
 
     #[test]

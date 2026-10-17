@@ -15664,3 +15664,148 @@ fn a_running_kept_box_is_not_removed_and_not_restarted() {
     assert!(ok, "after `stop`, `rm` must work:\n{said}");
     let _ = fs::remove_dir_all(&home);
 }
+
+/// `compose exec` BUILDS NOTHING, which is what Docker does and what the verb means.
+///
+/// It enters a box that is ALREADY RUNNING, so every image it could need exists by definition. The
+/// dispatch ran the whole `build:` section first and printed all of it: entering a running container
+/// cost a rebuild and buried the command's own output under it.
+///
+/// THE FIXTURE IS THE DISCRIMINATOR AND IT NEEDS NOTHING. The Dockerfile cannot build - its first
+/// instruction is not `FROM` - and the service is not running. Before the change the build ran and
+/// failed, so the reader was told "build failed" about a verb that builds nothing; after it, the
+/// exec path is reached and answers the question actually asked, which is that the service is not
+/// up. No box, no user namespace, no network: this runs everywhere the suite does.
+#[test]
+fn compose_exec_does_not_build_the_services_it_is_not_starting() {
+    let dir = std::env::temp_dir().join(format!("kern-ex-nb-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::write(dir.join("Dockerfile"), "NOTAREALINSTRUCTION x\n").expect("write Dockerfile");
+    let file = dir.join("compose.yml");
+    fs::write(&file, "services:\n  web:\n    build: .\n").expect("write compose");
+
+    // The control first: `up` DOES build, so the fixture is genuinely unbuildable and a later
+    // "no build happened" cannot pass because the build silently succeeded.
+    let up = kern()
+        .current_dir(&dir)
+        .args(["compose", "compose.yml", "up", "-d"])
+        .output()
+        .expect("run kern compose up");
+    let up_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(
+        up_text.contains("build failed") || up_text.contains("must be FROM"),
+        "the fixture must be unbuildable, or this test proves nothing: {up_text}"
+    );
+
+    let out = kern()
+        .current_dir(&dir)
+        .args(["compose", "compose.yml", "exec", "web", "--", "true"])
+        .output()
+        .expect("run kern compose exec");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        !text.contains("build failed") && !text.contains("must be FROM"),
+        "`compose exec` must not build: it entered the build path instead of answering about the \
+         service. Got: {text}"
+    );
+    assert!(
+        text.contains("is not running"),
+        "it must answer the question the verb asks - whether the service is up. Got: {text}"
+    );
+}
+
+/// `kern image inspect` EMITS WHAT IT PARSED, and this pins the wiring rather than the helpers.
+///
+/// The labels and the healthcheck are read out of the `.image` sidecar into the config struct and
+/// were then dropped: `Labels` appeared in neither rendering, and `Healthcheck` appeared in the
+/// human one and not in the JSON, so the two renderings of one image disagreed about what kern
+/// knows. Unit tests over the two serialisers cannot catch that - they stay green while nothing
+/// calls them - so this drives the real binary from a Dockerfile to the document.
+///
+/// `FROM scratch` needs no registry, so this test says nothing about the network, and it runs in its
+/// own `XDG_CACHE_HOME` so it cannot touch the developer's image store.
+#[test]
+fn image_inspect_emits_the_labels_and_healthcheck_it_parsed() {
+    let root = std::env::temp_dir().join(format!("kern-ins-lh-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let ctx = root.join("ctx");
+    fs::create_dir_all(&ctx).expect("mkdir ctx");
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM scratch\n\
+         LABEL org.opencontainers.image.version=\"1.2.3\"\n\
+         LABEL bare\n\
+         LABEL withequals=\"a=b=c\"\n\
+         HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD /probe\n",
+    )
+    .expect("write Dockerfile");
+    let run = |args: &[&str]| -> (bool, String) {
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            o.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        )
+    };
+    let (ok, out) = run(&["build", "-t", "s4wire:test", ctx.to_str().unwrap()]);
+    if !ok {
+        let _ = fs::remove_dir_all(&root);
+        eprintln!("skip: a `FROM scratch` image could not be built here: {out}");
+        return;
+    }
+
+    let (ok, json) = run(&["image", "inspect", "s4wire:test", "--json"]);
+    assert!(ok, "image inspect --json must succeed: {json}");
+    for want in [
+        r#""org.opencontainers.image.version":"1.2.3""#,
+        r#""bare":"""#,
+        r#""withequals":"a=b=c""#,
+    ] {
+        assert!(
+            json.contains(want),
+            "the JSON must carry {want} under Config.Labels: {json}"
+        );
+    }
+    // Docker's field names, and the durations in the nanoseconds its document uses: 30s and 3s.
+    for want in [
+        r#""Interval":30000000000"#,
+        r#""Timeout":3000000000"#,
+        r#""Retries":3"#,
+        // SHELL FORM, which is what `HEALTHCHECK CMD <words>` means: Docker records it as
+        // `CMD-SHELL` and so does kern. Asserted against what the binary actually writes, after
+        // this test first demanded the exec-form spelling and was wrong about it.
+        r#""Test":["CMD-SHELL","/probe"]"#,
+    ] {
+        assert!(
+            json.contains(want),
+            "the JSON must carry {want} under Config.Healthcheck: {json}"
+        );
+    }
+
+    let (ok, human) = run(&["image", "inspect", "s4wire:test"]);
+    assert!(ok, "the human rendering must succeed: {human}");
+    assert!(
+        human.contains("labels") && human.contains("org.opencontainers.image.version=1.2.3"),
+        "the human rendering must name the labels too: {human}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

@@ -5314,6 +5314,24 @@ pub const COMPOSE_VERBS: &[(&str, ComposeAction)] = &[
 ];
 
 impl ComposeAction {
+    /// The word that selects this verb on the command line, read from the ONE table that defines
+    /// them.
+    ///
+    /// DERIVED, NEVER RE-LISTED, which is the rule the table above states about itself after the
+    /// same list was written out three times by hand and `systemd` shipped working but undocumented.
+    /// The one place this is read is a note printed TO the user, and naming a verb they did not type
+    /// is exactly the defect it exists to prevent: that note said `up` for every verb that reached
+    /// it, including `start` and `restart`.
+    ///
+    /// `kill` and `stop` are one action and the table's order decides which word comes back: `stop`
+    /// is listed first, and it is the documented spelling.
+    pub fn name(self) -> &'static str {
+        COMPOSE_VERBS
+            .iter()
+            .find(|(_, a)| *a == self)
+            .map_or("up", |(n, _)| *n)
+    }
+
     /// Parse a compose sub-verb. `None` for an unknown word, so the caller can report it with the
     /// full list rather than guessing.
     pub fn from_verb(v: &str) -> Option<Self> {
