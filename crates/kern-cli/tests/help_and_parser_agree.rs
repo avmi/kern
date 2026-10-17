@@ -187,7 +187,7 @@ fn every_flag_the_parser_accepts_is_advertised_in_help() {
 /// `kern box --help` listed `--timeout` on two lines: "Auto-stop the box after N seconds" and
 /// "Auto-stop: SIGTERM at n seconds, SIGKILL 2 seconds later (so n+2 worst case)". Both were true
 /// and only the second was complete, so a reader who scanned to the first entry and stopped had no
-/// way to know a kill can land n+2 seconds in. An later pass read it that way and reported the
+/// way to know a kill can land n+2 seconds in. A later pass read it that way and reported the
 /// timeout as broken; it was not, it was measured at a constant 2.0 s of grace on 1, 2 and 5 second
 /// timeouts.
 ///

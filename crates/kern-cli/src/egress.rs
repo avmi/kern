@@ -472,7 +472,7 @@ pub fn spawn(allow: &[String], box_port: u16) -> Result<EgressPending, String> {
 
     // THE READINESS PIPE, and it exists because the pump's failure used to be invisible.
     //
-    // The pump joins the box netns and listens on `127.0.0.1:<port>` INSIDE it. That bind can fail: an
+    // The pump joins the box netns and listens on `127.0.0.1:<port>` INSIDE it. That bind can fail: a
     // later pass hit `os error 99` (EADDRNOTAVAIL) on a host where the box's loopback was not
     // usable, and the pump then printed one line and `_exit(1)`. Nobody read that exit. The box started
     // anyway with `http_proxy` pointing at a port nothing listens on, so every request the caller made,

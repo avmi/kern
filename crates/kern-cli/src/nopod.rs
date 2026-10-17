@@ -890,7 +890,7 @@ mod tests {
     /// cannot resolve the caller.
     /// A PEER THAT DECLARES A PORT THIS SERVICE ALSO DECLARES MUST NOT RESOLVE.
     ///
-    /// FOUND ON THE RELEASED BINARY BY AN A LATER PASS, and reproduced here before anything was
+    /// FOUND ON THE RELEASED BINARY BY A LATER PASS, and reproduced here before anything was
     /// changed. Two services both binding 8080: kern deliberately does not bind the peer's alias
     /// (the workload's own bind would fail), the alias is in `127.0.0.0/8` and therefore local
     /// anyway, and the caller's `0.0.0.0` listener owns every local address on that port. So a

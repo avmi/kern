@@ -4540,7 +4540,7 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     // A box ALWAYS carries a memory cap, the default 512 MiB when none is typed, so "the cap cannot
     // be enforced" is true of every box on such a host and not only of the ones that asked. Gating
     // this on the REQUEST left the common case silent: a default box on a host that does not
-    // delegate the controller ran with unbounded RAM and said nothing, and an later pass
+    // delegate the controller ran with unbounded RAM and said nothing, and a later pass
     // reported the limits as "soft" with no way to tell a degraded host from a degraded runtime.
     //
     // What kept it that way is a real objection: a line on every 2 ms box start is noise that trains

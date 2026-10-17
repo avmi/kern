@@ -1012,7 +1012,7 @@ fn the_started_signal_carries_the_oom_verdict_and_the_workload_signal() {
         sig[2], 0,
         "an exit 137 with no OOM behind it was reported as an OOM: {sig:?}"
     );
-    // THE ONE THE A LATER PASSS FOUND: the same exit code as the OOM below, and nothing signalled this
+    // THE ONE A LATER PASS FOUND: the same exit code as the OOM below, and nothing signalled this
     // workload. Without this byte a cell could fabricate `fault = killed` with one `exit 137`.
     assert_eq!(
         sig[3], 0,

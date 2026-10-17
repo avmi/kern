@@ -1084,7 +1084,7 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
 /// A free function rather than a `match` inside `inspect` because its most important branch is the
 /// one this developer's host cannot produce. `enforced == None` needs a box whose PID 1 is outside
 /// every kern leaf, which happens on a host with no usable cgroup delegation and not here; buried in
-/// a 245-line I/O function that branch was unreachable by any test, and it is precisely the branch an
+/// a 245-line I/O function that branch was unreachable by any test, and it is precisely the branch a
 /// later pass had to discover by hand. Pure, total over the four `(asked, enforced)` shapes,
 /// and pinned by `mem_cap_row_*` below.
 ///
@@ -2593,7 +2593,7 @@ mod tests {
     /// THE BRANCH THIS HOST CANNOT PRODUCE, which is the only reason the row exists.
     ///
     /// `enforced == None` means `box_cgroup_dir` found no kern leaf for the box's PID 1 - a host with
-    /// no usable cgroup delegation, where the box sits in the cgroup-v2 ROOT and nothing caps it. An
+    /// no usable cgroup delegation, where the box sits in the cgroup-v2 ROOT and nothing caps it. A
     /// later pass measured exactly that and read the requested value as a cap in force, because
     /// the row said `64M` and stopped. On a delegated developer machine this state cannot be created,
     /// so a runtime test would silently skip; the logic is pure, so it is pinned directly.

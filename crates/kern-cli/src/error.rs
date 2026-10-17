@@ -96,7 +96,7 @@ impl Error {
             // wrongly show the userns/rootfs hint on `-v`/secret/port errors).
             Error::Sandbox(_) => None,
             // Branch on the message, for the same reason `oci_hint` does: the setup step that failed
-            // decides what the reader should do next, and the variant alone does not know it. An
+            // decides what the reader should do next, and the variant alone does not know it. A
             // later pass measured a box refused by `RLIMIT_NPROC` and got
             //
             //   error: sandbox: fork(idmap helper) failed: Resource temporarily unavailable (os error 11)
@@ -726,7 +726,7 @@ mod hint_tests {
     /// A DOCKER VERB THAT KERN DOES NOT HAVE NAMES THE PAIR THAT DOES THE JOB.
     ///
     /// `kern rm` does not exist and never will: stopping a box and collecting what it left behind
-    /// are two decisions, so they are two verbs. Everyone arriving from Docker types it anyway, an
+    /// are two decisions, so they are two verbs. Everyone arriving from Docker types it anyway, a
     /// later pass did, and kern's own README shipped it once. A hint that only says "run
     /// --help" sends them to a list of fifty verbs to find the two.
     #[test]
