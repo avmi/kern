@@ -21,6 +21,25 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**`kern image inspect` emits the labels and the healthcheck it had already read.** Both are parsed
+out of the image's own record and both were dropped before anything was printed: `Config.Labels`
+appeared in neither rendering, and `Config.Healthcheck` appeared in the human one and not in the
+JSON, so the two renderings of one image disagreed about what kern knows. An image's labels are where
+`org.opencontainers.image.*` lives, so a consumer asking kern for an image's source, version or
+licence was told it carries none. Both now use Docker's shapes: `Labels` as an object, `Healthcheck`
+with `Test`, `Interval`, `Timeout`, `StartPeriod`, `StartInterval` and `Retries`, in the nanoseconds
+Docker's document uses, with each optional field omitted when the image did not set it.
+
+**`kern compose exec` no longer builds.** It entered a box that is already running - it refuses with
+"is not running" otherwise - and ran the file's whole `build:` section first, printing all of it, so
+entering a running container cost a rebuild and buried the command's own output. It builds nothing
+now, as `docker compose exec` does.
+
+**`kern compose start` and `restart` stop printing `up`'s note.** Three verbs reach the line that
+announces a stack returned instead of streaming, and all three were handed a sentence naming `up`,
+pointing at a `-d` flag they cannot pass and claiming parity with `docker compose up`. The note names
+the verb that ran, taken from the one table that defines them rather than a second list.
+
 **`kern exec` works on hosts where it used to refuse outright.** With an allowlist of host shapes
 that is not exotic at all - a shell in `/init.scope`, which is how WSL starts every terminal, and an
 ordinary `ssh` session on Ubuntu 24.04, Fedora 44, Debian 13 and Rocky 10.2 - kern runs outside the
@@ -61,6 +80,31 @@ reclaimed is no longer left behind here. Measured end to end on a cache of 20 su
 **`gc` and the `kern top` Images tab say what they could not reclaim**, with the bytes still on disk
 and the layer key, where a failed removal used to be dropped in silence. It is a note and not an
 error: the sweep removed everything it could, and the exit code still reports that.
+
+**`workspace_max_bytes` bounds the overshoot by the CAP now, not by the disk.** The in-call poller
+looked once a second whatever the limit was, so what got past it was whatever the disk could write in
+that second: a 50 MiB cap stopped a box at 5,964,300,288 bytes, 113.8x the cap, and a report from a
+slower disk measured ~933 MB of the same thing. A faster disk overshot further, which makes the number
+a lagging indicator rather than a limit. The interval is now the time the box would need to spend half
+the remaining headroom at a rate above any disk measured here, floored at 2 ms and still backed off to
+ten times what a measurement costs, so a workspace with many files cannot be walked into the ground.
+The same test now stops at 1.2x the cap in Python and 1.5x in Node. The cap remains a measurement and a
+kill on a host directory, not a refusal from the filesystem.
+
+In Node the backoff that bounds the poller's own cost had never run: its timer was started after the
+walk returned instead of before it, so it measured the comparison that follows and always came out at
+zero. The sentence promising it was true in Python and false there.
+
+**A file the box left at mode 0 is refused as a FILE, and as yours.** `read_file` answered "a directory
+on that path is closed to this process and its owner bits could not be restored - it is not ours (a
+`user=` session's box account owns it)" for a file owned by the caller's own uid: the subject, the
+ownership and the `/proc` hint it ended with were all wrong, and the reader was sent to three dead ends.
+`write_file` had the same defect and had not been reported. Both now name what they looked at - that it
+is a file, its mode, its owner, and whether that owner is this process - and say that kern leaves a
+mode-0 file exactly as the box wrote it because for a file the mode can be the data. A refusal that
+really is a closed DIRECTORY is unchanged, and keeps `snapshot`'s wording, which was already right
+because it enumerates the causes instead of asserting one; that sentence is now one spelling shared by
+every surface that has to say it.
 
 ## kern-sandbox 0.2.48 - 2026-10-13
 

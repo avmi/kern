@@ -272,8 +272,9 @@ your own.)</sub>
   `require_limits=True` refuses to start rather than run uncapped.
 - **The workspace is bounded only if you ask.** It is a host directory, so by default a job can
   fill your disk; `workspace_max_bytes` is measured WHILE a call runs and stops the box with a
-  `workspace_full` fault. The overshoot is whatever was written between two measurements, and it is
-  still a measurement and a kill rather than a refusal from the filesystem.
+  `workspace_full` fault. The interval scales to the headroom, so the overshoot is bounded by the cap
+  and not by the disk's speed (measured: 1.2x a 50 MiB cap), and it is still a measurement and a kill
+  rather than a refusal from the filesystem.
 - **A directory the box closes to the host comes back at `0o500`.** The host has to walk the
   workspace to report what changed, so read and search are restored on a directory it owns, never
   write, and a warning says how many were touched. A file at mode 0 is left alone.
