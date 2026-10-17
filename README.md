@@ -38,8 +38,8 @@ agent's code runs in, called from Python, Node or any MCP client. kern calls a c
   milliseconds.
 - **A sandbox for code your model wrote.** It runs where it can't reach your files unless you hand
   them over, with no network unless you ask.
-- **Rootless, always.** Six namespaces, a read-only or overlay root, a seccomp allowlist, cgroup v2
-  limits.
+- **No daemon, and root is never required.** Six namespaces, a read-only or overlay root, a seccomp
+  allowlist by default, cgroup v2 limits.
 - **Your `docker-compose.yml`, unchanged**, or kern's own `stack.toml`.
 - **Limits without a sandbox.** `kern run` puts the same caps on a plain process on the host.
   [docs/RESOURCES.md](docs/RESOURCES.md)
@@ -172,7 +172,7 @@ Each service gets its own network namespace and they reach each other by name.
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
-| Rootless | **yes**, always | opt-in | yes |
+| Root required | **never** | opt-in to avoid it | never |
 
 <sub>Same machine, same workload, same day, rounded down. The method and every runtime:
 [BENCHMARKS.md](BENCHMARKS.md).</sub>
