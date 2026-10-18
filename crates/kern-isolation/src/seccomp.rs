@@ -126,11 +126,18 @@ const AF_VSOCK: u32 = 40;
 /// `csum_start`/`csum_offset` that [`SOL_PACKET`] exists to withhold. Refusing one family while
 /// leaving the other open would have been a rule that reads well and closes nothing.
 ///
-/// A BOX CANNOT USE IT ANYWAY, which is why this costs nothing. Native-mode XDP needs `bpf(2)`, which
-/// is in the hard-kill set. Copy/SKB mode needs a device queue to bind to, and a box's netns holds
-/// `lo` and at most one `veth`. Measured before this rule: `socket(AF_XDP, SOCK_RAW)` OPENED in a
-/// default box in both seccomp postures, so the family was reachable even though nothing in a box can
-/// do anything with it - the worst combination, since it is surface without a use.
+/// WHAT IS MEASURED, AND ONLY THAT. Before this rule, `socket(AF_XDP, SOCK_RAW)` OPENED in a default
+/// box in both seccomp postures. After it, both postures answer `EAFNOSUPPORT`, and `AF_INET`,
+/// `AF_UNIX` and `AF_PACKET` still open. That is the whole of the measurement.
+///
+/// The first version of this comment went further and said a box "cannot use it anyway" because
+/// copy/SKB mode "needs a device queue to bind to". That is not the binding constraint and the
+/// sentence is gone: the constraint people cite is an XDP program on the netdev, which is `bpf(2)`
+/// and hard-killed, and the TX direction does not obviously need one. Whether a bind would have
+/// succeeded on a box's `lo` or `veth` was NOT measured, and establishing it means building a
+/// transmit harness against an unpatched parser, which is not a thing to build to justify a refusal.
+/// The refusal stands on the part that was measured: the family opened, and no container workload
+/// under a rootless runtime with `bpf` killed has been shown to need it.
 const AF_XDP: u32 = 44;
 
 /// `SOL_PACKET` and the two `setsockopt` options that turn a packet socket into a carrier for a
