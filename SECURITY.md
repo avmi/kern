@@ -128,10 +128,14 @@ families (io_uring's three, `userfaultfd`, `perf_event_open`, the keyring's thre
 `clone3` and `open_by_handle_at`), return **`ENOSYS`** instead: equally denied, and the difference
 is Redis falling back to its epoll path rather than Redis dying.
 
-Two rules refuse an **argument** rather than a syscall, and each returns what a kernel without that
-feature returns, for the same reason: `socket(AF_VSOCK, …)` gets `EAFNOSUPPORT`, and the two
-`SOL_PACKET` options that enable a caller-chosen `virtio_net_hdr` get `ENOPROTOOPT`. The syscall
-itself keeps working: ordinary sockets open, and a packet socket still captures.
+Two rules refuse an **argument** rather than a syscall, and each returns what a kernel that lacks
+that feature returns: `socket(AF_VSOCK, …)` gets `EAFNOSUPPORT`, and the two `SOL_PACKET` options
+that enable a caller-chosen `virtio_net_hdr` get `ENOPROTOOPT`. The syscall itself keeps working:
+ordinary sockets open, and a packet socket still captures. The errno is chosen so a caller that
+PROBES the feature takes its fallback, and that is the whole of what it buys. It is **not** the
+property the table below describes: a kernel that implements the option returns success, so a refusal
+here is evidence of a filter to anyone who knows the host kernel has the feature. The two rules are
+compatibility-shaped, not concealment.
 
 The obvious objection is that a survivable denial is easier to enumerate than a fatal one. Measured
 inside a box on x86_64, kernel 7.0:

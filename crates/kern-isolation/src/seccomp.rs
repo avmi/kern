@@ -123,19 +123,23 @@ const AF_VSOCK: u32 = 40;
 ///
 /// WHAT THEY REACH. That header is how a sender hands the kernel `csum_start`/`csum_offset` metadata
 /// rather than a finished checksum, and the parser behind it (`virtio_net_hdr_to_skb` and the checksum
-/// completion downstream of it) is the code a VM guest reaches through virtio-net. There are three
-/// doors to it and a box already has two of them shut by default: `/dev/net/tun` with `IFF_VNET_HDR`
-/// needs a node that is absent (only `--tun` delivers it) plus `CAP_NET_ADMIN`, which is in
-/// `DEFAULT_DROP`; `/dev/vhost-net` is absent and refused by name. The third was open. Measured in a
-/// default box before this rule: `CAP_NET_RAW` is effective in the box's own user namespace, a
-/// `socket(AF_PACKET, SOCK_RAW)` opens, and BOTH options below are ACCEPTED - while the invoking user
-/// cannot open an `AF_PACKET` socket on the host at all (EPERM). So the box was granting a reach its
-/// owner has not got, and this closes it, making the set of three complete.
+/// completion downstream of it) is the code a VM guest reaches through virtio-net. This rule closes
+/// ONE interface to it and the comment deliberately claims no more, because the first version of it
+/// said "there are three doors and this shuts the third" and that was wrong twice over: a fourth
+/// socket family (`AF_XDP`, which carries its own transmit checksum metadata) OPENS in a default box,
+/// and the `vhost*` name refusal it cited lives on the `vgpio` configuration path, not on the `-v`
+/// path a reader would use. An enumeration of doors is the weakest claim available here; what is
+/// measured is the posture, and `docs/CVE-POSTURE.md` states it with its limits.
+///
+/// Measured in a default box before this rule: `CAP_NET_RAW` is effective in the box's own user
+/// namespace, a `socket(AF_PACKET, SOCK_RAW)` opens, and BOTH options below are ACCEPTED - while the
+/// invoking user cannot open an `AF_PACKET` socket on the host at all (EPERM). So the box was granting
+/// a reach its owner has not got, through this family, and that is what this closes.
 ///
 /// BOTH NUMBERS, NOT ONE. `PACKET_VNET_HDR` (15) is the original switch; `PACKET_VNET_HDR_SZ` (24) is
 /// the later one that sets the header's size and enables it as a side effect. Blocking only 15 would
 /// leave the same metadata path reachable through 24, which is present on this kernel and was measured
-/// accepted. A rule that covers one of two doors is theatre.
+/// accepted. A rule that covers one of two options is theatre.
 ///
 /// NOT A FIX FOR ANYTHING IN THE KERNEL. A bug in that parser is fixed by the kernel patch and by
 /// nothing kern does. This removes a path from inside a box to it, which is defence in depth for the
