@@ -114,8 +114,24 @@ const CLONE_NEW_MASK: u32 = 0x0002_0000  // CLONE_NEWNS
 /// `vsock` transport loaded - WSL2, where `VMADDR_CID_HOST` reaches the Windows side - a box could reach
 /// the host past its loopback-only netns. It is a REACHABILITY gap, not a privilege escalation, and it
 /// is exactly the domain moby's default profile refuses; kern refuses it too (see
-/// [`emit_socket_vsock_rule`]), closing the one place its default was wider than moby's on `socket`.
+/// [`emit_socket_family_rule`]). It WAS the only family kern's `socket` default refused; [`AF_XDP`]
+/// joined it, and that one moby allows, so `socket` is now a place kern is NARROWER than moby rather
+/// than merely level with it. The reason is in `AF_XDP`'s own comment: a box cannot use it at all.
 const AF_VSOCK: u32 = 40;
+
+/// `AF_XDP` address family, refused by the same rule and with the same errno as [`AF_VSOCK`].
+///
+/// An XDP socket is a transmit and receive path straight onto a device queue, and it carries its own
+/// checksum metadata (`XDP_TXMD_FLAGS_CHECKSUM`), which is the same shape of caller-supplied
+/// `csum_start`/`csum_offset` that [`SOL_PACKET`] exists to withhold. Refusing one family while
+/// leaving the other open would have been a rule that reads well and closes nothing.
+///
+/// A BOX CANNOT USE IT ANYWAY, which is why this costs nothing. Native-mode XDP needs `bpf(2)`, which
+/// is in the hard-kill set. Copy/SKB mode needs a device queue to bind to, and a box's netns holds
+/// `lo` and at most one `veth`. Measured before this rule: `socket(AF_XDP, SOCK_RAW)` OPENED in a
+/// default box in both seccomp postures, so the family was reachable even though nothing in a box can
+/// do anything with it - the worst combination, since it is surface without a use.
+const AF_XDP: u32 = 44;
 
 /// `SOL_PACKET` and the two `setsockopt` options that turn a packet socket into a carrier for a
 /// **caller-chosen `virtio_net_hdr`**. Like an `AF_*` constant these are the same on every Linux arch
@@ -350,36 +366,40 @@ fn emit_kill_prologue(allow_nesting: bool) -> Vec<libc::sock_filter> {
     prog
 }
 
-/// Emit the `socket(2)` argument rule: `socket(AF_VSOCK, …)` returns `EAFNOSUPPORT` - the exact errno a
-/// host with no vsock transport already gives, so a workload that PROBES vsock falls back cleanly rather
-/// than dying - while every other address family is allowed. Shared by both the denylist and the
-/// allowlist so the two agree by construction.
+/// Emit the `socket(2)` argument rule: the address families a box cannot use return `EAFNOSUPPORT` -
+/// the exact errno a host without that transport already gives, so a workload that PROBES one falls
+/// back cleanly rather than dying - while every other family is allowed. Shared by both the denylist
+/// and the allowlist so the two agree by construction.
+///
+/// ONE LIST, NOT ONE RULE PER FAMILY, because the second family arrived after the first and the cost
+/// of a second spelling is that the two drift. See [`AF_VSOCK`] and [`AF_XDP`] for what each reaches.
 ///
 /// Self-contained by design: BOTH exits are an explicit `BPF_RET`, so loading `args[0]` (which clobbers
 /// the accumulator that until now held `nr`) is safe - nothing downstream re-reads `nr` for a matched
-/// `socket`. A NON-`socket` call takes the `jf = 4` branch and skips the whole block with `nr` intact
+/// `socket`. A NON-`socket` call takes the `jf = 5` branch and skips the whole block with `nr` intact
 /// for the rules that follow, so this may sit before the `clone` flag check or the allow search without
-/// disturbing either. NOT gated on `allow_nesting`: a nested runtime never needs `AF_VSOCK`, so a
-/// `--privileged` box is refused it too.
-fn emit_socket_vsock_rule(prog: &mut Vec<libc::sock_filter>) {
+/// disturbing either. NOT gated on `allow_nesting`: a nested rootless runtime needs neither family, so
+/// a `--privileged` box is refused them too.
+fn emit_socket_family_rule(prog: &mut Vec<libc::sock_filter>) {
     let eafnosupport = SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32 & SECCOMP_RET_DATA);
-    // nr == socket ? fall through to the 4-instruction body : skip it (jf = 4), nr preserved.
+    // nr == socket ? fall through to the 5-instruction body : skip it (jf = 5), nr preserved.
     prog.push(jump(
         BPF_JMP | BPF_JEQ | BPF_K,
         libc::SYS_socket as u32,
         0,
-        4,
+        5,
     ));
     prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0)); // A = domain (low 32 bits of args[0])
-    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_VSOCK, 0, 1)); // ==AF_VSOCK → next (errno); else skip 1
-    prog.push(stmt(BPF_RET | BPF_K, eafnosupport)); // vsock → EAFNOSUPPORT
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_VSOCK, 1, 0)); // ==AF_VSOCK → skip 1 → errno
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_XDP, 0, 1)); // ==AF_XDP → next (errno); else allow
+    prog.push(stmt(BPF_RET | BPF_K, eafnosupport)); // either family → EAFNOSUPPORT
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)); // any other domain → allow
 }
 
 /// Emit the `setsockopt(2)` argument rule: the two `SOL_PACKET` options that enable a caller-chosen
 /// `virtio_net_hdr` return `ENOPROTOOPT`, every other option is allowed. See [`SOL_PACKET`] for what
 /// that header reaches and why both numbers are named. Shared by both the denylist and the allowlist
-/// so the two postures agree by construction, like [`emit_socket_vsock_rule`].
+/// so the two postures agree by construction, like [`emit_socket_family_rule`].
 ///
 /// `ENOPROTOOPT` IS THE HONEST ERRNO: it is byte-for-byte what `packet_setsockopt` returns for an
 /// option it does not implement, so a caller that probes the option sees a kernel without it and takes
@@ -426,13 +446,13 @@ fn build_filter(allow_nesting: bool) -> Vec<libc::sock_filter> {
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1)); // ==nr → next (errno); else skip
         prog.push(stmt(BPF_RET | BPF_K, errno_ret));
     }
-    // 3b-vsock. `socket(AF_VSOCK, …)` → EAFNOSUPPORT (the netns does not contain vsock; see
-    // `emit_socket_vsock_rule`). Placed while the accumulator still holds `nr`; a non-`socket` call
-    // skips it with `nr` intact for the `clone` block below.
-    emit_socket_vsock_rule(&mut prog);
+    // 3b-family. `socket(AF_VSOCK | AF_XDP, …)` → EAFNOSUPPORT (the netns contains no vsock transport
+    // and no device queue to bind an XDP socket to; see `emit_socket_family_rule`). Placed while the
+    // accumulator still holds `nr`; a non-`socket` call skips it with `nr` intact for `clone` below.
+    emit_socket_family_rule(&mut prog);
     // 3b-vnethdr. `setsockopt(SOL_PACKET, PACKET_VNET_HDR[_SZ])` → ENOPROTOOPT (the box keeps packet
     // sockets and loses only the caller-chosen `virtio_net_hdr`; see `emit_setsockopt_vnet_hdr_rule`).
-    // Same placement rule as the vsock block above, and for the same reason.
+    // Same placement rule as the family block above, and for the same reason.
     emit_setsockopt_vnet_hdr_rule(&mut prog);
     // 3c. `clone(2)` carrying ANY namespace bit → kill; every other `clone` passes untouched.
     //
@@ -565,10 +585,10 @@ fn build_allowlist_filter(allow_nesting: bool, audit: bool) -> Vec<libc::sock_fi
             prog.push(jump(BPF_JMP | BPF_JA, JA_ALLOW, 0, 0));
         }
     }
-    // `socket(AF_VSOCK, …)` → EAFNOSUPPORT, every other domain allowed. Same rule and same reasoning as
+    // `socket(AF_VSOCK | AF_XDP, …)` → EAFNOSUPPORT, every other domain allowed. Same rule as
     // the denylist, so the two postures agree; self-contained (explicit `RET` exits), so it sits ahead of
     // the clone check and the allow search without disturbing `nr` for a non-`socket` call.
-    emit_socket_vsock_rule(&mut prog);
+    emit_socket_family_rule(&mut prog);
     // `setsockopt(SOL_PACKET, PACKET_VNET_HDR[_SZ])` → ENOPROTOOPT, every other option allowed. Same
     // rule as the denylist, so the two postures agree. Its explicit `ALLOW` short-circuits the search
     // below for a non-packet `setsockopt`, which widens nothing: the kill prologue has already run and
@@ -899,7 +919,7 @@ fn cached_program(mode: SeccompFilter, allow_nesting: bool) -> &'static [libc::s
 mod tests {
     use super::{
         build_allowlist_filter, build_filter, denylist, errno_syscalls, install_relay_filter,
-        nesting_syscalls, AF_VSOCK, AUDIT_ARCH, BPF_ABS, BPF_JA, BPF_JEQ, BPF_JGE, BPF_JGT,
+        nesting_syscalls, AF_VSOCK, AF_XDP, AUDIT_ARCH, BPF_ABS, BPF_JA, BPF_JEQ, BPF_JGE, BPF_JGT,
         BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_RET, BPF_W, CLONE_NEW_MASK, OFF_ARCH, OFF_ARG0,
         OFF_ARG1, OFF_ARG2, OFF_NR, PACKET_VNET_HDR, PACKET_VNET_HDR_SZ, SECCOMP_RET_ALLOW,
         SECCOMP_RET_DATA, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_LOG, SOL_PACKET,
@@ -981,13 +1001,14 @@ mod tests {
     /// Every generated filter must fit the kernel's `BPF_MAXINSNS` (4096) with headroom, or a future
     /// profile bump would fail to load at box start. Their EXACT sizes are also PINNED so no instruction
     /// count can drift silently (the class that has already produced ~1273, ~1174 and a stale denylist
-    /// figure): the allowlist is 186 on x86_64 after the range-merge (181 for a nesting box), the
-    /// denylist 94 (80 nesting). A change to an emitter or the ALLOW set fails this test, and this
+    /// figure): the allowlist is 187 on x86_64 after the range-merge (182 for a nesting box), the
+    /// denylist 95 (81 nesting). A change to an emitter or the ALLOW set fails this test, and this
     /// comment is where the four numbers live: the ROADMAP note the failure message used to send a
     /// reader to was cut when that page was reduced to the decisions, and it cites no count today.
     ///
-    /// All four grew by 8 when the `virtio_net_hdr` rule landed, which is that block's exact size in
-    /// both postures and both nesting modes - it is not gated on either, so the delta is uniform.
+    /// All four grew by 8 when the `virtio_net_hdr` rule landed and by 1 more when `AF_XDP` joined the
+    /// socket-family list, each delta being that block's exact growth; neither is gated on posture or
+    /// nesting, so both apply uniformly to all four numbers.
     #[test]
     fn the_seccomp_filter_instruction_counts_are_pinned() {
         for &nesting in &[false, true] {
@@ -1003,7 +1024,7 @@ mod tests {
                 // to x86_64. aarch64 still gets the fit check above.
                 #[cfg(target_arch = "x86_64")]
                 {
-                    let allow_expected = if nesting { 181 } else { 186 };
+                    let allow_expected = if nesting { 182 } else { 187 };
                     assert_eq!(
                         len, allow_expected,
                         "x86_64 allowlist instruction count changed (nesting={nesting}): {len} vs \
@@ -1021,7 +1042,7 @@ mod tests {
             );
             #[cfg(target_arch = "x86_64")]
             {
-                let deny_expected = if nesting { 80 } else { 94 };
+                let deny_expected = if nesting { 81 } else { 95 };
                 assert_eq!(
                     deny, deny_expected,
                     "x86_64 denylist instruction count changed (nesting={nesting}): {deny} vs \
@@ -1175,6 +1196,8 @@ mod tests {
             AF_VSOCK, 40,
             "AF_VSOCK is 40 in the Linux UAPI on every arch"
         );
+        assert_eq!(AF_XDP, 44, "AF_XDP is 44 in the Linux UAPI on every arch");
+        let refused_families = [AF_VSOCK, AF_XDP];
         let socket_nr = libc::SYS_socket as u32;
         let eafnosupport = SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32 & SECCOMP_RET_DATA);
         let other_families = [
@@ -1196,25 +1219,29 @@ mod tests {
             build_allowlist_filter(true, true),
         ];
         for prog in &progs {
-            assert_eq!(
-                run_filter(prog, socket_nr, AUDIT_ARCH, AF_VSOCK as u64),
-                eafnosupport,
-                "socket(AF_VSOCK) must return EAFNOSUPPORT in every posture"
-            );
+            for fam in refused_families {
+                assert_eq!(
+                    run_filter(prog, socket_nr, AUDIT_ARCH, fam as u64),
+                    eafnosupport,
+                    "socket(domain={fam}) must return EAFNOSUPPORT in every posture"
+                );
+            }
             for &fam in &other_families {
                 assert_eq!(
                     run_filter(prog, socket_nr, AUDIT_ARCH, fam),
                     SECCOMP_RET_ALLOW,
-                    "socket(domain={fam}) (not vsock) must stay allowed"
+                    "socket(domain={fam}) (not a refused family) must stay allowed"
                 );
             }
-            // Offset control: AF_VSOCK sitting ONLY in the high 32 bits of args[0] must be read as
-            // domain 0, not as vsock - proof the rule keys on the low word `OFF_ARG0` loads.
-            assert_eq!(
-                run_filter(prog, socket_nr, AUDIT_ARCH, (AF_VSOCK as u64) << 32),
-                SECCOMP_RET_ALLOW,
-                "AF_VSOCK only in the high word must not be treated as the domain"
-            );
+            // Offset control, one per refused family: the value sitting ONLY in the high 32 bits of
+            // args[0] must be read as domain 0 - proof the rule keys on the low word `OFF_ARG0` loads.
+            for fam in refused_families {
+                assert_eq!(
+                    run_filter(prog, socket_nr, AUDIT_ARCH, (fam as u64) << 32),
+                    SECCOMP_RET_ALLOW,
+                    "domain {fam} only in the high word must not be treated as the domain"
+                );
+            }
         }
     }
 
