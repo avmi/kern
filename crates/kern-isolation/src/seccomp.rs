@@ -78,6 +78,12 @@ const OFF_ARCH: u32 = 4;
 /// x86_64 and aarch64 (both little-endian, enforced by [`AUDIT_ARCH`] having no other arm), and on a
 /// big-endian port this would have to become 20.
 const OFF_ARG0: u32 = 16;
+/// Low 32 bits of `args[1]` and `args[2]`, read by the `setsockopt` rule (level, then optname). Same
+/// little-endian reasoning as [`OFF_ARG0`], and the same high-word blindness: both are `int` in the
+/// kernel's prototype, so the value a 64-bit register carries is sign-extended and the low word IS the
+/// argument. On a big-endian port these would have to become 28 and 36.
+const OFF_ARG1: u32 = 24;
+const OFF_ARG2: u32 = 32;
 
 /// The namespace-creating bits of `clone(2)`'s flags. `unshare` and `setns` are in [`denylist`] and
 /// hard-kill, but `clone`/`clone3` take the SAME `CLONE_NEW*` flags and reach the same capability, so
@@ -110,6 +116,34 @@ const CLONE_NEW_MASK: u32 = 0x0002_0000  // CLONE_NEWNS
 /// is exactly the domain moby's default profile refuses; kern refuses it too (see
 /// [`emit_socket_vsock_rule`]), closing the one place its default was wider than moby's on `socket`.
 const AF_VSOCK: u32 = 40;
+
+/// `SOL_PACKET` and the two `setsockopt` options that turn a packet socket into a carrier for a
+/// **caller-chosen `virtio_net_hdr`**. Like an `AF_*` constant these are the same on every Linux arch
+/// (kernel UAPI `if_packet.h`, `bits/socket.h`), so literals are correct on x86_64 and aarch64 alike.
+///
+/// WHAT THEY REACH. That header is how a sender hands the kernel `csum_start`/`csum_offset` metadata
+/// rather than a finished checksum, and the parser behind it (`virtio_net_hdr_to_skb` and the checksum
+/// completion downstream of it) is the code a VM guest reaches through virtio-net. There are three
+/// doors to it and a box already has two of them shut by default: `/dev/net/tun` with `IFF_VNET_HDR`
+/// needs a node that is absent (only `--tun` delivers it) plus `CAP_NET_ADMIN`, which is in
+/// `DEFAULT_DROP`; `/dev/vhost-net` is absent and refused by name. The third was open. Measured in a
+/// default box before this rule: `CAP_NET_RAW` is effective in the box's own user namespace, a
+/// `socket(AF_PACKET, SOCK_RAW)` opens, and BOTH options below are ACCEPTED - while the invoking user
+/// cannot open an `AF_PACKET` socket on the host at all (EPERM). So the box was granting a reach its
+/// owner has not got, and this closes it, making the set of three complete.
+///
+/// BOTH NUMBERS, NOT ONE. `PACKET_VNET_HDR` (15) is the original switch; `PACKET_VNET_HDR_SZ` (24) is
+/// the later one that sets the header's size and enables it as a side effect. Blocking only 15 would
+/// leave the same metadata path reachable through 24, which is present on this kernel and was measured
+/// accepted. A rule that covers one of two doors is theatre.
+///
+/// NOT A FIX FOR ANYTHING IN THE KERNEL. A bug in that parser is fixed by the kernel patch and by
+/// nothing kern does. This removes a path from inside a box to it, which is defence in depth for the
+/// whole class rather than for one number, and it costs a box nothing it uses: `tcpdump` captures
+/// through `PACKET_RX_RING`, `ping` and `arping` through raw sockets, and all of those keep working.
+const SOL_PACKET: u32 = 263;
+const PACKET_VNET_HDR: u32 = 15;
+const PACKET_VNET_HDR_SZ: u32 = 24;
 
 // The audit-arch token for the build target. A syscall number is only meaningful for one ABI,
 // so we kill anything arriving under a different arch.
@@ -338,6 +372,45 @@ fn emit_socket_vsock_rule(prog: &mut Vec<libc::sock_filter>) {
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)); // any other domain → allow
 }
 
+/// Emit the `setsockopt(2)` argument rule: the two `SOL_PACKET` options that enable a caller-chosen
+/// `virtio_net_hdr` return `ENOPROTOOPT`, every other option is allowed. See [`SOL_PACKET`] for what
+/// that header reaches and why both numbers are named. Shared by both the denylist and the allowlist
+/// so the two postures agree by construction, like [`emit_socket_vsock_rule`].
+///
+/// `ENOPROTOOPT` IS THE HONEST ERRNO: it is byte-for-byte what `packet_setsockopt` returns for an
+/// option it does not implement, so a caller that probes the option sees a kernel without it and takes
+/// its fallback, rather than dying on a SIGSYS it cannot interpret.
+///
+/// TWO ARGUMENTS, SO TWO LOADS, in the order that costs the least: `level` first, because every
+/// `setsockopt` in a box that is NOT `SOL_PACKET` (every `SO_*`, `IP_*`, `TCP_*`) leaves after one
+/// comparison and never reads `optname`.
+///
+/// AN EXPLICIT `ALLOW` HERE CANNOT WIDEN ANYTHING, which is the one property worth stating because
+/// this rule sits in the allowlist builder too and short-circuits its search. [`emit_kill_prologue`]
+/// has already run, so a syscall in the hard-kill set has died before reaching this block; and
+/// `setsockopt` is in the allow set in every posture, so the search it skips would have allowed it.
+/// Self-contained by the same construction as the vsock rule: both exits are an explicit `BPF_RET`, so
+/// clobbering the accumulator that held `nr` is safe, and a NON-`setsockopt` call takes the `jf = 7`
+/// branch with `nr` intact for the rules that follow. NOT gated on `allow_nesting`: a nested rootless
+/// runtime brings no virtio device of its own, so a `--privileged` box is refused it too.
+fn emit_setsockopt_vnet_hdr_rule(prog: &mut Vec<libc::sock_filter>) {
+    let enoprotoopt = SECCOMP_RET_ERRNO | (libc::ENOPROTOOPT as u32 & SECCOMP_RET_DATA);
+    // nr == setsockopt ? fall through to the 7-instruction body : skip it (jf = 7), nr preserved.
+    prog.push(jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        libc::SYS_setsockopt as u32,
+        0,
+        7,
+    ));
+    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG1)); // A = level (low 32 bits of args[1])
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, SOL_PACKET, 0, 4)); // !=SOL_PACKET → skip 4 → allow
+    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG2)); // A = optname (low 32 bits of args[2])
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, PACKET_VNET_HDR, 1, 0)); // ==15 → skip 1 → errno
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, PACKET_VNET_HDR_SZ, 0, 1)); // ==24 → next (errno); else allow
+    prog.push(stmt(BPF_RET | BPF_K, enoprotoopt)); // either vnet-header option → ENOPROTOOPT
+    prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)); // any other level/option → allow
+}
+
 fn build_filter(allow_nesting: bool) -> Vec<libc::sock_filter> {
     // Arch guard, load nr, x32 kill, and the hard-kill set - shared with the allowlist builder.
     let mut prog = emit_kill_prologue(allow_nesting);
@@ -353,6 +426,10 @@ fn build_filter(allow_nesting: bool) -> Vec<libc::sock_filter> {
     // `emit_socket_vsock_rule`). Placed while the accumulator still holds `nr`; a non-`socket` call
     // skips it with `nr` intact for the `clone` block below.
     emit_socket_vsock_rule(&mut prog);
+    // 3b-vnethdr. `setsockopt(SOL_PACKET, PACKET_VNET_HDR[_SZ])` → ENOPROTOOPT (the box keeps packet
+    // sockets and loses only the caller-chosen `virtio_net_hdr`; see `emit_setsockopt_vnet_hdr_rule`).
+    // Same placement rule as the vsock block above, and for the same reason.
+    emit_setsockopt_vnet_hdr_rule(&mut prog);
     // 3c. `clone(2)` carrying ANY namespace bit → kill; every other `clone` passes untouched.
     //
     // This closes the hole that denying `unshare`/`setns` alone left open: they are not the only way
@@ -488,6 +565,11 @@ fn build_allowlist_filter(allow_nesting: bool, audit: bool) -> Vec<libc::sock_fi
     // the denylist, so the two postures agree; self-contained (explicit `RET` exits), so it sits ahead of
     // the clone check and the allow search without disturbing `nr` for a non-`socket` call.
     emit_socket_vsock_rule(&mut prog);
+    // `setsockopt(SOL_PACKET, PACKET_VNET_HDR[_SZ])` → ENOPROTOOPT, every other option allowed. Same
+    // rule as the denylist, so the two postures agree. Its explicit `ALLOW` short-circuits the search
+    // below for a non-packet `setsockopt`, which widens nothing: the kill prologue has already run and
+    // `setsockopt` is in the allow set anyway (see `emit_setsockopt_vnet_hdr_rule`).
+    emit_setsockopt_vnet_hdr_rule(&mut prog);
     // `clone` with any `CLONE_NEW*` bit is a namespace-creation vector and dies; a plain `clone`
     // (fork/pthread) is allowed. Skipped under `allow_nesting`, where `clone` is allowed unconditionally
     // via the search. Placed before the search because it inspects `args[0]`, which clobbers `nr`.
@@ -815,8 +897,8 @@ mod tests {
         build_allowlist_filter, build_filter, denylist, errno_syscalls, install_relay_filter,
         nesting_syscalls, AF_VSOCK, AUDIT_ARCH, BPF_ABS, BPF_JA, BPF_JEQ, BPF_JGE, BPF_JGT,
         BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_RET, BPF_W, CLONE_NEW_MASK, OFF_ARCH, OFF_ARG0,
-        OFF_NR, SECCOMP_RET_ALLOW, SECCOMP_RET_DATA, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS,
-        SECCOMP_RET_LOG,
+        OFF_ARG1, OFF_ARG2, OFF_NR, PACKET_VNET_HDR, PACKET_VNET_HDR_SZ, SECCOMP_RET_ALLOW,
+        SECCOMP_RET_DATA, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_LOG, SOL_PACKET,
     };
 
     /// A minimal classic-BPF interpreter for the seccomp program: enough opcodes to execute what
@@ -825,6 +907,17 @@ mod tests {
     /// search VERIFIABLE: it does not matter how intricate the jump layout is if every syscall number
     /// is proven to classify correctly.
     fn run_filter(prog: &[libc::sock_filter], nr: u32, arch: u32, arg0: u64) -> u32 {
+        run_filter_args(prog, nr, arch, [arg0, 0, 0])
+    }
+
+    /// The same interpreter over the first THREE arguments, for the rules that read more than
+    /// `args[0]` (`setsockopt`'s level and optname). [`run_filter`] is this function with the other two
+    /// zeroed, so there is one interpreter and no second set of opcode semantics to keep in step.
+    ///
+    /// An offset the interpreter does not know PANICS rather than reading as 0: a rule emitted against
+    /// a new `args[n]` would otherwise be tested against a silent zero and pass for the wrong reason,
+    /// which is the exact shape of a harness that cannot see the thing it is asked to prove.
+    fn run_filter_args(prog: &[libc::sock_filter], nr: u32, arch: u32, args: [u64; 3]) -> u32 {
         let mut pc = 0usize;
         let mut acc: u32 = 0;
         // A real filter terminates in a few dozen steps; cap to catch a mis-laid-out jump loop.
@@ -837,8 +930,13 @@ mod tests {
                     acc = match ins.k {
                         x if x == OFF_NR => nr,
                         x if x == OFF_ARCH => arch,
-                        x if x == OFF_ARG0 => (arg0 & 0xFFFF_FFFF) as u32,
-                        _ => 0,
+                        x if x == OFF_ARG0 => (args[0] & 0xFFFF_FFFF) as u32,
+                        x if x == OFF_ARG1 => (args[1] & 0xFFFF_FFFF) as u32,
+                        x if x == OFF_ARG2 => (args[2] & 0xFFFF_FFFF) as u32,
+                        other => panic!(
+                            "run_filter: seccomp_data offset {other} is not modelled - a rule reads \
+                             an argument this harness would have scored as 0"
+                        ),
                     };
                     pc += 1;
                 }
@@ -879,9 +977,13 @@ mod tests {
     /// Every generated filter must fit the kernel's `BPF_MAXINSNS` (4096) with headroom, or a future
     /// profile bump would fail to load at box start. Their EXACT sizes are also PINNED so no instruction
     /// count can drift silently (the class that has already produced ~1273, ~1174 and a stale denylist
-    /// figure): the allowlist is 178 on x86_64 after the range-merge (173 for a nesting box), the
-    /// denylist 86 (72 nesting). A change to an emitter or the ALLOW set fails this test and forces the
-    /// ROADMAP/seccomp docs that cite these four numbers to be updated in the same change.
+    /// figure): the allowlist is 186 on x86_64 after the range-merge (181 for a nesting box), the
+    /// denylist 94 (80 nesting). A change to an emitter or the ALLOW set fails this test, and this
+    /// comment is where the four numbers live: the ROADMAP note the failure message used to send a
+    /// reader to was cut when that page was reduced to the decisions, and it cites no count today.
+    ///
+    /// All four grew by 8 when the `virtio_net_hdr` rule landed, which is that block's exact size in
+    /// both postures and both nesting modes - it is not gated on either, so the delta is uniform.
     #[test]
     fn the_seccomp_filter_instruction_counts_are_pinned() {
         for &nesting in &[false, true] {
@@ -897,11 +999,12 @@ mod tests {
                 // to x86_64. aarch64 still gets the fit check above.
                 #[cfg(target_arch = "x86_64")]
                 {
-                    let allow_expected = if nesting { 173 } else { 178 };
+                    let allow_expected = if nesting { 181 } else { 186 };
                     assert_eq!(
                         len, allow_expected,
                         "x86_64 allowlist instruction count changed (nesting={nesting}): {len} vs \
-                         {allow_expected}. If intentional, update ROADMAP.md (cites 178) + the doc-comment."
+                         {allow_expected}. If intentional, update this test's doc-comment, which is \
+                         the only place these four numbers are now written down."
                     );
                 }
             }
@@ -914,11 +1017,12 @@ mod tests {
             );
             #[cfg(target_arch = "x86_64")]
             {
-                let deny_expected = if nesting { 72 } else { 86 };
+                let deny_expected = if nesting { 80 } else { 94 };
                 assert_eq!(
                     deny, deny_expected,
                     "x86_64 denylist instruction count changed (nesting={nesting}): {deny} vs \
-                     {deny_expected}. If intentional, update ROADMAP.md (cites 86)."
+                     {deny_expected}. If intentional, update this test's doc-comment, which is the \
+                     only place these four numbers are now written down."
                 );
             }
         }
@@ -1106,6 +1210,112 @@ mod tests {
                 run_filter(prog, socket_nr, AUDIT_ARCH, (AF_VSOCK as u64) << 32),
                 SECCOMP_RET_ALLOW,
                 "AF_VSOCK only in the high word must not be treated as the domain"
+            );
+        }
+    }
+
+    /// The `virtio_net_hdr` switch is the third argument-inspection rule and carries the same
+    /// invisibility risk as the other two, with one more edge: it reads TWO arguments, so a wrong
+    /// offset can leave the door open while every assertion about `optname` still passes.
+    ///
+    /// Both halves of the control are asserted, because a rule that refuses everything is as wrong as
+    /// one that refuses nothing: the two enabling options must be SEEN refused in every posture, and
+    /// the options a capture actually uses must be SEEN allowed.
+    #[test]
+    fn the_vnet_header_options_are_refused_and_every_other_packet_option_is_not() {
+        // Pinned against the kernel's own numbers (`linux/if_packet.h`, `bits/socket.h`), not against
+        // themselves: a typo here would be a rule that guards an option nobody calls.
+        assert_eq!(SOL_PACKET, 263, "SOL_PACKET is 263 in the Linux UAPI");
+        assert_eq!(PACKET_VNET_HDR, 15, "PACKET_VNET_HDR is 15");
+        assert_eq!(PACKET_VNET_HDR_SZ, 24, "PACKET_VNET_HDR_SZ is 24");
+
+        let sso = libc::SYS_setsockopt as u32;
+        let enoprotoopt = SECCOMP_RET_ERRNO | (libc::ENOPROTOOPT as u32 & SECCOMP_RET_DATA);
+        // The options a packet socket legitimately sets, which must keep working: the two that make
+        // `tcpdump`'s mmapped capture, the version/length it negotiates first, its stats and metadata,
+        // its load-balancing group, and the transmit ring.
+        let kept: [u32; 7] = [
+            5,  // PACKET_RX_RING
+            13, // PACKET_TX_RING
+            10, // PACKET_VERSION
+            11, // PACKET_HDRLEN
+            6,  // PACKET_STATISTICS
+            8,  // PACKET_AUXDATA
+            18, // PACKET_FANOUT
+        ];
+        assert!(
+            !kept.contains(&PACKET_VNET_HDR) && !kept.contains(&PACKET_VNET_HDR_SZ),
+            "the kept set must not name an option the rule refuses, or it asserts nothing"
+        );
+
+        let progs = [
+            build_filter(false),
+            build_filter(true),
+            build_allowlist_filter(false, false),
+            build_allowlist_filter(true, false),
+            build_allowlist_filter(false, true),
+            build_allowlist_filter(true, true),
+        ];
+        for prog in &progs {
+            for opt in [PACKET_VNET_HDR, PACKET_VNET_HDR_SZ] {
+                assert_eq!(
+                    run_filter_args(prog, sso, AUDIT_ARCH, [3, SOL_PACKET as u64, opt as u64]),
+                    enoprotoopt,
+                    "setsockopt(SOL_PACKET, {opt}) must return ENOPROTOOPT in every posture"
+                );
+            }
+            for opt in kept {
+                assert_eq!(
+                    run_filter_args(prog, sso, AUDIT_ARCH, [3, SOL_PACKET as u64, opt as u64]),
+                    SECCOMP_RET_ALLOW,
+                    "setsockopt(SOL_PACKET, {opt}) is not a vnet header and must stay allowed"
+                );
+            }
+            // Level control: the SAME optname numbers under another level are ordinary options
+            // (`SOL_SOCKET` 1, `IPPROTO_TCP` 6, `IPPROTO_IP` 0) and must pass untouched, which is what
+            // proves the rule reads `level` and not just `optname`.
+            for lvl in [1u64, 6, 0] {
+                for opt in [PACKET_VNET_HDR, PACKET_VNET_HDR_SZ] {
+                    assert_eq!(
+                        run_filter_args(prog, sso, AUDIT_ARCH, [3, lvl, opt as u64]),
+                        SECCOMP_RET_ALLOW,
+                        "setsockopt(level={lvl}, {opt}) is not a packet option and must stay allowed"
+                    );
+                }
+            }
+            // Offset controls, one per argument: the matching value sitting ONLY in the high 32 bits
+            // must be read as 0, proving each comparison keys on the low word its `OFF_ARG*` loads.
+            assert_eq!(
+                run_filter_args(
+                    prog,
+                    sso,
+                    AUDIT_ARCH,
+                    [3, (SOL_PACKET as u64) << 32, PACKET_VNET_HDR as u64]
+                ),
+                SECCOMP_RET_ALLOW,
+                "SOL_PACKET only in the high word must not be treated as the level"
+            );
+            assert_eq!(
+                run_filter_args(
+                    prog,
+                    sso,
+                    AUDIT_ARCH,
+                    [3, SOL_PACKET as u64, (PACKET_VNET_HDR as u64) << 32]
+                ),
+                SECCOMP_RET_ALLOW,
+                "PACKET_VNET_HDR only in the high word must not be treated as the optname"
+            );
+            // Syscall control: `getsockopt` carries the same three arguments and READS the option, so
+            // it must not be caught by a rule keyed on `setsockopt`.
+            assert_eq!(
+                run_filter_args(
+                    prog,
+                    libc::SYS_getsockopt as u32,
+                    AUDIT_ARCH,
+                    [3, SOL_PACKET as u64, PACKET_VNET_HDR as u64]
+                ),
+                SECCOMP_RET_ALLOW,
+                "getsockopt of the same option must not hit the setsockopt rule"
             );
         }
     }
